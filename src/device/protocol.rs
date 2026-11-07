@@ -330,6 +330,14 @@ impl Calibration {
         s / COUNTS_PER_VOLT[gain] * self.gain[gain][channel]
     }
 
+    /// Volts at the BNC of the lowest and the highest ADC value (0x00 and
+    /// 0xFF): what the input can measure at this gain.
+    pub fn range(&self, gain: usize, channel: usize, high_speed: bool) -> (f64, f64) {
+        let a = self.volts(0.0, gain, channel, high_speed);
+        let b = self.volts(255.0, gain, channel, high_speed);
+        (a.min(b), a.max(b))
+    }
+
     /// ADC value for a voltage at the BNC (the inverse of [`Self::volts`]).
     pub fn raw(&self, volts: f64, gain: usize, channel: usize, high_speed: bool) -> f64 {
         let bank = high_speed as usize;
@@ -370,6 +378,13 @@ impl HwConfig {
     pub fn high_speed(&self) -> bool {
         self.rate.rate >= 30e6
     }
+}
+
+/// The input range of each channel for `cfg` with the nominal
+/// calibration (no EEPROM values).
+pub fn nominal_range(cfg: &HwConfig) -> [(f64, f64); 2] {
+    let cal = Calibration::default();
+    [0, 1].map(|c| cal.range(cfg.gains[c], c, cfg.high_speed()))
 }
 
 /// Turns raw ADC bytes into volts, with oversampling. Keeps partial

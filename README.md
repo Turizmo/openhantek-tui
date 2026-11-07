@@ -155,6 +155,16 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 On screen: `1▸` and `2▸` on the left show each channel's 0 V line. `◂` on
 the right is the trigger level, `▾` at the top the trigger position.
 `CLIP CH1` in the title means the signal is bigger than the input range.
+
+The input range shrinks when the volts/div goes down (more hardware
+gain): at 20 to 100 mV/div the ADC covers only about ±0.5 V at the BNC.
+A trigger level outside the range of the trigger source is never
+crossed, so the trigger then uses a level 5 % of the range inside the
+nearest edge (from the calibration, with probe, invert and AC coupling;
+the hysteresis still applies). Your level does not change: the `◂` mark
+turns red, the status line says
+`Trig Auto CH1 ↑ 1 V (out of range, using 465 mV)`, and with a bigger
+volts/div the real level is used again.
 The labels on the left are the volts of the selected trace at each
 division line; the labels below are the time from the trigger point.
 The margins are kept small, so the plot gets the room: the left labels

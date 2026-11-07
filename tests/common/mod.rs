@@ -66,6 +66,7 @@ pub fn block_for(app: &App, d: &mut Driver) -> Block {
         cfg,
         data: cap.data,
         clipped: cap.clipped,
+        range: cap.range,
         rate: cap.rate,
         roll: cfg.roll,
     }

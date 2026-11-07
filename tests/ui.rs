@@ -302,6 +302,52 @@ fn clipping_is_shown() {
     assert!(r.text(150, 40).contains("CLIP CH1"));
 }
 
+/// Colour of the trigger mark `◂` right of the plot.
+fn trigger_mark_colour(r: &Rig) -> ratatui::style::Color {
+    let buf = r.buffer(120, 40);
+    for y in 0..40 {
+        for x in 0..120 {
+            if buf[(x, y)].symbol() == "◂" {
+                return buf[(x, y)].fg;
+            }
+        }
+    }
+    panic!("no trigger mark");
+}
+
+#[test]
+fn trigger_level_out_of_range_is_red_and_explained() {
+    let mut r = rig();
+    r.app.scope.settings.trigger.level = 1.0;
+    r.feed();
+    let normal = trigger_mark_colour(&r);
+    assert_ne!(normal, ui::TRIGGER_OUT_OF_RANGE);
+    assert!(!r.text(120, 40).contains("out of range"));
+    // 20 mV/div: the input covers only about ±0.5 V.
+    r.app.scope.settings.channels[0].volt_idx = 0;
+    r.feed();
+    r.feed();
+    assert_eq!(trigger_mark_colour(&r), ui::TRIGGER_OUT_OF_RANGE);
+    let text = r.text(120, 40);
+    let line = text
+        .lines()
+        .find(|l| l.contains("Trig "))
+        .expect("trigger status");
+    // The fake EEPROM calibration gives a range a little off the nominal.
+    assert!(
+        line.contains("Trig Auto CH1 ↑ 1 V (out of range, using 4"),
+        "{line}"
+    );
+    assert!(line.contains(" mV) @50%"), "{line}");
+    // The clipped sine still triggers on the level inside the range.
+    assert_eq!(r.app.scope.state, TrigState::Triggered);
+    assert_eq!(r.app.scope.settings.trigger.level, 1.0);
+    // Back to 1 V/div: the real level again.
+    r.app.scope.settings.channels[0].volt_idx = 5;
+    r.feed();
+    assert_eq!(trigger_mark_colour(&r), normal);
+}
+
 /// Cells of the plot grid row that has the center cross: the columns of
 /// its `┼` signs.
 fn cross_columns(lines: &[String]) -> Vec<usize> {

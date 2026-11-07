@@ -248,6 +248,10 @@ fn draw_trace(plot: &mut Plot, frame: &Frame, t: usize, s: &Settings, layer: u8,
     plot.styled(&pts, style, s.display.dots, layer, color);
 }
 
+/// Colour of the trigger mark and text when the level is outside the
+/// input range.
+pub const TRIGGER_OUT_OF_RANGE: Color = Color::Red;
+
 /// Colour of the classic cursor lines and their names.
 const CLASSIC_CURSOR: Color = Color::Gray;
 const CLASSIC_CURSOR_NAME: Color = Color::White;
@@ -541,12 +545,19 @@ fn time_margins(
         let src = s.trigger.source;
         let (sc_, off) = trace_scale(s, src);
         let y = g.plot.y + plot.row_of((s.trigger.level / sc_ + off).clamp(-half_v, half_v)) as u16;
+        // Red when the level is outside the input range (the trigger
+        // uses a level inside it).
+        let color = if sc.effective_trigger_level().is_some() {
+            TRIGGER_OUT_OF_RANGE
+        } else {
+            pal.trace[src]
+        };
         put(
             buf,
             right_x,
             y,
             "◂",
-            Style::default().fg(pal.trace[src]),
+            Style::default().fg(color),
             right_x + 1,
         );
     }
@@ -950,40 +961,56 @@ pub fn cursor_text(app: &App) -> Option<String> {
 
 fn draw_time_line(f: &mut TermFrame, app: &App, area: Rect) {
     let s = &app.scope.settings;
-    let mut parts = vec![format!(" {}/div", fmt_si(s.time_per_div(), "s"))];
+    let gray = Style::default().fg(Color::Gray);
+    let mut parts: Vec<Vec<Span>> = vec![vec![Span::raw(format!(
+        " {}/div",
+        fmt_si(s.time_per_div(), "s")
+    ))]];
+    let text = |t: String| vec![Span::raw(t)];
     if let Some(hw) = &app.scope.hw {
-        parts.push(fmt_si(hw.rate.rate, "S/s"));
+        parts.push(text(fmt_si(hw.rate.rate, "S/s")));
     }
     if s.roll() {
-        parts.push("Roll".into());
+        parts.push(text("Roll".into()));
     } else {
         let src = s.trigger.source;
-        parts.push(format!(
-            "Trig {} {} {} {} @{:.0}%",
+        let mut trig = vec![Span::raw(format!(
+            "Trig {} {} {} {}",
             s.trigger.mode.name(),
             NAMES[src],
             s.trigger.slope.symbol(),
             fmt_si(s.trigger.level, "V"),
-            s.trigger.position * 100.0
-        ));
+        ))];
+        if let Some(used) = app.scope.effective_trigger_level() {
+            trig.push(Span::styled(
+                format!(" (out of range, using {})", fmt_si(used, "V")),
+                Style::default().fg(Color::LightRed),
+            ));
+        }
+        trig.push(Span::raw(format!(" @{:.0}%", s.trigger.position * 100.0)));
+        parts.push(trig);
     }
     if s.display.averaging > 1 {
-        parts.push(format!("Avg {}", s.display.averaging));
+        parts.push(text(format!("Avg {}", s.display.averaging)));
     }
     if s.display.persistence > 0 {
-        parts.push(format!("Pers {}", s.display.persistence));
+        parts.push(text(format!("Pers {}", s.display.persistence)));
     }
     if s.display.interpolation == Interpolation::Linear {
-        parts.push("Linear".into());
+        parts.push(text("Linear".into()));
     }
     if s.display.dots {
-        parts.push("Dots".into());
+        parts.push(text("Dots".into()));
     }
-    parts.push(format!("Cal out {}", fmt_si(s.cal_freq as f64, "Hz")));
-    f.render_widget(
-        Paragraph::new(parts.join(" │ ")).style(Style::default().fg(Color::Gray)),
-        area,
-    );
+    parts.push(text(format!("Cal out {}", fmt_si(s.cal_freq as f64, "Hz"))));
+    let mut spans = Vec::new();
+    for (i, p) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" │ "));
+        }
+        spans.extend(p);
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).style(gray), area);
 }
 
 fn draw_message_line(f: &mut TermFrame, app: &App, area: Rect) {

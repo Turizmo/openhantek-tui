@@ -17,6 +17,9 @@ pub struct Captured {
     pub clipped: [bool; 2],
     /// Output samples per second.
     pub rate: f64,
+    /// Volts at the BNC of the lowest and highest ADC value, per channel:
+    /// what the input can measure at the gain of the capture.
+    pub range: [(f64, f64); 2],
 }
 
 pub struct Scope6022<T: Transport> {
@@ -134,6 +137,11 @@ impl<T: Transport> Scope6022<T> {
         Duration::from_secs_f64(secs * 2.0 + 1.0)
     }
 
+    /// Input range of each channel for `cfg`, with this scope's calibration.
+    pub fn range(&self, cfg: &HwConfig) -> [(f64, f64); 2] {
+        [0, 1].map(|c| self.cal.range(cfg.gains[c], c, cfg.high_speed()))
+    }
+
     /// Capture one block. The whole block is one bulk transfer: libusb
     /// keeps the pipe busy, so no samples are lost inside the block.
     pub fn capture(&mut self, cfg: &HwConfig) -> Result<Captured> {
@@ -164,6 +172,7 @@ impl<T: Transport> Scope6022<T> {
             data,
             clipped: conv.clipped,
             rate: cfg.rate.rate,
+            range: self.range(cfg),
         })
     }
 
@@ -207,6 +216,7 @@ impl<T: Transport> Scope6022<T> {
             data,
             clipped: conv.clipped,
             rate: cfg.rate.rate,
+            range: self.range(cfg),
         })
     }
 }

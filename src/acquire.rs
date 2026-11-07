@@ -202,6 +202,8 @@ pub struct Block {
     /// CH1 and CH2. A channel that was not sampled is empty.
     pub data: [Vec<f64>; 2],
     pub clipped: [bool; 2],
+    /// Volts at the BNC of the lowest and highest ADC value per channel.
+    pub range: [(f64, f64); 2],
     /// Output samples per second.
     pub rate: f64,
     /// A piece of a roll mode stream: append it, do not trigger.
@@ -402,6 +404,7 @@ impl Worker {
                         cfg,
                         data: cap.data,
                         clipped: cap.clipped,
+                        range: cap.range,
                         rate: cap.rate,
                         roll: cfg.roll,
                     };

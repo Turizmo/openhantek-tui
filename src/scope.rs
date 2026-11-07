@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use crate::acquire::Block;
-use crate::device::protocol::{choose_rate, gain_index, roll_rate, HwConfig};
+use crate::device::protocol::{choose_rate, gain_index, nominal_range, roll_rate, HwConfig};
 use crate::dsp::math::combine;
 use crate::dsp::measure::{measure, Measurements};
 use crate::dsp::trigger::find_trigger;
@@ -127,7 +127,16 @@ pub struct Scope {
     autoset: Option<AutosetStep>,
     /// Notices for the message line (autoset results and such).
     pub notices: Vec<String>,
+    /// Input range at the BNC per channel, from the last block, with the
+    /// gain index it was measured at.
+    adc_range: [Option<(usize, (f64, f64))>; 2],
+    /// Mean that AC coupling took away, per channel, in the last block.
+    ac_mean: [f64; 2],
 }
+
+/// How far inside the input range the trigger level goes when the
+/// user's level is outside it: 5 % of the range.
+pub const TRIGGER_INSIDE: f64 = 0.05;
 
 impl Scope {
     pub fn new(mut settings: Settings) -> Self {
@@ -147,6 +156,52 @@ impl Scope {
             last_block: None,
             autoset: None,
             notices: Vec::new(),
+            adc_range: [None; 2],
+            ac_mean: [0.0; 2],
+        }
+    }
+
+    /// Voltage range (at the probe tip, low to high) the trigger source
+    /// can measure at its gain: the ADC range from the calibration, with
+    /// probe, invert and AC coupling. Without a block yet, the nominal
+    /// calibration.
+    pub fn trigger_range(&self) -> (f64, f64) {
+        let s = &self.settings;
+        let src = s.trigger.source.min(1);
+        let ch = &s.channels[src];
+        let gain = gain_index(VOLT_DIVS[ch.volt_idx.min(VOLT_DIVS.len() - 1)]);
+        let (lo, hi) = match self.adc_range[src] {
+            Some((g, r)) if g == gain => r,
+            _ => {
+                let mut cfg = self.hw_config();
+                cfg.gains[src] = gain;
+                nominal_range(&cfg)[src]
+            }
+        };
+        let mean = if ch.coupling == Coupling::Ac {
+            self.ac_mean[src]
+        } else {
+            0.0
+        };
+        let k = ch.probe as f64 * if ch.invert { -1.0 } else { 1.0 };
+        let (a, b) = ((lo - mean) * k, (hi - mean) * k);
+        (a.min(b), a.max(b))
+    }
+
+    /// The trigger level the trigger search uses, when it is not the
+    /// user's level: a level outside the input range is never crossed, so
+    /// the search uses a level 5 % of the range inside the nearest edge.
+    /// `None` when the user's level is inside the range.
+    pub fn effective_trigger_level(&self) -> Option<f64> {
+        let level = self.settings.trigger.level;
+        let (lo, hi) = self.trigger_range();
+        let inside = TRIGGER_INSIDE * (hi - lo);
+        if level > hi {
+            Some(hi - inside)
+        } else if level < lo {
+            Some(lo + inside)
+        } else {
+            None
         }
     }
 
@@ -266,15 +321,17 @@ impl Scope {
         }
         let ch = &self.settings.channels[c];
         let k = ch.probe as f64 * if ch.invert { -1.0 } else { 1.0 };
-        let mean = if ch.coupling == Coupling::Ac && !block.roll {
-            data.iter().sum::<f64>() / data.len() as f64
-        } else {
-            0.0
-        };
+        let mean = ac_mean(block, ch, c);
         Some(data.iter().map(|v| (v - mean) * k).collect())
     }
 
     fn process(&mut self, block: &Block) -> bool {
+        for c in 0..2 {
+            if !block.data[c].is_empty() {
+                self.adc_range[c] = Some((block.cfg.gains[c], block.range[c]));
+                self.ac_mean[c] = ac_mean(block, &self.settings.channels[c], c);
+            }
+        }
         let ch = [self.condition(block, 0), self.condition(block, 1)];
         if block.roll {
             return self.process_roll(block, ch);
@@ -289,10 +346,13 @@ impl Scope {
         let src_samples = ch[src].as_deref().or(ch[1 - src].as_deref());
         let len = src_samples.map_or(0, |v| v.len());
         let vdiv = s.channels[src].volts_per_div();
+        let level = self
+            .effective_trigger_level()
+            .unwrap_or(s.trigger.level);
         let trig = src_samples.and_then(|v| {
             find_trigger(
                 v,
-                s.trigger.level,
+                level,
                 s.trigger.slope,
                 0.1 * vdiv,
                 pre + MARGIN,
@@ -521,6 +581,17 @@ impl Scope {
     }
 }
 
+/// The mean AC coupling takes away from channel `c` of a block (0 for DC
+/// and in roll mode).
+fn ac_mean(block: &Block, ch: &ChannelSettings, c: usize) -> f64 {
+    let data = &block.data[c];
+    if ch.coupling == Coupling::Ac && !block.roll && !data.is_empty() {
+        data.iter().sum::<f64>() / data.len() as f64
+    } else {
+        0.0
+    }
+}
+
 /// Index of the smallest time/div step that is at least `t`.
 pub fn time_index(t: f64) -> usize {
     TIME_DIVS
@@ -549,6 +620,7 @@ mod tests {
             cfg,
             data: [w(amp, phase), w(amp / 2.0, phase)],
             clipped: [false; 2],
+            range: nominal_range(&cfg),
             rate,
             roll: false,
         }
@@ -753,6 +825,77 @@ mod tests {
         assert_eq!(s.history.len(), 3);
     }
 
+    /// A sine of `amp` volts cut at the input range of 20 mV/div, like
+    /// the ADC does, with that range in the block.
+    fn clipped_block(gen: u64, cfg: HwConfig, amp: f64) -> Block {
+        let range = nominal_range(&cfg);
+        let rate = cfg.rate.rate;
+        let (lo, hi) = range[0];
+        let w: Vec<f64> = (0..20_000)
+            .map(|i| {
+                (amp * (std::f64::consts::TAU * 1000.0 * i as f64 / rate).sin()).clamp(lo, hi)
+            })
+            .collect();
+        Block {
+            gen,
+            cfg,
+            data: [w.clone(), w],
+            clipped: [true; 2],
+            range,
+            rate,
+            roll: false,
+        }
+    }
+
+    #[test]
+    fn trigger_level_outside_the_range_uses_one_inside() {
+        let mut s = Scope::new(Settings::default());
+        s.settings.channels[0].volt_idx = 0; // 20 mV/div: about ±0.5 V
+        s.settings.trigger.level = 1.0;
+        s.settings.trigger.mode = TriggerMode::Normal;
+        let (gen, cfg) = s.sync_hw().unwrap();
+        assert_eq!(cfg.gains[0], 0);
+        let (lo, hi) = s.trigger_range();
+        assert!((hi - 127.0 / 250.0).abs() < 1e-9, "{hi}");
+        assert!((lo + 128.0 / 250.0).abs() < 1e-9, "{lo}");
+        let used = s.effective_trigger_level().expect("out of range");
+        assert!((used - (hi - 0.05 * (hi - lo))).abs() < 1e-9, "{used}");
+        // The clipped sine never reaches 1 V, but it triggers.
+        assert!(s.push(clipped_block(gen, cfg, 2.0)));
+        assert_eq!(s.state, TrigState::Triggered);
+        // The user's level stays.
+        assert_eq!(s.settings.trigger.level, 1.0);
+        // Below the range: 5 % above the low edge.
+        s.settings.trigger.level = -3.0;
+        let used = s.effective_trigger_level().unwrap();
+        assert!((used - (lo + 0.05 * (hi - lo))).abs() < 1e-9);
+        // The probe and invert move the range.
+        s.settings.channels[0].probe = 10;
+        s.settings.channels[0].invert = true;
+        let (lo10, hi10) = s.trigger_range();
+        assert!((hi10 + lo * 10.0).abs() < 1e-9 && (lo10 + hi * 10.0).abs() < 1e-9);
+        // Back at 1 V/div the real level is used again.
+        s.settings.channels[0].probe = 1;
+        s.settings.channels[0].invert = false;
+        s.settings.channels[0].volt_idx = 5;
+        s.settings.trigger.level = 1.0;
+        assert_eq!(s.effective_trigger_level(), None);
+    }
+
+    #[test]
+    fn trigger_level_inside_the_range_is_unchanged() {
+        let mut s = scope();
+        s.settings.trigger.level = 0.3;
+        assert_eq!(s.effective_trigger_level(), None);
+        s.push(sine_block(1, 1e6, 1000.0, 1.0, 0.0));
+        let f = s.frame.as_ref().unwrap();
+        assert!(f.triggered);
+        // The trace crosses the user's level at the trigger point.
+        let tr = f.traces[0].as_ref().unwrap();
+        let i = (-f.t0 / f.dt).floor() as usize;
+        assert!(tr[i] <= 0.3 && tr[i + 1] >= 0.3, "{} {}", tr[i], tr[i + 1]);
+    }
+
     #[test]
     fn roll_mode_appends_and_scrolls() {
         let mut s = Scope::new(Settings::default());
@@ -765,6 +908,7 @@ mod tests {
             cfg,
             data: [vec![k as f64; 1000], vec![0.0; 1000]],
             clipped: [false; 2],
+            range: nominal_range(&cfg),
             rate,
             roll: true,
         };
