@@ -209,6 +209,21 @@ names in the margin). Dots (`d`), persistence (`P`) and interpolation
 load: the old style names `Classic` and `Thin` read as `braille thin`,
 `Bold` as `braille bold`.
 
+The grid has three settings under Display, used in the time view, the
+spectrum and XY:
+
+| Setting | Values |
+|---|---|
+| Grid style | `dots` (default: `·` where division lines cross), `dashed` (`╌` `╎`), `solid` (`─` `│` with `┼` crossings), `crosses` (`+` where lines cross), `none` (no grid, no center cross) |
+| Grid lines | `points` (default: marks only at the crossings, short arms for dashed and solid) or `full` (every division line across the whole plot, with `┌ ┬ ├ ┼` joins) |
+| Grid brightness | 10 % to 100 % in steps of 10 (default 30 %, the old look) |
+
+The center cross is always a whole line and a little brighter than the
+rest of the grid. Brightness scales the perceptual lightness of the grid
+in true colour, takes the nearest xterm gray in 256 colours, and has four
+steps in 16 colours (dim dark gray, dark gray, gray, white). Traces are
+always drawn over the grid.
+
 Persistence (`P`, time view only) keeps 2, 4, 8 or 16 old traces, and
 each fades by age: the newest old trace is at 85 % of the way from the
 background to the trace colour, the oldest at 12 %, in even perceptual

@@ -4,6 +4,8 @@
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
+use crate::settings::GRID_BRIGHTNESS_DEFAULT;
+
 /// Which colours to use. `Auto` looks at `COLORTERM`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ColorMode {
@@ -105,6 +107,17 @@ pub fn fade(trace: Rgb, bg: Rgb, level: f64) -> Rgb {
         to_srgb(b + (t - b) * light)
     };
     (mix(trace.0, bg.0), mix(trace.1, bg.1), mix(trace.2, bg.2))
+}
+
+/// Perceptual lightness (CIE L*, 0..1) of a gray `v`: the inverse of
+/// [`fade`] from black to white.
+fn gray_lightness(v: u8) -> f64 {
+    let y = to_linear(v);
+    if y > 0.008_856 {
+        1.16 * y.cbrt() - 0.16
+    } else {
+        9.033 * y
+    }
 }
 
 /// The xterm 256-colour index nearest to `c`: the 6 x 6 x 6 cube or the
@@ -245,6 +258,36 @@ impl Palette {
         }
     }
 
+    /// Grid and center cross colours at grid brightness `percent` (10 to
+    /// 100), and whether the grid needs the DIM modifier. At
+    /// [`GRID_BRIGHTNESS_DEFAULT`] they are [`Palette::grid`] and
+    /// [`Palette::axis`]. True colour scales their perceptual lightness
+    /// (toward the background below the default, toward white above),
+    /// 256 colours take the nearest xterm gray, and 16 colours have four
+    /// steps: dim dark gray, dark gray (the default), gray and white.
+    pub fn grid_colors(&self, percent: u8) -> (Color, Color, bool) {
+        let k = percent.clamp(1, 100) as f64 / GRID_BRIGHTNESS_DEFAULT as f64;
+        let white = (255, 255, 255);
+        let gray = |base: u8| fade(white, self.background, gray_lightness(base) * k);
+        let (g, a) = (gray(60), gray(105));
+        match self.mode {
+            ColorMode::TrueColor | ColorMode::Auto => {
+                (Color::Rgb(g.0, g.1, g.2), Color::Rgb(a.0, a.1, a.2), false)
+            }
+            ColorMode::Ansi256 => (
+                Color::Indexed(xterm_index(g)),
+                Color::Indexed(xterm_index(a)),
+                false,
+            ),
+            ColorMode::Ansi16 => match percent {
+                0..=20 => (Color::DarkGray, Color::DarkGray, true),
+                21..=50 => (Color::DarkGray, Color::Gray, false),
+                51..=80 => (Color::Gray, Color::White, false),
+                _ => (Color::White, Color::White, false),
+            },
+        }
+    }
+
     /// Palette for a setting, using the `COLORTERM` of this process.
     pub fn for_setting(mode: ColorMode) -> Self {
         Self::new(mode.resolve(colorterm()))
@@ -341,6 +384,45 @@ mod tests {
         assert_eq!(s.persist(1, 3, 8), (Color::Cyan, false));
         assert_eq!(s.persist(1, 4, 8), (Color::Cyan, true));
         assert_eq!(s.persist(1, 7, 8), (Color::Cyan, true));
+    }
+
+    #[test]
+    fn grid_colours_by_brightness() {
+        use crate::settings::GRID_BRIGHTNESS;
+        // The default brightness gives the palette's own grid colours.
+        for mode in [ColorMode::TrueColor, ColorMode::Ansi256, ColorMode::Ansi16] {
+            let p = Palette::new(mode);
+            assert_eq!(
+                p.grid_colors(GRID_BRIGHTNESS_DEFAULT),
+                (p.grid, p.axis, false),
+                "{mode:?}"
+            );
+        }
+        // True colour: each step brighter, and the center cross brighter
+        // than the grid (until both are white).
+        let p = Palette::new(ColorMode::TrueColor);
+        let level = |c: Color| match c {
+            Color::Rgb(r, g, b) => {
+                assert!(r == g && g == b);
+                r
+            }
+            _ => panic!("{c:?}"),
+        };
+        let mut last = 0;
+        for b in GRID_BRIGHTNESS {
+            let (g, a, dim) = p.grid_colors(b);
+            assert!(!dim);
+            assert!(level(g) > last, "{b}");
+            assert!(level(a) > level(g) || level(a) == 255, "{b}");
+            last = level(g);
+        }
+        // 256 colours: grays, different at the ends.
+        let p = Palette::new(ColorMode::Ansi256);
+        assert_ne!(p.grid_colors(10).0, p.grid_colors(100).0);
+        // 16 colours: dim at the lowest steps.
+        let p = Palette::new(ColorMode::Ansi16);
+        assert!(p.grid_colors(10).2);
+        assert_eq!(p.grid_colors(100).0, Color::White);
     }
 
     #[test]

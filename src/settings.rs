@@ -272,6 +272,68 @@ impl CursorStyle {
     }
 }
 
+/// How the division lines of the grid are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GridStyle {
+    /// `·` dots, with a dashed center cross.
+    #[default]
+    Dots,
+    /// `╌` and `╎` dashes.
+    Dashed,
+    /// `─` and `│` lines with `┼` where they cross.
+    Solid,
+    /// `+` where the division lines cross, nothing between.
+    Crosses,
+    /// No grid and no center cross.
+    None,
+}
+
+impl GridStyle {
+    pub const ALL: [GridStyle; 5] = [
+        GridStyle::Dots,
+        GridStyle::Dashed,
+        GridStyle::Solid,
+        GridStyle::Crosses,
+        GridStyle::None,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            GridStyle::Dots => "dots",
+            GridStyle::Dashed => "dashed",
+            GridStyle::Solid => "solid",
+            GridStyle::Crosses => "crosses",
+            GridStyle::None => "none",
+        }
+    }
+}
+
+/// Where the grid draws its division lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GridExtent {
+    /// Marks only where the division lines cross, and the center cross.
+    #[default]
+    Points,
+    /// Every division line across the whole plot.
+    Full,
+}
+
+impl GridExtent {
+    pub const ALL: [GridExtent; 2] = [GridExtent::Points, GridExtent::Full];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            GridExtent::Points => "points",
+            GridExtent::Full => "full",
+        }
+    }
+}
+
+/// Grid brightness steps, in percent.
+pub const GRID_BRIGHTNESS: [u8; 10] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+/// The grid brightness of the first versions.
+pub const GRID_BRIGHTNESS_DEFAULT: u8 = 30;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DisplaySettings {
@@ -295,6 +357,10 @@ pub struct DisplaySettings {
     /// How CH1, CH2 and MATH are drawn (also in the spectrum).
     pub trace_style: [TraceStyle; 3],
     pub cursor_style: CursorStyle,
+    pub grid_style: GridStyle,
+    pub grid_extent: GridExtent,
+    /// Grid brightness in percent, one of [`GRID_BRIGHTNESS`].
+    pub grid_brightness: u8,
 }
 
 impl Default for DisplaySettings {
@@ -312,6 +378,9 @@ impl Default for DisplaySettings {
             colors: ColorMode::Auto,
             trace_style: [TraceStyle::BrailleThin; 3],
             cursor_style: CursorStyle::Classic,
+            grid_style: GridStyle::Dots,
+            grid_extent: GridExtent::Points,
+            grid_brightness: GRID_BRIGHTNESS_DEFAULT,
         }
     }
 }
@@ -397,6 +466,12 @@ impl Settings {
         self.display.averaging = self.display.averaging.clamp(1, 128);
         self.display.persistence = self.display.persistence.min(16);
         self.display.spectrum_zoom = self.display.spectrum_zoom.min(MAX_SPECTRUM_ZOOM);
+        // The nearest step, so a hand-typed 35 still works.
+        let b = self.display.grid_brightness;
+        self.display.grid_brightness = *GRID_BRIGHTNESS
+            .iter()
+            .min_by_key(|g| g.abs_diff(b))
+            .unwrap_or(&GRID_BRIGHTNESS_DEFAULT);
         if !CAL_FREQS.contains(&self.cal_freq) {
             self.cal_freq = 1_000;
         }
@@ -453,6 +528,7 @@ mod tests {
         s.trigger.source = 5;
         s.cal_freq = 12345;
         s.display.averaging = 0;
+        s.display.grid_brightness = 255;
         s.selected = 9;
         s.sanitize();
         assert_eq!(s.time_idx, TIME_DIVS.len() - 1);
@@ -463,6 +539,7 @@ mod tests {
         assert_eq!(s.trigger.source, 1);
         assert_eq!(s.cal_freq, 1000);
         assert_eq!(s.display.averaging, 1);
+        assert_eq!(s.display.grid_brightness, 100);
         assert_eq!(s.selected, 2);
     }
 
@@ -492,6 +569,9 @@ mod tests {
         s.math.mode = MathMode::Mul;
         s.display.trace_style = [TraceStyle::BrailleBold, TraceStyle::Box, TraceStyle::Line];
         s.display.cursor_style = CursorStyle::Fine;
+        s.display.grid_style = GridStyle::Solid;
+        s.display.grid_extent = GridExtent::Full;
+        s.display.grid_brightness = 70;
         let text = toml::to_string_pretty(&s).unwrap();
         let back: Settings = toml::from_str(&text).unwrap();
         assert_eq!(back, s);
@@ -506,6 +586,10 @@ mod tests {
         assert!(s.display.dots);
         assert_eq!(s.display.trace_style, [TraceStyle::BrailleThin; 3]);
         assert_eq!(s.display.cursor_style, CursorStyle::Classic);
+        // And the grid of the first versions.
+        assert_eq!(s.display.grid_style, GridStyle::Dots);
+        assert_eq!(s.display.grid_extent, GridExtent::Points);
+        assert_eq!(s.display.grid_brightness, 30);
         // Each style is saved by name.
         let mut s = Settings::default();
         s.display.trace_style[1] = TraceStyle::BrailleBold;

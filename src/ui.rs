@@ -195,6 +195,12 @@ pub fn trace_points(
     (lo..hi).map(|i| (frame.x(i as f64, s), y(tr[i]))).collect()
 }
 
+/// The grid in the style of the display settings.
+fn grid(plot: &mut Plot, s: &Settings, pal: &Palette) {
+    let d = &s.display;
+    plot.grid_with(pal, d.grid_style, d.grid_extent, d.grid_brightness);
+}
+
 fn draw_trace(plot: &mut Plot, frame: &Frame, t: usize, s: &Settings, layer: u8, color: Color) {
     let style = s.display.trace_style[t];
     // Braille thin shows the same points with and without dots, like the
@@ -354,7 +360,7 @@ fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         return;
     };
     let mut plot = Plot::new(g.cx, g.ry);
-    plot.grid(pal);
+    grid(&mut plot, s, pal);
     draw_cursors(&mut plot, s, pal);
     let order = draw_order(s);
     // Old frames first, oldest first, fading by age: a newer frame is on
@@ -570,7 +576,7 @@ fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let geo = Geometry::fit(block_inner);
     let mut plot = geo.map(|g| Plot::new(g.cx, g.ry));
     if let Some(p) = plot.as_mut() {
-        p.grid(pal);
+        grid(p, &app.scope.settings, pal);
     }
     let to_div = |(hz, db): (f64, f64)| {
         (
@@ -668,7 +674,7 @@ fn draw_xy(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         return;
     };
     let mut plot = Plot::new(g.cx, g.ry);
-    plot.grid(pal);
+    grid(&mut plot, s, pal);
     if s.display.dots {
         plot.points(&points, plot::LAYER_TOP, pal.xy);
     } else {

@@ -49,11 +49,16 @@ impl Rig {
         self.key(KeyCode::Char(c));
     }
 
-    /// Draw and return the screen as lines of text.
-    fn screen(&self, w: u16, h: u16) -> Vec<String> {
+    /// Draw and return the screen buffer, with colours.
+    fn buffer(&self, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| ui::draw(f, &self.app)).unwrap();
-        let buf = term.backend().buffer().clone();
+        term.backend().buffer().clone()
+    }
+
+    /// Draw and return the screen as lines of text.
+    fn screen(&self, w: u16, h: u16) -> Vec<String> {
+        let buf = self.buffer(w, h);
         (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
             .collect()
@@ -324,6 +329,95 @@ fn grid_divisions_are_even_at_every_size() {
         let gaps: Vec<usize> = cols.windows(2).map(|p| p[1] - p[0]).collect();
         assert!(gaps.iter().all(|g| *g == gaps[0]), "{w}x{h}: {gaps:?}");
     }
+}
+
+#[test]
+fn grid_settings_in_the_panel_change_the_grid() {
+    use openhantek_tui::theme::{ColorMode, Palette};
+    let mut r = rig();
+    r.app.scope.settings.display.colors = ColorMode::TrueColor;
+    // Traces off, so only the grid is in the plot.
+    r.char('1');
+    r.char('2');
+    let count = |lines: &[String], c: char| -> usize {
+        lines.iter().map(|l| l.chars().filter(|x| *x == c).count()).sum()
+    };
+    let before = r.screen(120, 40);
+    assert!(count(&before, '·') > 50);
+    // Display › Grid style: solid; Grid lines: full.
+    r.char('S');
+    r.char('/');
+    for c in "grid style".chars() {
+        r.char(c);
+    }
+    r.key(KeyCode::Enter);
+    r.char('l');
+    r.char('j');
+    r.char('j');
+    assert_eq!(r.app.scope.settings.display.grid_style, GridStyle::Solid);
+    // Back to the categories and clear the search.
+    r.key(KeyCode::Esc);
+    r.key(KeyCode::Esc);
+    r.key(KeyCode::Esc);
+    assert!(r.app.panel_open);
+    r.char('/');
+    for c in "grid lines".chars() {
+        r.char(c);
+    }
+    r.key(KeyCode::Enter);
+    r.char('l');
+    r.char('j');
+    assert_eq!(r.app.scope.settings.display.grid_extent, GridExtent::Full);
+    r.char('S');
+    let full = r.screen(120, 40);
+    // Whole lines: many more line cells than the center cross alone.
+    assert!(count(&full, '─') > 400, "{}", full.join("\n"));
+    assert!(count(&full, '│') > 200);
+    assert!(full.iter().any(|l| l.contains("┌──") && l.contains("──┐")));
+    // Every style and extent draws. Grid characters on top of what the
+    // borders and labels have with no grid.
+    let grid_chars = |r: &Rig| -> usize {
+        let lines = r.screen(120, 40);
+        ['·', '─', '│', '╌', '╎', '┼', '+', '┌', '┴']
+            .iter()
+            .map(|c| count(&lines, *c))
+            .sum()
+    };
+    r.app.scope.settings.display.grid_style = GridStyle::None;
+    let none = grid_chars(&r);
+    for style in GridStyle::ALL {
+        for extent in GridExtent::ALL {
+            r.app.scope.settings.display.grid_style = style;
+            r.app.scope.settings.display.grid_extent = extent;
+            let grid = grid_chars(&r) - none;
+            match (style, extent) {
+                (GridStyle::None, _) => assert_eq!(grid, 0),
+                (_, GridExtent::Full) => assert!(grid > 500, "{style:?} full: {grid}"),
+                _ => assert!(grid > 50, "{style:?} points: {grid}"),
+            }
+            r.screen(80, 24);
+        }
+    }
+    // Brightness changes the grid colour.
+    r.app.scope.settings.display.grid_style = GridStyle::Solid;
+    let pal = Palette::new(ColorMode::TrueColor);
+    let colour_of = |r: &Rig, c: char| {
+        let buf = r.buffer(120, 40);
+        buf.content()
+            .iter()
+            .find(|cell| cell.symbol() == c.to_string())
+            .map(|cell| cell.fg)
+            .unwrap()
+    };
+    let mut seen = Vec::new();
+    for b in [10, 30, 100] {
+        r.app.scope.settings.display.grid_brightness = b;
+        let (grid, _, _) = pal.grid_colors(b);
+        assert_eq!(colour_of(&r, '┬'), grid, "{b}");
+        seen.push(grid);
+    }
+    assert_eq!(seen[1], pal.grid);
+    assert!(seen[0] != seen[1] && seen[1] != seen[2]);
 }
 
 #[test]

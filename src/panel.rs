@@ -54,6 +54,9 @@ pub enum Field {
     Xy,
     Colors,
     CursorLook,
+    GridLook,
+    GridExtent,
+    GridBrightness,
     SpecOn,
     SpecWindow,
     SpecZoom,
@@ -175,6 +178,9 @@ pub fn categories() -> Vec<Category> {
                 Xy,
                 Colors,
                 CursorLook,
+                GridLook,
+                GridExtent,
+                GridBrightness,
             ],
         },
         Category {
@@ -267,6 +273,9 @@ impl Field {
             Xy => "XY mode",
             Colors => "Colours",
             CursorLook => "Cursor style",
+            GridLook => "Grid style",
+            GridExtent => "Grid lines",
+            GridBrightness => "Grid brightness",
             SpecOn => "Show spectrum",
             SpecWindow => "Window",
             SpecZoom => "Span",
@@ -325,6 +334,9 @@ impl Field {
             Persistence => "Keep this many old traces on screen, dimmed. Key P.",
             Xy => "Draw CH1 against CH2. Key x.",
             Colors => "auto uses true colour when COLORTERM says so.",
+            GridLook => "Look of the division lines. The center cross is brighter in every style.",
+            GridExtent => "points: marks where division lines cross. full: every division line across the whole plot.",
+            GridBrightness => "How bright the grid is. Traces are always drawn over it.",
             CursorLook => "classic: grey dashes, names inside the plot. fine dashes: short dashes, names in the margin.",
             SpecOn => "Show the spectrum (FFT) below the trace. Key f.",
             SpecWindow => "Window function for the FFT. Key w.",
@@ -423,6 +435,12 @@ impl Field {
                 .iter()
                 .map(|m| m.name().to_string())
                 .collect(),
+            GridLook => GridStyle::ALL.iter().map(|m| m.name().to_string()).collect(),
+            GridExtent => crate::settings::GridExtent::ALL
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect(),
+            GridBrightness => GRID_BRIGHTNESS.iter().map(|b| format!("{b} %")).collect(),
             SpecWindow => Window::ALL.iter().map(|w| w.name().to_string()).collect(),
             SpecZoom => (0..=MAX_SPECTRUM_ZOOM)
                 .map(|z| match d.rate {
@@ -470,6 +488,9 @@ impl Field {
             Colors => index_of(&ColorMode::ALL, &s.display.colors),
             Style(t) => index_of(&crate::settings::TraceStyle::ALL, &s.display.trace_style[t]),
             CursorLook => index_of(&crate::settings::CursorStyle::ALL, &s.display.cursor_style),
+            GridLook => index_of(&GridStyle::ALL, &s.display.grid_style),
+            GridExtent => index_of(&crate::settings::GridExtent::ALL, &s.display.grid_extent),
+            GridBrightness => index_of(&GRID_BRIGHTNESS, &s.display.grid_brightness),
             SpecWindow => index_of(&Window::ALL, &s.display.window),
             SpecZoom => s.display.spectrum_zoom as usize,
             CursorMode => index_of(
@@ -538,6 +559,14 @@ impl Field {
             CursorLook => {
                 let all = crate::settings::CursorStyle::ALL;
                 s.display.cursor_style = all[i.min(all.len() - 1)]
+            }
+            GridLook => s.display.grid_style = GridStyle::ALL[i.min(GridStyle::ALL.len() - 1)],
+            GridExtent => {
+                let all = crate::settings::GridExtent::ALL;
+                s.display.grid_extent = all[i.min(all.len() - 1)]
+            }
+            GridBrightness => {
+                s.display.grid_brightness = GRID_BRIGHTNESS[i.min(GRID_BRIGHTNESS.len() - 1)]
             }
             SpecWindow => s.display.window = Window::ALL[i.min(Window::ALL.len() - 1)],
             SpecZoom => s.display.spectrum_zoom = (i as u32).min(MAX_SPECTRUM_ZOOM),

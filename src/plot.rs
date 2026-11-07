@@ -9,7 +9,7 @@
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
-use crate::settings::TraceStyle;
+use crate::settings::{GridExtent, GridStyle, TraceStyle, GRID_BRIGHTNESS_DEFAULT};
 use crate::theme::Palette;
 
 /// Draw layers, lowest first. A higher layer takes over a cell from a
@@ -90,6 +90,11 @@ const BOX_CHARS: [char; 16] = [
     '─', '╵', '╷', '│', '╴', '╯', '╮', '┤', '╶', '╰', '╭', '├', '─', '┴', '┬', '┼',
 ];
 
+/// Grid crossings by the same side bits, with square corners.
+const GRID_JOINS: [char; 16] = [
+    '┼', '╵', '╷', '│', '╴', '┘', '┐', '┤', '╶', '└', '┌', '├', '─', '┴', '┬', '┼',
+];
+
 fn box_char(sides: u8) -> char {
     BOX_CHARS[(sides & 15) as usize]
 }
@@ -122,6 +127,9 @@ pub struct Plot {
     /// Layers up to this one render with the DIM modifier (the older old
     /// traces in 16 colours). 0: none.
     dim_upto: u8,
+    /// Grid characters render with the DIM modifier (the lowest grid
+    /// brightness in 16 colours).
+    grid_dim: bool,
 }
 
 impl Plot {
@@ -137,6 +145,7 @@ impl Plot {
             rows,
             cells: vec![Cell::default(); cols * rows],
             dim_upto: 0,
+            grid_dim: false,
         }
     }
 
@@ -221,42 +230,119 @@ impl Plot {
         }
     }
 
-    /// Grid characters: `·` on division points, and a brighter center
-    /// cross. Ticks at 1/5 division on the center lines when a division
-    /// is a multiple of 5 cells, and at least 10 (so ticks have gaps).
+    /// The grid of the first versions: `·` on division points, and a
+    /// brighter dashed center cross.
     pub fn grid(&mut self, pal: &Palette) {
+        self.grid_with(
+            pal,
+            GridStyle::Dots,
+            GridExtent::Points,
+            GRID_BRIGHTNESS_DEFAULT,
+        );
+    }
+
+    /// Grid characters in `style`. With [`GridExtent::Points`] only the
+    /// points where division lines cross get a mark; with
+    /// [`GridExtent::Full`] every division line goes across the plot. The
+    /// center cross is always a whole line, in the brighter axis colour,
+    /// with ticks at 1/5 division when a division is a multiple of 5
+    /// cells, and at least 10 (so ticks have gaps). `brightness` is in
+    /// percent (see [`Palette::grid_colors`]). Grid characters show only
+    /// in cells with no trace, so traces are always on top.
+    pub fn grid_with(
+        &mut self,
+        pal: &Palette,
+        style: GridStyle,
+        extent: GridExtent,
+        brightness: u8,
+    ) {
+        let (grid_c, axis_c, dim) = pal.grid_colors(brightness);
+        self.grid_dim = dim;
         let (cx, ry) = (self.cx, self.ry);
+        let (rows, cols) = (self.rows, self.cols);
         let (mid_col, mid_row) = (H_DIVS / 2 * cx, V_DIVS / 2 * ry);
+        let full = extent == GridExtent::Full;
         let tick_x = |col: usize| cx.is_multiple_of(5) && cx >= 10 && col.is_multiple_of(cx / 5);
         let tick_y = |row: usize| ry.is_multiple_of(5) && ry >= 10 && row.is_multiple_of(ry / 5);
-        for row in 0..self.rows {
-            for col in 0..self.cols {
-                let on_col = col % cx == 0;
-                let on_row = row % ry == 0;
-                let text = if row == mid_row {
-                    Some(if on_col {
-                        '┼'
-                    } else if tick_x(col) {
-                        '┴'
+        let (h_line, v_line) = match style {
+            GridStyle::Solid => ('─', '│'),
+            GridStyle::Dots | GridStyle::Crosses => ('·', '·'),
+            _ => ('╌', '╎'),
+        };
+        let (axis_h, axis_v) = match style {
+            GridStyle::Solid => ('─', '│'),
+            _ => ('╌', '╎'),
+        };
+        // A short arm of a points-mode cross: the cell next to the
+        // crossing, when the division is big enough to keep a gap.
+        let arm_x = |col: usize| cx >= 5 && (col % cx == 1 || col % cx == cx - 1);
+        let arm_y = |row: usize| ry >= 4 && (row % ry == 1 || row % ry == ry - 1);
+        for row in 0..rows {
+            for col in 0..cols {
+                let div_col = col % cx == 0;
+                let div_row = row % ry == 0;
+                // Lines through this cell.
+                let on_h = div_row && (full || row == mid_row);
+                let on_v = div_col && (full || col == mid_col);
+                let axis = row == mid_row || col == mid_col;
+                let color = if (row == mid_row && on_h) || (col == mid_col && on_v) {
+                    axis_c
+                } else {
+                    grid_c
+                };
+                let text = if style == GridStyle::None {
+                    None
+                } else if div_row && div_col {
+                    // A crossing.
+                    if full && (on_h || on_v) {
+                        if style == GridStyle::Dots && !axis {
+                            Some('·')
+                        } else {
+                            let mut sides = 0;
+                            if row > 0 {
+                                sides |= BOX_UP;
+                            }
+                            if row + 1 < rows {
+                                sides |= BOX_DOWN;
+                            }
+                            if col > 0 {
+                                sides |= BOX_LEFT;
+                            }
+                            if col + 1 < cols {
+                                sides |= BOX_RIGHT;
+                            }
+                            Some(GRID_JOINS[sides as usize])
+                        }
+                    } else if axis {
+                        Some('┼')
                     } else {
-                        '╌'
-                    })
-                    .map(|c| (c, pal.axis))
+                        Some(match style {
+                            GridStyle::Dots => '·',
+                            GridStyle::Crosses => '+',
+                            _ => '┼',
+                        })
+                    }
+                } else if row == mid_row {
+                    Some(if tick_x(col) { '┴' } else { axis_h })
                 } else if col == mid_col {
-                    Some(if on_row {
-                        '┼'
-                    } else if tick_y(row) {
-                        '├'
+                    Some(if tick_y(row) { '├' } else { axis_v })
+                } else if on_h {
+                    Some(h_line)
+                } else if on_v {
+                    Some(v_line)
+                } else if matches!(style, GridStyle::Dashed | GridStyle::Solid) && !full {
+                    // Points mode: short arms around each crossing.
+                    if div_row && arm_x(col) {
+                        Some(h_line)
+                    } else if div_col && arm_y(row) {
+                        Some(v_line)
                     } else {
-                        '╎'
-                    })
-                    .map(|c| (c, pal.axis))
-                } else if on_col && on_row {
-                    Some(('·', pal.grid))
+                        None
+                    }
                 } else {
                     None
                 };
-                self.cells[row * self.cols + col].text = text;
+                self.cells[row * cols + col].text = text.map(|c| (c, color));
             }
         }
     }
@@ -904,7 +990,8 @@ impl Plot {
                         let faint = src.layer != 0
                             && src.layer <= self.dim_upto
                             && (src.dots != 0 || src.glyph.is_some());
-                        if faint {
+                        let grid = src.dots == 0 && src.glyph.is_none();
+                        if faint || (grid && self.grid_dim) {
                             cell.modifier.insert(ratatui::style::Modifier::DIM);
                         }
                     }
@@ -1193,6 +1280,100 @@ mod tests {
             // Ticks only when they can be even.
             let ticks = (0..p.cols).filter(|&c| p.char_at(c, mid_r) == '┴').count();
             assert_eq!(ticks > 0, cx % 5 == 0 && cx >= 10, "{cx}");
+        }
+    }
+
+    fn grid_text(p: &Plot) -> String {
+        (0..p.rows)
+            .map(|r| (0..p.cols).map(|c| p.char_at(c, r)).collect::<String>() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn every_grid_style_and_extent() {
+        use std::collections::HashSet;
+        let pal = Palette::new(ColorMode::TrueColor);
+        let (cx, ry) = (6, 3);
+        let (mid_c, mid_r) = (5 * cx, 4 * ry);
+        let mut looks = HashSet::new();
+        for style in GridStyle::ALL {
+            for extent in GridExtent::ALL {
+                let mut p = Plot::new(cx, ry);
+                p.grid_with(&pal, style, extent, GRID_BRIGHTNESS_DEFAULT);
+                looks.insert(grid_text(&p));
+                let mut line = 0;
+                let mut inked = 0;
+                for row in 0..p.rows {
+                    for col in 0..p.cols {
+                        let ink = p.cell(col, row).text.is_some();
+                        let on_line = row % ry == 0 || col % cx == 0;
+                        let axis = row == mid_r || col == mid_c;
+                        let what = format!("{style:?} {extent:?} at {col},{row}");
+                        if style == GridStyle::None {
+                            assert!(!ink, "{what}");
+                        } else if !on_line {
+                            assert!(!ink, "nothing between lines: {what}");
+                        } else if axis {
+                            assert!(ink, "the center cross is whole: {what}");
+                            assert_eq!(p.cell(col, row).text.unwrap().1, pal.axis, "{what}");
+                        } else {
+                            line += 1;
+                            inked += ink as usize;
+                            if ink {
+                                assert_eq!(p.cell(col, row).text.unwrap().1, pal.grid, "{what}");
+                            }
+                        }
+                    }
+                }
+                match (style, extent) {
+                    (GridStyle::None, _) => {}
+                    // Full: every division line across the whole plot.
+                    (_, GridExtent::Full) => assert_eq!(inked, line, "{style:?}"),
+                    // Points: marks at the crossings, far from whole lines.
+                    (_, GridExtent::Points) => {
+                        assert!(inked > 0 && inked * 2 < line, "{style:?}: {inked}/{line}")
+                    }
+                }
+            }
+        }
+        // Every style and extent looks different; none is the same both ways.
+        assert_eq!(looks.len(), GridStyle::ALL.len() * 2 - 1);
+    }
+
+    #[test]
+    fn full_solid_grid_has_square_joins() {
+        let pal = Palette::new(ColorMode::TrueColor);
+        let mut p = Plot::new(4, 2);
+        p.grid_with(&pal, GridStyle::Solid, GridExtent::Full, 30);
+        let t = grid_text(&p);
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].starts_with("┌───┬"), "{t}");
+        assert!(lines[0].ends_with("┬───┐"), "{t}");
+        assert!(lines[1].starts_with("│   │"), "{t}");
+        assert!(lines[8].starts_with("├───┼"), "{t}");
+        assert!(lines[16].starts_with("└───┴"), "{t}");
+    }
+
+    #[test]
+    fn traces_draw_over_every_grid() {
+        let pal = Palette::new(ColorMode::Ansi16);
+        for style in GridStyle::ALL {
+            let mut p = Plot::new(4, 2);
+            p.grid_with(&pal, style, GridExtent::Full, 10);
+            p.set(0, 0, LAYER_CH1, RED);
+            p.put_glyph(1, 0, '─', LAYER_CH2, BLUE);
+            assert_eq!(p.char_at(0, 0), '\u{2801}');
+            assert_eq!(p.char_at(1, 0), '─');
+            assert_eq!(p.cell(1, 0).color, BLUE);
+            // The dim grid of 16 colours does not dim the traces.
+            let mut buf = Buffer::empty(Rect::new(0, 0, 41, 17));
+            p.render(&mut buf, Rect::new(0, 0, 41, 17));
+            use ratatui::style::Modifier;
+            assert!(!buf[(0, 0)].modifier.contains(Modifier::DIM));
+            assert!(!buf[(1, 0)].modifier.contains(Modifier::DIM));
+            if style != GridStyle::None {
+                assert!(buf[(4, 0)].modifier.contains(Modifier::DIM), "{style:?}");
+            }
         }
     }
 
