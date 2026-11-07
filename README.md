@@ -181,6 +181,20 @@ shows the model, serial number, firmware, calibration source and sample
 rate. Display › Colours picks true colour, 256 or 16 colours (`auto`
 uses `COLORTERM`).
 
+Each trace has a Style (Channel 1, Channel 2 and Math › Style), used in the
+time view and the spectrum:
+
+| Style | Look |
+|---|---|
+| `classic` (default) | lines from point to point through the low and high value of each dot column, like the first version |
+| `braille thin` | one braille dot thick, one dot run per column |
+| `bold` | the thin line, two dots thick |
+
+Display › Cursor style (also under Cursors) picks `classic` (grey dashes,
+`A`/`B` inside the plot, the default) or `fine dashes` (short dashes,
+names in the margin). Dots (`d`), persistence (`P`) and interpolation
+(`z`) work with every style.
+
 ## How it works
 
 - `src/device/`: USB. `protocol.rs` has the vendor requests, sample rates,
@@ -191,7 +205,7 @@ uses `COLORTERM`).
 - `src/scope.rs`: trigger, averaging, math, roll mode, autoset.
 - `src/dsp/`: trigger search, measurements, FFT, math, interpolation.
 - `src/app.rs` and `src/ui.rs`: keys and drawing. `src/plot.rs` is the
-  braille renderer, `src/theme.rs` the colours, `src/panel.rs` the
+  braille renderer (trace styles and cursor lines), `src/theme.rs` the colours, `src/panel.rs` the
   settings panel model.
 
 Like OpenHantek6022, it reads 20000 samples per channel per block, throws
