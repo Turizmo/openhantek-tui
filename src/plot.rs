@@ -3,7 +3,8 @@
 //! A cell holds 2 x 4 braille dots and one colour. Each division is a whole
 //! number of cells, so the grid looks the same in every division. Traces
 //! are drawn in one of the [`TraceStyle`]s: classic lines from point to
-//! point, one dot thick (one vertical run of dots per dot column), or bold.
+//! point, one dot thick (one vertical run of dots per dot column), bold,
+//! or text lines with no braille at all (`|`, `/`, `\`, `_`, `-`, `‾`).
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
@@ -31,7 +32,9 @@ pub struct Cell {
     /// Layer that owns the dots, 0 when there are none.
     pub layer: u8,
     pub color: Color,
-    /// Grid character, shown when the cell has no dots.
+    /// Trace character of the line style, owned by `layer` like the dots.
+    pub glyph: Option<char>,
+    /// Grid character, shown when the cell has no dots or glyph.
     pub text: Option<(char, Color)>,
 }
 
@@ -41,6 +44,7 @@ impl Default for Cell {
             dots: 0,
             layer: 0,
             color: Color::Reset,
+            glyph: None,
             text: None,
         }
     }
@@ -51,6 +55,8 @@ impl Cell {
     pub fn symbol(&self) -> Option<(char, Color)> {
         if self.dots != 0 {
             char::from_u32(0x2800 + self.dots as u32).map(|c| (c, self.color))
+        } else if let Some(c) = self.glyph {
+            Some((c, self.color))
         } else {
             self.text
         }
@@ -148,6 +154,7 @@ impl Plot {
         let bit = dot_bit(x % 2, y % 4);
         if layer > cell.layer {
             cell.dots = bit;
+            cell.glyph = None;
             cell.layer = layer;
             cell.color = color;
         } else if layer == cell.layer {
@@ -221,6 +228,171 @@ impl Plot {
             (TraceStyle::Thin, true) => self.points(points, layer, color),
             (TraceStyle::Bold, false) => self.trace_run(points, true, layer, color),
             (TraceStyle::Bold, true) => self.points_bold(points, layer, color),
+            (TraceStyle::Line, false) => self.text_line(points, layer, color),
+            (TraceStyle::Line, true) => self.text_points(points, layer, color),
+        }
+    }
+
+    /// Put a trace character in a cell. A layer at least as high as the
+    /// cell's takes it over: a later trace on the same layer wins.
+    pub fn put_glyph(&mut self, col: usize, row: usize, ch: char, layer: u8, color: Color) {
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+        let cell = &mut self.cells[row * self.cols + col];
+        if layer >= cell.layer {
+            cell.dots = 0;
+            cell.glyph = Some(ch);
+            cell.layer = layer;
+            cell.color = color;
+        }
+    }
+
+    /// Flat character for dot y `y` (continuous): `‾`, `-` or `_` for the
+    /// top, middle or bottom third of its cell.
+    fn flat_char(y: f64) -> char {
+        let f = y / 4.0 - (y / 4.0).floor();
+        if f < 1.0 / 3.0 {
+            '‾'
+        } else if f < 2.0 / 3.0 {
+            '-'
+        } else {
+            '_'
+        }
+    }
+
+    /// The line style: one text character per cell, no braille. Each cell
+    /// column gets the low and high value of the trace in it, and the
+    /// values where the trace comes in and goes out. A column inside one
+    /// cell row is flat (`_`, `-`, `‾` at its height) or a slope (`/`,
+    /// `\`). A column over more cell rows is a slope on gentle runs and
+    /// stacked `|` on steep ones. A non-finite point breaks the line.
+    pub fn text_line(&mut self, points: &[(f64, f64)], layer: u8, color: Color) {
+        let w = self.cols;
+        let y_max = self.dots_h() as f64 - 1e-6;
+        // (low, high, first, last) dot y per cell column.
+        let mut cols: Vec<Option<(f64, f64, f64, f64)>> = vec![None; w];
+        let mut add = |c: i64, y: f64| {
+            if c < 0 || c >= w as i64 {
+                return;
+            }
+            let r = &mut cols[c as usize];
+            *r = Some(r.map_or((y, y, y, y), |(lo, hi, first, _)| {
+                (lo.min(y), hi.max(y), first, y)
+            }));
+        };
+        let mut prev: Option<(f64, f64)> = None;
+        for &(x, y) in points {
+            if !x.is_finite() || !y.is_finite() {
+                prev = None;
+                continue;
+            }
+            // Cell x (continuous) and dot y.
+            let p = (self.px(x) / 2.0, self.py(y).clamp(0.0, y_max));
+            let col = p.0.floor() as i64;
+            if let Some(a) = prev {
+                let ca = a.0.floor() as i64;
+                if col > ca {
+                    // As in `trace_run`: the step from `a` goes to the
+                    // columns after `a`, so an edge lands in one column.
+                    let at = |x: f64| {
+                        if p.0 - a.0 <= f64::EPSILON {
+                            p.1
+                        } else {
+                            a.1 + (p.1 - a.1) * (x - a.0) / (p.0 - a.0)
+                        }
+                    };
+                    let first = (ca + 1).max(0);
+                    let last = col.min(w as i64 - 1);
+                    for c in first..=last {
+                        let x0 = if c == ca + 1 { a.0 } else { c as f64 };
+                        let x1 = if c == col { p.0 } else { (c + 1) as f64 };
+                        add(c, at(x0));
+                        add(c, at(x1));
+                    }
+                }
+            }
+            add(col, p.1);
+            prev = Some(p);
+        }
+        for (c, r) in cols.iter().enumerate() {
+            if let Some((lo, hi, first, last)) = *r {
+                self.text_column(c, lo, hi, first, last, layer, color);
+            }
+        }
+    }
+
+    /// Characters of one cell column of [`Plot::text_line`], from dot y
+    /// `lo` (top) to `hi`, entering at `first` and leaving at `last`.
+    #[allow(clippy::too_many_arguments)]
+    fn text_column(
+        &mut self,
+        c: usize,
+        lo: f64,
+        hi: f64,
+        first: f64,
+        last: f64,
+        layer: u8,
+        color: Color,
+    ) {
+        // In cells: 4 dot rows per cell row.
+        let span = (hi - lo) / 4.0;
+        let rise = (first - last) / 4.0;
+        let slope = if rise > 0.0 { '/' } else { '\\' };
+        // Most of the column goes one way: a slope, not a peak or noise.
+        let monotonic = rise.abs() >= 0.6 * span;
+        // Flat, or a peak or dip that fits in about one cell: one flat
+        // character, at the far end from where the line comes in and
+        // goes out.
+        if span < 0.6 || (!monotonic && span < 1.5) {
+            let ends = (first + last) / 2.0;
+            let y = if span < 0.6 {
+                (lo + hi) / 2.0
+            } else if ends - lo > hi - ends {
+                lo
+            } else {
+                hi
+            };
+            self.put_glyph(c, (y / 4.0) as usize, Self::flat_char(y), layer, color);
+            return;
+        }
+        let (r0, r1) = ((lo / 4.0).floor() as usize, (hi / 4.0).floor() as usize);
+        let ch = if monotonic && span < 2.0 { slope } else { '|' };
+        // Rows the run covers by at least a third of a cell; at least one.
+        let cover = |r: usize| {
+            let (a, b) = (r as f64 * 4.0, (r + 1) as f64 * 4.0);
+            (hi.min(b) - lo.max(a)) / 4.0
+        };
+        let rows: Vec<usize> = (r0..=r1).filter(|&r| cover(r) >= 1.0 / 3.0).collect();
+        if rows.is_empty() {
+            let best = (r0..=r1)
+                .max_by(|&a, &b| cover(a).total_cmp(&cover(b)))
+                .unwrap_or(r0);
+            self.put_glyph(c, best, ch, layer, color);
+        }
+        for r in rows {
+            self.put_glyph(c, r, ch, layer, color);
+        }
+    }
+
+    /// Dots mode of the line style: `'`, `·` or `.` per point, at the top,
+    /// middle or bottom of its cell.
+    pub fn text_points(&mut self, points: &[(f64, f64)], layer: u8, color: Color) {
+        let y_max = self.dots_h() as f64 - 1e-6;
+        for &(x, y) in points {
+            if !x.is_finite() || !y.is_finite() {
+                continue;
+            }
+            let (px, py) = (self.px(x), self.py(y).clamp(0.0, y_max));
+            if px < 0.0 || px >= self.dots_w() as f64 {
+                continue;
+            }
+            let ch = match Self::flat_char(py) {
+                '‾' => '\'',
+                '-' => '·',
+                _ => '.',
+            };
+            self.put_glyph((px / 2.0) as usize, (py / 4.0) as usize, ch, layer, color);
         }
     }
 
@@ -854,6 +1026,122 @@ mod tests {
         let mut p = Plot::new(6, 3);
         p.styled(&[(0.0, 0.0)], TraceStyle::Bold, true, LAYER_CH1, RED);
         assert_eq!(used_columns(&p).len(), 2);
+    }
+
+    /// The characters of the line style, row by row, for messages.
+    fn text_rows(p: &Plot) -> String {
+        (0..p.rows)
+            .map(|r| (0..p.cols).map(|c| p.char_at(c, r)).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn line_plot(pts: &[(f64, f64)]) -> Plot {
+        let mut p = Plot::new(6, 3);
+        p.styled(pts, TraceStyle::Line, false, LAYER_CH1, RED);
+        p
+    }
+
+    #[test]
+    fn line_style_square_wave_has_bars_and_flat_tops() {
+        for n in [200, 2000, 20_000] {
+            // High in the top third of a cell, low in the bottom third.
+            let p0 = Plot::new(6, 3);
+            let (hi, lo) = (2.1, -2.1);
+            assert_eq!(Plot::flat_char(p0.py(hi)), '‾');
+            assert_eq!(Plot::flat_char(p0.py(lo)), '_');
+            let p = line_plot(&samples(
+                n,
+                |x| if x.rem_euclid(4.0) < 2.0 { hi } else { lo },
+            ));
+            let text = text_rows(&p);
+            assert!(!text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)));
+            let (rh, rl) = (p.row_of(hi), p.row_of(lo));
+            // Each edge is one column of `|` from the high row to the low row.
+            let bars: Vec<usize> = (0..p.cols)
+                .filter(|&c| (rh + 1..rl).all(|r| p.char_at(c, r) == '|'))
+                .collect();
+            assert_eq!(bars.len(), 5, "n {n}:\n{text}");
+            for c in 0..p.cols {
+                if bars.contains(&c) {
+                    continue;
+                }
+                let col: String = (0..p.rows).map(|r| p.char_at(c, r)).collect();
+                let ink: Vec<char> = col.chars().filter(|&ch| ch != ' ').collect();
+                assert_eq!(ink.len(), 1, "n {n} col {c}:\n{text}");
+                assert!(
+                    p.char_at(c, rh) == '‾' || p.char_at(c, rl) == '_',
+                    "n {n} col {c}:\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn line_style_slopes() {
+        // One cell row per cell column (2 div up per div across, with 6
+        // cells across and 3 up per division): one slope character each.
+        let ramp = |k: f64| samples(2000, move |x| if x.abs() < 1.9 { k * x } else { f64::NAN });
+        let rise = line_plot(&ramp(2.0));
+        let fall = line_plot(&ramp(-2.0));
+        for (p, want, other) in [(&rise, '/', '\\'), (&fall, '\\', '/')] {
+            let text = text_rows(p);
+            let n = text.chars().filter(|&c| c == want).count();
+            assert!(n >= 20, "{want}: {n}\n{text}");
+            assert!(!text.contains(other) && !text.contains('|'), "{text}");
+        }
+        // A slow slope steps through the three heights of a cell.
+        let slow = text_rows(&line_plot(&samples(2000, |x| x * 0.1)));
+        for c in ['_', '-', '‾'] {
+            assert!(slow.contains(c), "{c}\n{slow}");
+        }
+    }
+
+    #[test]
+    fn line_style_layers_and_dots() {
+        let mut p = Plot::new(4, 2);
+        p.styled(
+            &samples(500, |_| 0.0),
+            TraceStyle::Line,
+            false,
+            LAYER_CH2,
+            BLUE,
+        );
+        p.styled(
+            &samples(500, |_| 0.0),
+            TraceStyle::Line,
+            false,
+            LAYER_CH1,
+            RED,
+        );
+        let row = p.row_of(0.0);
+        assert_eq!(p.char_at(5, row), '-');
+        assert_eq!(p.cell(5, row).color, RED);
+        // A lower layer does not take the cell back.
+        p.styled(
+            &samples(500, |_| 0.0),
+            TraceStyle::Line,
+            false,
+            LAYER_PERSIST,
+            BLUE,
+        );
+        assert_eq!(p.cell(5, row).color, RED);
+        // Dots: one character per point.
+        let mut d = Plot::new(4, 2);
+        d.styled(
+            &[(-4.0, 0.0), (0.0, 2.0)],
+            TraceStyle::Line,
+            true,
+            LAYER_CH1,
+            RED,
+        );
+        let text = text_rows(&d);
+        assert_eq!(
+            text.chars().filter(|c| !c.is_whitespace()).count(),
+            2,
+            "{text}"
+        );
+        assert_eq!(d.char_at(d.col_of(-4.0), d.row_of(0.0)), '·');
     }
 
     #[test]

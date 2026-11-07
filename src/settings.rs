@@ -221,16 +221,26 @@ pub enum TraceStyle {
     Thin,
     /// The thin line, two dots wide.
     Bold,
+    /// No braille: one text character per cell, like an old ASCII scope.
+    /// `|` for steep runs, `/` and `\` for slopes, `_`, `-` and `‾` for
+    /// flat parts at the bottom, middle and top of the cell.
+    Line,
 }
 
 impl TraceStyle {
-    pub const ALL: [TraceStyle; 3] = [TraceStyle::Classic, TraceStyle::Thin, TraceStyle::Bold];
+    pub const ALL: [TraceStyle; 4] = [
+        TraceStyle::Classic,
+        TraceStyle::Thin,
+        TraceStyle::Bold,
+        TraceStyle::Line,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             TraceStyle::Classic => "classic",
             TraceStyle::Thin => "braille thin",
             TraceStyle::Bold => "bold",
+            TraceStyle::Line => "ascii lines",
         }
     }
 }
@@ -474,7 +484,7 @@ mod tests {
         s.trigger.slope = Slope::Both;
         s.display.window = Window::FlatTop;
         s.math.mode = MathMode::Mul;
-        s.display.trace_style = [TraceStyle::Thin, TraceStyle::Bold, TraceStyle::Classic];
+        s.display.trace_style = [TraceStyle::Thin, TraceStyle::Bold, TraceStyle::Line];
         s.display.cursor_style = CursorStyle::Fine;
         let text = toml::to_string_pretty(&s).unwrap();
         let back: Settings = toml::from_str(&text).unwrap();
