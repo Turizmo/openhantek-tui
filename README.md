@@ -161,7 +161,9 @@ Press `S` (or `F2`). The panel opens at the bottom of the screen, and the
 live trace stays above it, so you see each change at once. It has three
 columns, like the file manager yazi: categories, the settings in that
 category with their values, and the possible values (or help) of the
-setting under the cursor. Number settings (positions, trigger level and
+setting under the cursor. The line above the key hints explains the
+setting under the cursor; it has the bold gray of the panel heading, so
+it does not look like a setting row. Number settings (positions, trigger level and
 position, cursor positions, calibration frequency) show their value in a
 box in the third column instead of a list:
 

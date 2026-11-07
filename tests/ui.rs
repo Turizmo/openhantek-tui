@@ -677,6 +677,38 @@ fn settings_panel_runs_actions_and_shows_device() {
     assert!(t.contains("connected"));
 }
 
+#[test]
+fn panel_help_line_has_the_heading_colour() {
+    use openhantek_tui::theme::{ColorMode, Palette};
+    let mut r = rig();
+    r.app.scope.settings.display.colors = ColorMode::TrueColor;
+    r.char('S');
+    r.char('l');
+    let buf = r.buffer(120, 40);
+    let lines = r.screen(120, 40);
+    // Cell (column, row) where `needle` starts.
+    let find = |needle: &str| -> (u16, u16) {
+        let y = lines.iter().position(|l| l.contains(needle)).unwrap();
+        let col = lines[y]
+            .char_indices()
+            .position(|(i, _)| lines[y][i..].starts_with(needle))
+            .unwrap();
+        (col as u16, y as u16)
+    };
+    let (tx, ty) = find("Settings · Channel 1");
+    let (hx, hy) = find("Show this channel");
+    let (rx, ry) = find("Volts/div");
+    let title = buf[(tx, ty)].style();
+    let help = buf[(hx, hy)].style();
+    let row = buf[(rx, ry)].style();
+    assert_eq!(title.fg, help.fg);
+    assert_eq!(title.add_modifier, help.add_modifier);
+    let want = ui::panel_heading(&Palette::new(ColorMode::TrueColor));
+    assert_eq!((help.fg, help.add_modifier), (want.fg, want.add_modifier));
+    // A setting row does not look like it.
+    assert_ne!((row.fg, row.add_modifier), (help.fg, help.add_modifier));
+}
+
 /// Rows of the open settings panel on the screen, borders included.
 fn panel_rows(lines: &[String]) -> usize {
     let top = lines

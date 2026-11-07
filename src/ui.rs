@@ -1001,7 +1001,10 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let current = p.current();
     // The key hints or the input line go in the bottom border.
     let block = Block::bordered()
-        .title(format!(" Settings · {} ", p.breadcrumb()))
+        .title(Line::styled(
+            format!(" Settings · {} ", p.breadcrumb()),
+            panel_heading(pal),
+        ))
         .title_bottom(panel_foot(app, current, area.width.saturating_sub(2), pal))
         .border_style(Style::default().fg(pal.axis));
     let inner = block.inner(area);
@@ -1116,15 +1119,20 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     }
     f.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), val_area);
 
-    // Help for the field.
+    // Help for the field, in the colour of the heading, so it does not
+    // look like one more setting row.
     let help_text = current.map_or("", |f| f.help());
     f.render_widget(
-        Paragraph::new(Line::styled(
-            format!(" {help_text}"),
-            Style::default().fg(Color::Gray),
-        )),
+        Paragraph::new(Line::styled(format!(" {help_text}"), panel_heading(pal))),
         help,
     );
+}
+
+/// Style of the panel heading and of the help line of the setting.
+pub fn panel_heading(pal: &Palette) -> Style {
+    Style::default()
+        .fg(pal.label)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// The value column of a number setting: the value in a box, the step and
