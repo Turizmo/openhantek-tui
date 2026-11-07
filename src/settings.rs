@@ -210,6 +210,52 @@ pub enum Interpolation {
     Sinc,
 }
 
+/// How a trace is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TraceStyle {
+    /// Braille lines from point to point, through the low and high value
+    /// of each dot column. Thicker where the signal is noisy or steep.
+    #[default]
+    Classic,
+    /// One braille dot thick: one vertical run per dot column.
+    Thin,
+    /// The thin line, two dots wide.
+    Bold,
+}
+
+impl TraceStyle {
+    pub const ALL: [TraceStyle; 3] = [TraceStyle::Classic, TraceStyle::Thin, TraceStyle::Bold];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TraceStyle::Classic => "classic",
+            TraceStyle::Thin => "braille thin",
+            TraceStyle::Bold => "bold",
+        }
+    }
+}
+
+/// How the cursor lines are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CursorStyle {
+    /// Grey dashes of a fixed length, names inside the plot.
+    #[default]
+    Classic,
+    /// Short dashes on every cell, names in the margin.
+    Fine,
+}
+
+impl CursorStyle {
+    pub const ALL: [CursorStyle; 2] = [CursorStyle::Classic, CursorStyle::Fine];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CursorStyle::Classic => "classic",
+            CursorStyle::Fine => "fine dashes",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DisplaySettings {
@@ -230,6 +276,9 @@ pub struct DisplaySettings {
     pub measurements: bool,
     /// Colours: auto, true colour, 256 or 16 colours.
     pub colors: ColorMode,
+    /// How CH1, CH2 and MATH are drawn (also in the spectrum).
+    pub trace_style: [TraceStyle; 3],
+    pub cursor_style: CursorStyle,
 }
 
 impl Default for DisplaySettings {
@@ -245,6 +294,8 @@ impl Default for DisplaySettings {
             dots: false,
             measurements: true,
             colors: ColorMode::Auto,
+            trace_style: [TraceStyle::Classic; 3],
+            cursor_style: CursorStyle::Classic,
         }
     }
 }
@@ -423,8 +474,30 @@ mod tests {
         s.trigger.slope = Slope::Both;
         s.display.window = Window::FlatTop;
         s.math.mode = MathMode::Mul;
+        s.display.trace_style = [TraceStyle::Thin, TraceStyle::Bold, TraceStyle::Classic];
+        s.display.cursor_style = CursorStyle::Fine;
         let text = toml::to_string_pretty(&s).unwrap();
         let back: Settings = toml::from_str(&text).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn old_files_get_the_classic_styles() {
+        // A file from before the style settings: no trace_style, no
+        // cursor_style.
+        let text = "[display]\ndots = true\n";
+        let s: Settings = toml::from_str(text).unwrap();
+        assert!(s.display.dots);
+        assert_eq!(s.display.trace_style, [TraceStyle::Classic; 3]);
+        assert_eq!(s.display.cursor_style, CursorStyle::Classic);
+        // Each style is saved by name.
+        let mut s = Settings::default();
+        s.display.trace_style[1] = TraceStyle::Bold;
+        let text = toml::to_string_pretty(&s).unwrap();
+        let text: String = text.split_whitespace().collect();
+        assert!(
+            text.contains(r#"trace_style=["Classic","Bold","Classic",]"#),
+            "{text}"
+        );
     }
 }
