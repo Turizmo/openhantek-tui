@@ -1,16 +1,11 @@
 //! Drawing the screen with ratatui.
 
-use std::sync::OnceLock;
-
 use ratatui::{
+    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols::Marker,
     text::{Line, Span},
-    widgets::{
-        canvas::{Canvas, Context, Line as CLine, Points},
-        Block, Clear, Paragraph, Wrap,
-    },
+    widgets::{Block, Clear, Paragraph, Wrap},
     Frame as TermFrame,
 };
 
@@ -18,60 +13,85 @@ use crate::app::App;
 use crate::dsp::fft::{spectrum, Spectrum};
 use crate::dsp::measure::Measurements;
 use crate::dsp::sinc_interpolate;
+use crate::panel::{Focus, Kind};
+use crate::plot::{self, Geometry, Plot, LABEL_W, MARKER_W};
 use crate::scope::{Frame, TrigState, MATH};
 use crate::settings::*;
 use crate::si::{fmt_opt, fmt_percent, fmt_si};
+use crate::theme::Palette;
 
-/// Trace colors: CH1, CH2, MATH.
-pub const COLORS: [Color; 3] = [Color::LightYellow, Color::LightCyan, Color::LightMagenta];
-/// Dimmed trace colors, for persistence.
-const DIM: [Color; 3] = [Color::Yellow, Color::Cyan, Color::Magenta];
 const NAMES: [&str; 3] = ["CH1", "CH2", "MATH"];
 
 /// Spectrum scale: top line and dB per division.
 pub const SPECTRUM_TOP_DBV: f64 = 20.0;
 pub const SPECTRUM_DB_PER_DIV: f64 = 15.0;
 
+/// Smallest settings panel, in rows.
+const PANEL_MIN_ROWS: u16 = 10;
+
 pub fn draw(f: &mut TermFrame, app: &App) {
-    let [main, status1, status2, status3] = Layout::vertical([
+    let area = f.area();
+    let pal = Palette::for_setting(app.scope.settings.display.colors);
+    let panel_h = if app.panel_open {
+        panel_height(area.height)
+    } else {
+        0
+    };
+    let [main, panel, status1, status2, status3] = Layout::vertical([
         Constraint::Min(6),
+        Constraint::Length(panel_h),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(f.area());
+    .areas(area);
     let s = &app.scope.settings;
 
     // Measurement panel on the right, if there is room.
     let panel_w = measurement_width(app, main.width);
-    let [view, panel] =
+    let [view, meas] =
         Layout::horizontal([Constraint::Min(20), Constraint::Length(panel_w)]).areas(main);
     if panel_w > 0 {
-        draw_measurements(f, app, panel);
+        draw_measurements(f, app, meas, &pal);
     }
     if s.display.spectrum && !s.display.xy {
+        let time_h = split_height(view.height);
         let [time, spec] =
-            Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(view);
-        draw_time(f, app, time);
-        draw_spectrum(f, app, spec);
+            Layout::vertical([Constraint::Length(time_h), Constraint::Min(0)]).areas(view);
+        draw_time(f, app, time, &pal);
+        draw_spectrum(f, app, spec, &pal);
     } else if s.display.xy {
-        draw_xy(f, app, view);
+        draw_xy(f, app, view, &pal);
     } else {
-        draw_time(f, app, view);
+        draw_time(f, app, view, &pal);
     }
-    draw_channel_line(f, app, status1);
+    if app.panel_open {
+        draw_panel(f, app, panel, &pal);
+    }
+    draw_channel_line(f, app, status1, &pal);
     draw_time_line(f, app, status2);
     draw_message_line(f, app, status3);
     if app.help {
-        draw_help(f, f.area());
+        draw_help(f, area);
     }
 }
 
-/// Traces in drawing order: the selected trace last, so it is on top.
-fn draw_order(s: &Settings) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..3).filter(|&t| t != s.selected).collect();
-    order.push(s.selected);
-    order
+/// Rows for the settings panel: 40 % of the screen, at least 10 rows,
+/// and the plot keeps at least 6 rows.
+pub fn panel_height(h: u16) -> u16 {
+    let want = (h as u32 * 40 / 100) as u16;
+    want.max(PANEL_MIN_ROWS).min(h.saturating_sub(3 + 6))
+}
+
+/// Height of the time view when the spectrum is below it: about 55 % of
+/// the rows, rounded down to a whole number of rows per division.
+fn split_height(h: u16) -> u16 {
+    let target = h * 55 / 100;
+    (1..=40)
+        .rev()
+        .map(|ry| 2 + Geometry::height_for(ry))
+        .find(|need| *need <= target)
+        .unwrap_or(target)
 }
 
 pub fn trace_enabled(s: &Settings, t: usize) -> bool {
@@ -99,64 +119,50 @@ fn trace_unit(s: &Settings, t: usize) -> &'static str {
     }
 }
 
-fn grid() -> &'static [(f64, f64)] {
-    static GRID: OnceLock<Vec<(f64, f64)>> = OnceLock::new();
-    GRID.get_or_init(|| {
-        let mut points = Vec::new();
-        let (half_h, half_v) = (H_DIVS / 2.0, V_DIVS / 2.0);
-        for i in 0..=H_DIVS as i32 {
-            let x = i as f64 - half_h;
-            for j in 0..=(V_DIVS * 5.0) as i32 {
-                points.push((x, j as f64 / 5.0 - half_v));
-            }
-        }
-        for j in 0..=V_DIVS as i32 {
-            let y = j as f64 - half_v;
-            for i in 0..=(H_DIVS * 5.0) as i32 {
-                points.push((i as f64 / 5.0 - half_h, y));
-            }
-        }
-        points
-    })
+/// Traces in drawing order: the selected trace last, so it is on top.
+fn draw_order(s: &Settings) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..3).filter(|&t| t != s.selected).collect();
+    order.push(s.selected);
+    order
 }
 
-/// Screen points of a trace, in divisions. Many samples are cut down to a
-/// min/max pair per dot column; few samples get sin(x)/x points between.
-pub fn trace_points(frame: &Frame, t: usize, s: &Settings, dots_x: usize) -> Vec<(f64, f64)> {
+/// Plot layer of a trace: the selected one is on top, then CH1, CH2, MATH.
+fn layer_of(s: &Settings, t: usize) -> u8 {
+    if t == s.selected {
+        plot::LAYER_TOP
+    } else {
+        [plot::LAYER_CH1, plot::LAYER_CH2, plot::LAYER_MATH][t]
+    }
+}
+
+/// Screen points of a trace, in divisions, in time order. Few samples get
+/// sin(x)/x points between them. With `dots`, only the real samples.
+pub fn trace_points(
+    frame: &Frame,
+    t: usize,
+    s: &Settings,
+    dots_x: usize,
+    dots: bool,
+) -> Vec<(f64, f64)> {
     let Some(tr) = frame.traces[t].as_ref() else {
         return Vec::new();
     };
     let (scale, offset) = trace_scale(s, t);
-    let half_h = H_DIVS / 2.0;
     let half_v = V_DIVS / 2.0;
-    let y = |v: f64| (v / scale + offset).clamp(-half_v, half_v);
+    let y = |v: f64| {
+        if v.is_finite() {
+            (v / scale + offset).clamp(-half_v, half_v)
+        } else {
+            f64::NAN
+        }
+    };
     let r = frame.visible(s, tr.len());
     let n = r.len();
-    let dots_x = dots_x.max(2);
     if n == 0 {
         return Vec::new();
     }
-    if n > 2 * dots_x {
-        let mut cols: Vec<Option<(f64, f64)>> = vec![None; dots_x];
-        for i in r {
-            let v = tr[i];
-            if !v.is_finite() {
-                continue;
-            }
-            let x = frame.x(i as f64, s);
-            let px = (((x + half_h) / H_DIVS) * dots_x as f64) as usize;
-            let c = &mut cols[px.min(dots_x - 1)];
-            *c = Some(c.map_or((v, v), |(lo, hi)| (lo.min(v), hi.max(v))));
-        }
-        let mut out = Vec::with_capacity(dots_x * 2);
-        for (px, c) in cols.iter().enumerate() {
-            if let Some((lo, hi)) = c {
-                let x = (px as f64 + 0.5) / dots_x as f64 * H_DIVS - half_h;
-                out.push((x, y(*lo)));
-                out.push((x, y(*hi)));
-            }
-        }
-        return out;
+    if dots {
+        return r.map(|i| (frame.x(i as f64, s), y(tr[i]))).collect();
     }
     if s.display.interpolation == Interpolation::Sinc && n * 4 < dots_x {
         let factor = (dots_x / n).clamp(2, 32);
@@ -166,33 +172,21 @@ pub fn trace_points(frame: &Frame, t: usize, s: &Settings, dots_x: usize) -> Vec
         return fine
             .iter()
             .enumerate()
-            .filter_map(|(j, v)| {
-                let x = frame.x(lo as f64 + j as f64 / factor as f64, s);
-                (x >= -half_h - 1e-9 && x <= half_h + 1e-9 && v.is_finite()).then(|| (x, y(*v)))
-            })
+            .map(|(j, v)| (frame.x(lo as f64 + j as f64 / factor as f64, s), y(*v)))
             .collect();
     }
-    r.filter(|&i| tr[i].is_finite())
-        .map(|i| (frame.x(i as f64, s), y(tr[i])))
-        .collect()
+    // One sample more on each side, so the line reaches the screen edges.
+    let lo = r.start.saturating_sub(1);
+    let hi = (r.end + 1).min(tr.len());
+    (lo..hi).map(|i| (frame.x(i as f64, s), y(tr[i]))).collect()
 }
 
-fn draw_points(ctx: &mut Context, points: &[(f64, f64)], color: Color, dots: bool) {
-    if dots || points.len() < 2 {
-        ctx.draw(&Points {
-            coords: points,
-            color,
-        });
-        return;
-    }
-    for w in points.windows(2) {
-        ctx.draw(&CLine {
-            x1: w[0].0,
-            y1: w[0].1,
-            x2: w[1].0,
-            y2: w[1].1,
-            color,
-        });
+fn draw_trace(plot: &mut Plot, frame: &Frame, t: usize, s: &Settings, layer: u8, color: Color) {
+    let pts = trace_points(frame, t, s, plot.dots_w(), s.display.dots);
+    if s.display.dots {
+        plot.points(&pts, layer, color);
+    } else {
+        plot.trace(&pts, layer, color);
     }
 }
 
@@ -241,150 +235,217 @@ fn title(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-fn draw_time(f: &mut TermFrame, app: &App, area: Rect) {
+/// Short SI text with no space, like `-500mV` or `2ms`. The value is
+/// rounded to a multiple of `step`, so tiny offsets do not show as `2.02mV`.
+fn compact(v: f64, step: f64, unit: &str) -> String {
+    let v = if step > 0.0 {
+        (v / step).round() * step
+    } else {
+        v
+    };
+    let v = if v.abs() < 1e-12 { 0.0 } else { v };
+    fmt_si(v, unit).replace(' ', "")
+}
+
+/// Write `text` at (x, y), cut at `max_x`.
+fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style, max_x: u16) {
+    for (cx, ch) in (x..max_x).zip(text.chars()) {
+        if let Some(cell) = buf.cell_mut((cx, y)) {
+            cell.set_char(ch).set_style(style);
+        }
+    }
+}
+
+/// Labels left of the plot, one per division line, right-aligned.
+fn left_labels(buf: &mut Buffer, g: &Geometry, label: impl Fn(usize) -> String, style: Style) {
+    if g.margins.left < LABEL_W + MARKER_W {
+        return;
+    }
+    let x = g.plot.x - g.margins.left;
+    for j in 0..=plot::V_DIVS {
+        let y = g.plot.y + (j * g.ry) as u16;
+        let text = label(j);
+        let text: String = text.chars().take(LABEL_W as usize).collect();
+        let pad = LABEL_W as usize - text.chars().count();
+        put(buf, x + pad as u16, y, &text, style, x + LABEL_W);
+    }
+}
+
+/// Labels below the plot, one per division (fewer when they do not fit).
+fn bottom_labels(buf: &mut Buffer, g: &Geometry, label: impl Fn(usize) -> String, style: Style) {
+    if g.margins.bottom == 0 {
+        return;
+    }
+    let y = g.plot.y + g.plot.height;
+    let min_x = g.plot.x - g.margins.left;
+    let max_x = g.plot.x + g.plot.width + g.margins.right;
+    let texts: Vec<String> = (0..=plot::H_DIVS).map(&label).collect();
+    let widest = texts.iter().map(|t| t.chars().count()).max().unwrap_or(1);
+    // Every division, every 2nd or every 5th, so labels do not touch.
+    let every = [1, 2, 5, 10]
+        .into_iter()
+        .find(|e| e * g.cx > widest)
+        .unwrap_or(10);
+    for (k, text) in texts.iter().enumerate() {
+        if k % every != 0 {
+            continue;
+        }
+        let w = text.chars().count() as u16;
+        let center = g.plot.x + (k * g.cx) as u16;
+        let x = center
+            .saturating_sub(w / 2)
+            .clamp(min_x, max_x.saturating_sub(w));
+        put(buf, x, y, text, style, max_x);
+    }
+}
+
+fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let sc = &app.scope;
     let s = &sc.settings;
     let block = Block::bordered().title(title(app));
     let inner = block.inner(area);
-    let dots_x = inner.width as usize * 2;
-    let half_h = H_DIVS / 2.0;
-    let half_v = V_DIVS / 2.0;
+    f.render_widget(block, area);
+    let Some(g) = Geometry::fit(inner) else {
+        return;
+    };
+    let mut plot = Plot::new(g.cx, g.ry);
+    plot.grid(pal);
+    match s.cursors.mode {
+        CursorMode::Time => {
+            for &x in &s.cursors.t {
+                plot.dashed_v(x, plot::LAYER_CURSOR, pal.cursor);
+            }
+        }
+        CursorMode::Volt => {
+            for &y in &s.cursors.v {
+                plot.dashed_h(y, plot::LAYER_CURSOR, pal.cursor);
+            }
+        }
+        CursorMode::Off => {}
+    }
     let order = draw_order(s);
-    let mut layers: Vec<(Vec<(f64, f64)>, Color)> = Vec::new();
     // Old frames first, dimmed.
     for old in &sc.history {
         for &t in &order {
             if trace_enabled(s, t) {
-                layers.push((trace_points(old, t, s, dots_x), DIM[t]));
+                draw_trace(&mut plot, old, t, s, plot::LAYER_PERSIST, pal.dim[t]);
             }
         }
     }
     if let Some(frame) = &sc.frame {
         for &t in &order {
             if trace_enabled(s, t) {
-                layers.push((trace_points(frame, t, s, dots_x), COLORS[t]));
+                draw_trace(&mut plot, frame, t, s, layer_of(s, t), pal.trace[t]);
             }
         }
     }
-    let dots = s.display.dots;
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(Marker::Braille)
-        .x_bounds([-half_h, half_h])
-        .y_bounds([-half_v, half_v])
-        .paint(|ctx| {
-            ctx.draw(&Points {
-                coords: grid(),
-                color: Color::DarkGray,
-            });
-            draw_cursors(ctx, s);
-            ctx.layer();
-            for (points, color) in &layers {
-                draw_points(ctx, points, *color, dots);
-            }
-            draw_markers(ctx, app);
-            if sc.frame.is_none() {
-                let text = app
-                    .status
-                    .clone()
-                    .unwrap_or_else(|| "Waiting for data...".to_string());
-                ctx.print(
-                    -half_h + 0.3,
-                    0.0,
-                    Line::styled(text, Style::default().fg(Color::Gray)),
-                );
-            }
-        });
-    f.render_widget(canvas, area);
-}
-
-fn draw_cursors(ctx: &mut Context, s: &Settings) {
-    let (half_h, half_v) = (H_DIVS / 2.0, V_DIVS / 2.0);
-    let color = Color::Gray;
-    match s.cursors.mode {
-        CursorMode::Off => {}
-        CursorMode::Time => {
-            for &x in &s.cursors.t {
-                dashed(ctx, (x, -half_v), (x, half_v), color);
-            }
-        }
-        CursorMode::Volt => {
-            for &y in &s.cursors.v {
-                dashed(ctx, (-half_h, y), (half_h, y), color);
-            }
-        }
+    let buf = f.buffer_mut();
+    plot.render(buf, g.plot);
+    time_margins(buf, app, &g, &plot, pal);
+    if sc.frame.is_none() {
+        let text = app
+            .status
+            .clone()
+            .unwrap_or_else(|| "Waiting for data...".to_string());
+        let y = g.plot.y + g.plot.height / 2;
+        put(
+            buf,
+            g.plot.x + 2,
+            y.saturating_sub(1),
+            &text,
+            Style::default().fg(Color::Gray),
+            g.plot.x + g.plot.width,
+        );
     }
 }
 
-fn dashed(ctx: &mut Context, a: (f64, f64), b: (f64, f64), color: Color) {
-    let steps = 80;
-    let coords: Vec<(f64, f64)> = (0..=steps)
-        .filter(|i| i % 4 < 2)
-        .map(|i| {
-            let k = i as f64 / steps as f64;
-            (a.0 + (b.0 - a.0) * k, a.1 + (b.1 - a.1) * k)
-        })
-        .collect();
-    ctx.draw(&Points {
-        coords: &coords,
-        color,
-    });
-}
-
-/// Ground markers, trigger level and trigger position, cursor labels.
-fn draw_markers(ctx: &mut Context, app: &App) {
+/// Labels, ground markers, trigger marks and cursor names around the plot.
+fn time_margins(buf: &mut Buffer, app: &App, g: &Geometry, plot: &Plot, pal: &Palette) {
     let sc = &app.scope;
     let s = &sc.settings;
-    let (half_h, half_v) = (H_DIVS / 2.0, V_DIVS / 2.0);
-    for t in 0..3 {
-        if !trace_enabled(s, t) {
-            continue;
-        }
-        let (_, offset) = trace_scale(s, t);
-        let label = ["1", "2", "M"][t];
-        ctx.print(
-            -half_h,
-            offset.clamp(-half_v + 0.2, half_v),
-            Line::styled(format!("{label}▸"), Style::default().fg(COLORS[t])),
-        );
-    }
+    let half_v = V_DIVS / 2.0;
+    let sel = s.selected;
+    let (scale, offset) = trace_scale(s, sel);
+    let unit = trace_unit(s, sel);
+    left_labels(
+        buf,
+        g,
+        |j| compact((half_v - j as f64 - offset) * scale, scale / 100.0, unit),
+        Style::default().fg(pal.trace[sel]),
+    );
     let roll = sc.frame.as_ref().is_some_and(|f| f.roll) || s.roll();
-    if !roll && !s.display.xy {
+    let x_ref = match &sc.frame {
+        Some(f) => f.x_ref(s),
+        None if roll => H_DIVS / 2.0,
+        None => -H_DIVS / 2.0 + s.trigger.position * H_DIVS,
+    };
+    let tdiv = s.time_per_div();
+    bottom_labels(
+        buf,
+        g,
+        |k| compact((k as f64 - H_DIVS / 2.0 - x_ref) * tdiv, tdiv / 100.0, "s"),
+        Style::default().fg(pal.label),
+    );
+    let right_x = g.plot.x + g.plot.width;
+    // Ground markers: where each trace has its 0 line.
+    if g.margins.left >= MARKER_W {
+        for t in draw_order(s) {
+            if !trace_enabled(s, t) {
+                continue;
+            }
+            let (_, off) = trace_scale(s, t);
+            let y = g.plot.y + plot.row_of(off.clamp(-half_v, half_v)) as u16;
+            let label = ["1▸", "2▸", "M▸"][t];
+            let x = g.plot.x - MARKER_W;
+            put(
+                buf,
+                x,
+                y,
+                label,
+                Style::default().fg(pal.trace[t]),
+                g.plot.x,
+            );
+        }
+    }
+    if !roll && !s.display.xy && g.margins.right >= 1 {
         let src = s.trigger.source;
-        let (scale, offset) = trace_scale(s, src);
-        let y = (s.trigger.level / scale + offset).clamp(-half_v + 0.2, half_v);
-        ctx.print(
-            half_h - 0.25,
+        let (sc_, off) = trace_scale(s, src);
+        let y = g.plot.y + plot.row_of((s.trigger.level / sc_ + off).clamp(-half_v, half_v)) as u16;
+        put(
+            buf,
+            right_x,
             y,
-            Line::styled("◂", Style::default().fg(COLORS[src])),
-        );
-        let x = -half_h + s.trigger.position * H_DIVS;
-        ctx.print(
-            (x - 0.1).clamp(-half_h, half_h - 0.2),
-            half_v,
-            Line::styled("▾", Style::default().fg(Color::LightRed)),
+            "◂",
+            Style::default().fg(pal.trace[src]),
+            right_x + 1,
         );
     }
+    if !roll && g.margins.top >= 1 {
+        let x = g.plot.x + plot.col_of(-H_DIVS / 2.0 + s.trigger.position * H_DIVS) as u16;
+        put(
+            buf,
+            x,
+            g.plot.y - 1,
+            "▾",
+            Style::default().fg(pal.trigger),
+            x + 1,
+        );
+    }
+    let cur = Style::default().fg(pal.cursor);
     match s.cursors.mode {
-        CursorMode::Time => {
+        CursorMode::Time if g.margins.top >= 1 => {
             for (i, &x) in s.cursors.t.iter().enumerate() {
-                ctx.print(
-                    (x + 0.05).min(half_h - 0.2),
-                    half_v - 0.3,
-                    Line::styled(["A", "B"][i], Style::default().fg(Color::White)),
-                );
+                let cx = g.plot.x + plot.col_of(x) as u16 + 1;
+                put(buf, cx, g.plot.y - 1, ["A", "B"][i], cur, right_x);
             }
         }
-        CursorMode::Volt => {
+        CursorMode::Volt if g.margins.right >= 2 => {
             for (i, &y) in s.cursors.v.iter().enumerate() {
-                ctx.print(
-                    half_h - 0.6,
-                    (y + 0.2).min(half_v),
-                    Line::styled(["A", "B"][i], Style::default().fg(Color::White)),
-                );
+                let cy = g.plot.y + plot.row_of(y) as u16;
+                put(buf, right_x + 1, cy, ["A", "B"][i], cur, right_x + 2);
             }
         }
-        CursorMode::Off => {}
+        _ => {}
     }
 }
 
@@ -427,11 +488,10 @@ pub fn spectrum_points(sp: &Spectrum, span: f64, dots_x: usize) -> Vec<(f64, f64
         .collect()
 }
 
-fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect) {
+fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let s = &app.scope.settings;
     let rate = app.scope.frame.as_ref().map_or(1.0, |f| f.rate);
     let span = rate / 2.0 / 2f64.powi(s.display.spectrum_zoom as i32);
-    let bottom = SPECTRUM_TOP_DBV - SPECTRUM_DB_PER_DIV * V_DIVS;
     let main = main_trace(app);
     let mut title = format!(
         " Spectrum · {} · {} dB/div · 0..{} ",
@@ -440,59 +500,60 @@ fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect) {
         fmt_si(span, "Hz")
     );
     let block_inner = Block::bordered().inner(area);
-    let dots_x = block_inner.width as usize * 2;
-    let mut layers = Vec::new();
+    let geo = Geometry::fit(block_inner);
+    let mut plot = geo.map(|g| Plot::new(g.cx, g.ry));
+    if let Some(p) = plot.as_mut() {
+        p.grid(pal);
+    }
+    let to_div = |(hz, db): (f64, f64)| {
+        (
+            hz / span * H_DIVS - H_DIVS / 2.0,
+            (db - SPECTRUM_TOP_DBV) / SPECTRUM_DB_PER_DIV + V_DIVS / 2.0,
+        )
+    };
     for t in draw_order(s) {
         if !trace_enabled(s, t) {
             continue;
         }
-        if let Some(sp) = trace_spectrum(app, t) {
-            if Some(t) == main {
-                if let Some((pf, rms)) = sp.peak() {
-                    title.push_str(&format!(
-                        "· {} peak {} {:.1} dBV ",
-                        NAMES[t],
-                        fmt_si(pf, "Hz"),
-                        20.0 * rms.max(1e-12).log10()
-                    ));
-                }
+        let Some(sp) = trace_spectrum(app, t) else {
+            continue;
+        };
+        if Some(t) == main {
+            if let Some((pf, rms)) = sp.peak() {
+                title.push_str(&format!(
+                    "· {} peak {} {:.1} dBV ",
+                    NAMES[t],
+                    fmt_si(pf, "Hz"),
+                    20.0 * rms.max(1e-12).log10()
+                ));
             }
-            layers.push((spectrum_points(&sp, span, dots_x), COLORS[t]));
+        }
+        if let Some(p) = plot.as_mut() {
+            let pts: Vec<(f64, f64)> = spectrum_points(&sp, span, p.dots_w() - 1)
+                .into_iter()
+                .map(to_div)
+                .collect();
+            p.trace(&pts, layer_of(s, t), pal.trace[t]);
         }
     }
-    let grid: Vec<(f64, f64)> = grid()
-        .iter()
-        .map(|&(x, y)| {
-            (
-                (x + H_DIVS / 2.0) / H_DIVS * span,
-                SPECTRUM_TOP_DBV - (V_DIVS / 2.0 - y) * SPECTRUM_DB_PER_DIV,
-            )
-        })
-        .collect();
-    let canvas = Canvas::default()
-        .block(Block::bordered().title(title))
-        .marker(Marker::Braille)
-        .x_bounds([0.0, span])
-        .y_bounds([bottom, SPECTRUM_TOP_DBV])
-        .paint(|ctx| {
-            ctx.draw(&Points {
-                coords: &grid,
-                color: Color::DarkGray,
-            });
-            ctx.layer();
-            for (points, color) in &layers {
-                draw_points(ctx, points, *color, false);
-            }
-            ctx.print(
-                0.0,
-                SPECTRUM_TOP_DBV,
-                Line::styled(
-                    format!("{SPECTRUM_TOP_DBV:+.0} dBV"),
-                    Style::default().fg(Color::Gray),
-                ),
-            );
-        });
-    f.render_widget(canvas, area);
+    f.render_widget(Block::bordered().title(title), area);
+    let (Some(g), Some(p)) = (geo, plot) else {
+        return;
+    };
+    let buf = f.buffer_mut();
+    p.render(buf, g.plot);
+    left_labels(
+        buf,
+        &g,
+        |j| format!("{:.0}dB", SPECTRUM_TOP_DBV - j as f64 * SPECTRUM_DB_PER_DIV),
+        Style::default().fg(pal.label),
+    );
+    bottom_labels(
+        buf,
+        &g,
+        |k| compact(k as f64 / H_DIVS * span, span / 1000.0, "Hz"),
+        Style::default().fg(pal.label),
+    );
 }
 
 /// XY points: CH1 on x, CH2 on y, in divisions.
@@ -522,25 +583,40 @@ pub fn xy_points(app: &App) -> Vec<(f64, f64)> {
         .collect()
 }
 
-fn draw_xy(f: &mut TermFrame, app: &App, area: Rect) {
+fn draw_xy(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
+    let s = &app.scope.settings;
     let points = xy_points(app);
     let mut t = title(app);
     t.spans.push(Span::raw("· XY: CH1 → x, CH2 → y "));
-    let dots = app.scope.settings.display.dots;
-    let canvas = Canvas::default()
-        .block(Block::bordered().title(t))
-        .marker(Marker::Braille)
-        .x_bounds([-H_DIVS / 2.0, H_DIVS / 2.0])
-        .y_bounds([-V_DIVS / 2.0, V_DIVS / 2.0])
-        .paint(|ctx| {
-            ctx.draw(&Points {
-                coords: grid(),
-                color: Color::DarkGray,
-            });
-            ctx.layer();
-            draw_points(ctx, &points, Color::LightGreen, dots);
-        });
-    f.render_widget(canvas, area);
+    let block = Block::bordered().title(t);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let Some(g) = Geometry::fit(inner) else {
+        return;
+    };
+    let mut plot = Plot::new(g.cx, g.ry);
+    plot.grid(pal);
+    if s.display.dots {
+        plot.points(&points, plot::LAYER_TOP, pal.xy);
+    } else {
+        plot.polyline(&points, plot::LAYER_TOP, pal.xy);
+    }
+    let buf = f.buffer_mut();
+    plot.render(buf, g.plot);
+    let (sx, ox) = trace_scale(s, 0);
+    let (sy, oy) = trace_scale(s, 1);
+    left_labels(
+        buf,
+        &g,
+        |j| compact((V_DIVS / 2.0 - j as f64 - oy) * sy, sy / 100.0, "V"),
+        Style::default().fg(pal.trace[1]),
+    );
+    bottom_labels(
+        buf,
+        &g,
+        |k| compact((k as f64 - H_DIVS / 2.0 - ox) * sx, sx / 100.0, "V"),
+        Style::default().fg(pal.trace[0]),
+    );
 }
 
 /// The measurement rows: label and value text.
@@ -565,14 +641,14 @@ pub fn measurement_rows(m: &Measurements, unit: &str) -> Vec<(&'static str, Stri
     ]
 }
 
-const LABEL_W: u16 = 7;
+const MEAS_LABEL_W: u16 = 7;
 const VALUE_W: u16 = 11;
 
 /// Traces shown in the panel. Narrow screens show only the main trace.
 fn panel_traces(app: &App, width: u16) -> Vec<usize> {
     let s = &app.scope.settings;
     let all: Vec<usize> = (0..3).filter(|&t| trace_enabled(s, t)).collect();
-    let full = LABEL_W + VALUE_W * all.len() as u16 + 2;
+    let full = MEAS_LABEL_W + VALUE_W * all.len() as u16 + 2;
     if width >= full + 60 {
         all
     } else {
@@ -585,7 +661,7 @@ fn measurement_width(app: &App, width: u16) -> u16 {
         return 0;
     }
     let n = panel_traces(app, width).len() as u16;
-    let w = LABEL_W + VALUE_W * n + 2;
+    let w = MEAS_LABEL_W + VALUE_W * n + 2;
     if n == 0 || width < w + 40 {
         0
     } else {
@@ -593,17 +669,19 @@ fn measurement_width(app: &App, width: u16) -> u16 {
     }
 }
 
-fn draw_measurements(f: &mut TermFrame, app: &App, area: Rect) {
+fn draw_measurements(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let s = &app.scope.settings;
     let traces = panel_traces(app, area.width + 60);
     let measured: Vec<Option<Measurements>> =
         traces.iter().map(|&t| app.scope.measure(t)).collect();
     let mut lines = Vec::new();
-    let mut head = vec![Span::raw(format!("{:<w$}", "", w = LABEL_W as usize))];
+    let mut head = vec![Span::raw(format!("{:<w$}", "", w = MEAS_LABEL_W as usize))];
     for &t in &traces {
         head.push(Span::styled(
             format!("{:>w$}", NAMES[t], w = VALUE_W as usize),
-            Style::default().fg(COLORS[t]).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(pal.trace[t])
+                .add_modifier(Modifier::BOLD),
         ));
     }
     lines.push(Line::from(head));
@@ -619,14 +697,14 @@ fn draw_measurements(f: &mut TermFrame, app: &App, area: Rect) {
     let labels = measurement_rows(&Measurements::default(), "V");
     for (r, (label, _)) in labels.iter().enumerate() {
         let mut spans = vec![Span::styled(
-            format!("{label:<w$}", w = LABEL_W as usize),
-            Style::default().fg(Color::Gray),
+            format!("{label:<w$}", w = MEAS_LABEL_W as usize),
+            Style::default().fg(pal.label),
         )];
         for (k, &t) in traces.iter().enumerate() {
             let text = rows[k].get(r).map_or("--".to_string(), |(_, v)| v.clone());
             spans.push(Span::styled(
                 format!("{text:>w$}", w = VALUE_W as usize),
-                Style::default().fg(COLORS[t]),
+                Style::default().fg(pal.trace[t]),
             ));
         }
         lines.push(Line::from(spans));
@@ -637,7 +715,7 @@ fn draw_measurements(f: &mut TermFrame, app: &App, area: Rect) {
     );
 }
 
-fn channel_span(app: &App, t: usize) -> Span<'static> {
+fn channel_span(app: &App, t: usize, pal: &Palette) -> Span<'static> {
     let s = &app.scope.settings;
     let text = if t == MATH {
         format!(
@@ -656,7 +734,7 @@ fn channel_span(app: &App, t: usize) -> Span<'static> {
             if ch.invert { " INV" } else { "" }
         )
     };
-    let mut style = Style::default().fg(COLORS[t]);
+    let mut style = Style::default().fg(pal.trace[t]);
     if t == s.selected {
         style = style.add_modifier(Modifier::REVERSED);
     }
@@ -666,14 +744,14 @@ fn channel_span(app: &App, t: usize) -> Span<'static> {
     Span::styled(text, style)
 }
 
-fn draw_channel_line(f: &mut TermFrame, app: &App, area: Rect) {
+fn draw_channel_line(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let mut spans = Vec::new();
     for t in 0..3 {
-        spans.push(channel_span(app, t));
+        spans.push(channel_span(app, t, pal));
         spans.push(Span::raw(" "));
     }
     if let Some(text) = cursor_text(app) {
-        spans.push(Span::styled(text, Style::default().fg(Color::White)));
+        spans.push(Span::styled(text, Style::default().fg(pal.cursor)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -767,17 +845,251 @@ fn draw_message_line(f: &mut TermFrame, app: &App, area: Rect) {
         ),
         (None, Some(st)) => Line::styled(format!(" {st}"), Style::default().fg(Color::Yellow)),
         _ => Line::styled(
-            " ? help · q quit · space run/stop · a autoset · ←→ time · ↑↓ volts · tab channel",
+            " ? help · S settings · q quit · space run/stop · a autoset · ←→ time · ↑↓ volts · tab channel",
             Style::default().fg(Color::DarkGray),
         ),
     };
     f.render_widget(Paragraph::new(line), area);
 }
 
+/// First visible row of a list of `len` rows in `height` rows, so that
+/// row `sel` is on screen.
+fn scroll(sel: usize, len: usize, height: usize) -> usize {
+    if len <= height || height == 0 {
+        0
+    } else {
+        sel.saturating_sub(height / 2).min(len - height)
+    }
+}
+
+/// Style of a list row: the cursor row is reversed in the focused column
+/// and bold in the others.
+fn row_style(selected: bool, focused: bool) -> Style {
+    match (selected, focused) {
+        (true, true) => Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        (true, false) => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default(),
+    }
+}
+
+/// `left` and `right` on one row of `width` cells, `right` aligned right.
+fn two_sided(left: &str, right: &str, width: usize) -> String {
+    let lw = left.chars().count();
+    let rw = right.chars().count();
+    if lw + rw + 1 > width {
+        let keep = width.saturating_sub(rw + 1).max(1);
+        let left: String = left.chars().take(keep).collect();
+        let lw = left.chars().count();
+        return format!(
+            "{left}{:pad$}{right}",
+            "",
+            pad = width.saturating_sub(lw + rw).max(1)
+        );
+    }
+    format!("{left}{:pad$}{right}", "", pad = width - lw - rw)
+}
+
+fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
+    let p = &app.panel;
+    let s = &app.scope.settings;
+    let d = app.device_info();
+    let block = Block::bordered()
+        .title(format!(" Settings · {} ", p.breadcrumb()))
+        .border_style(Style::default().fg(pal.axis));
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    if inner.height < 3 || inner.width < 24 {
+        return;
+    }
+    let [cols, help, foot] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    let cat_w = (inner.width / 4).clamp(12, 22);
+    let item_w = ((inner.width - cat_w) / 2 + 4).min(46);
+    let [cat_area, sep1, item_area, sep2, val_area] = Layout::horizontal([
+        Constraint::Length(cat_w),
+        Constraint::Length(1),
+        Constraint::Length(item_w),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(cols);
+    let sep_style = Style::default().fg(pal.grid);
+    for sep in [sep1, sep2] {
+        let lines: Vec<Line> = (0..sep.height)
+            .map(|_| Line::styled("│", sep_style))
+            .collect();
+        f.render_widget(Paragraph::new(lines), sep);
+    }
+    let h = cols.height as usize;
+    let groups = p.groups();
+
+    // Categories.
+    let start = scroll(p.cat, groups.len(), h);
+    let lines: Vec<Line> = groups
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(h)
+        .map(|(i, g)| {
+            let w = cat_w as usize;
+            let text = format!(" {:<w$}", g.name, w = w.saturating_sub(1));
+            Line::styled(text, row_style(i == p.cat, p.focus == Focus::Categories))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), cat_area);
+
+    // Settings with their values.
+    let items = groups
+        .get(p.cat)
+        .map(|g| g.items.clone())
+        .unwrap_or_default();
+    let start = scroll(p.item, items.len(), h);
+    let in_items = p.focus != Focus::Categories;
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(h)
+        .map(|(i, (field, label))| {
+            let w = item_w as usize;
+            let value = field.value(s, &d);
+            let text = format!(
+                " {}",
+                two_sided(label, &format!("{value} "), w.saturating_sub(1))
+            );
+            let mut style = row_style(i == p.item && in_items, p.focus == Focus::Items);
+            if field.kind() == Kind::Info && !(i == p.item && in_items) {
+                style = style.fg(pal.label);
+            }
+            Line::styled(text, style)
+        })
+        .collect();
+    if items.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::styled(" no match", Style::default().fg(pal.label))),
+            item_area,
+        );
+    } else {
+        f.render_widget(Paragraph::new(lines), item_area);
+    }
+
+    // Values or help for the field under the cursor.
+    let current = p.current();
+    let mut right: Vec<Line> = Vec::new();
+    if let Some(field) = current {
+        match field.kind() {
+            Kind::Choice | Kind::Bool => {
+                let opts = field.options(s, &d);
+                let now = field.index(s);
+                let cursor = if p.focus == Focus::Values {
+                    p.value
+                } else {
+                    now
+                };
+                let start = scroll(cursor, opts.len(), h);
+                for (i, o) in opts.iter().enumerate().skip(start).take(h) {
+                    let mark = if i == now { "●" } else { " " };
+                    let style = row_style(i == cursor && p.focus == Focus::Values, true);
+                    let style = if i == now && p.focus != Focus::Values {
+                        style.fg(pal.trace[0])
+                    } else {
+                        style
+                    };
+                    right.push(Line::styled(format!(" {mark} {o} "), style));
+                }
+            }
+            Kind::Number => {
+                right.push(Line::from(format!(" Value  {}", field.value(s, &d))));
+                right.push(Line::from(format!(
+                    " Step   ± {}",
+                    match field {
+                        crate::panel::Field::ChOffset(_) | crate::panel::Field::MathOffset =>
+                            format!("{:.1} div", field.step(s)),
+                        crate::panel::Field::TrigPosition => format!("{:.0} %", field.step(s)),
+                        _ => fmt_si(field.step(s), field.unit()),
+                    }
+                )));
+                right.push(Line::from(""));
+                right.push(Line::styled(
+                    " = or ⏎ type a value · + - step",
+                    Style::default().fg(pal.label),
+                ));
+            }
+            Kind::Info => {
+                right.push(Line::from(format!(" {}", field.value(s, &d))));
+            }
+            Kind::Action => {
+                right.push(Line::from(format!(" ⏎ {}", field.label())));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), val_area);
+
+    // Help for the field, then the key hints or the input line.
+    let help_text = current.map_or("", |f| f.help());
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            format!(" {help_text}"),
+            Style::default().fg(Color::Gray),
+        )),
+        help,
+    );
+    let hint = Style::default().fg(Color::DarkGray);
+    let foot_line = if let Some(text) = &p.input {
+        let label = current.map_or("", |f| f.label());
+        let mut spans = vec![
+            Span::styled(format!(" {label} = "), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{text}▏"),
+                Style::default()
+                    .fg(pal.trace[0])
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(e) = &p.error {
+            spans.push(Span::styled(
+                format!("  {e}"),
+                Style::default().fg(Color::LightRed),
+            ));
+        }
+        spans.push(Span::styled("  ⏎ apply · esc cancel · 500m 2k 1.5u", hint));
+        Line::from(spans)
+    } else if p.searching {
+        Line::from(vec![
+            Span::styled(
+                format!(" /{}▏", p.filter),
+                Style::default()
+                    .fg(pal.trace[0])
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ⏎ done · esc clear · ↑↓ move", hint),
+        ])
+    } else if foot.width >= 108 {
+        Line::styled(
+            " j/k move · h/l out/in · ⏎ keep · esc back · space toggle · +/- step · = type · / search · gg/G · S close",
+            hint,
+        )
+    } else {
+        Line::styled(
+            " hjkl move · ⏎ keep · esc back · space toggle · = type · / find · S close",
+            hint,
+        )
+    };
+    f.render_widget(Paragraph::new(foot_line), foot);
+}
+
 /// Every key, for the help screen and the README.
-pub const KEYS: [(&str, &str); 44] = [
+pub const KEYS: [(&str, &str); 45] = [
     ("q Esc", "quit (saves settings)"),
     ("? F1", "this help"),
+    ("S F2", "settings panel (h j k l, / search, = type)"),
     ("space", "run / stop"),
     ("o", "single shot: arm the trigger once"),
     ("a", "autoset"),
@@ -853,5 +1165,52 @@ fn draw_help(f: &mut TermFrame, area: Rect) {
         f.render_widget(Paragraph::new(rows[half..].to_vec()), right);
     } else {
         f.render_widget(Paragraph::new(rows).wrap(Wrap { trim: false }), inner);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_height_rules() {
+        assert_eq!(panel_height(24), 10);
+        assert_eq!(panel_height(40), 16);
+        assert_eq!(panel_height(60), 24);
+        // A tiny screen still leaves room for the plot and status lines.
+        assert_eq!(panel_height(15), 6);
+    }
+
+    #[test]
+    fn split_height_is_a_whole_plot() {
+        for h in [30u16, 37, 50, 60] {
+            let t = split_height(h);
+            assert!(t <= h * 55 / 100, "{h}: {t}");
+            let g = Geometry::fit(Rect::new(0, 0, 100, t - 2)).unwrap();
+            // No spare rows inside the time view.
+            assert_eq!(g.plot.height + 2, t - 2, "{h}");
+        }
+    }
+
+    #[test]
+    fn compact_labels_round_small_offsets() {
+        assert_eq!(compact(0.00202, 0.01, "V"), "0V");
+        assert_eq!(compact(-0.998, 0.01, "V"), "-1V");
+        assert_eq!(compact(-0.0025, 1e-5, "s"), "-2.5ms");
+        assert_eq!(compact(1.5e-3, 0.0, "s"), "1.5ms");
+    }
+
+    #[test]
+    fn two_sided_rows() {
+        assert_eq!(two_sided("Probe", "x1", 10), "Probe   x1");
+        assert_eq!(two_sided("Long label here", "on", 10).chars().count(), 10);
+    }
+
+    #[test]
+    fn scroll_keeps_the_row_visible() {
+        assert_eq!(scroll(0, 5, 10), 0);
+        assert_eq!(scroll(30, 38, 10), 25);
+        assert_eq!(scroll(37, 38, 10), 28);
+        assert_eq!(scroll(12, 38, 10), 7);
     }
 }

@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::acquire::{Acquisition, Command, Event};
 use crate::export;
+use crate::panel::{Action, DeviceInfo, Outcome, Panel};
 use crate::scope::{Scope, MATH};
 use crate::settings::*;
 
@@ -32,13 +33,14 @@ pub struct App {
     pub help: bool,
     pub quit: bool,
     pub export_dir: PathBuf,
+    /// Settings file, when settings are saved on quit.
+    pub settings_path: Option<PathBuf>,
+    /// Notes from connecting, like where the calibration came from.
+    pub device_notes: Vec<String>,
+    pub panel: Panel,
+    pub panel_open: bool,
     sent_running: Option<bool>,
 }
-
-/// Averaging steps for the `A` key.
-const AVERAGING: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
-/// Persistence steps for the `P` key.
-const PERSISTENCE: [usize; 5] = [0, 2, 4, 8, 16];
 
 fn next_in<T: PartialEq + Copy>(list: &[T], v: T) -> T {
     let i = list.iter().position(|x| *x == v).map_or(0, |i| i + 1);
@@ -57,6 +59,10 @@ impl App {
             help: false,
             quit: false,
             export_dir: PathBuf::from("."),
+            settings_path: None,
+            device_notes: Vec::new(),
+            panel: Panel::new(),
+            panel_open: false,
             sent_running: None,
         };
         app.sync();
@@ -114,6 +120,7 @@ impl App {
                     notes.join(" · ")
                 };
                 let warn = notes.iter().any(|n| n.contains("nominal"));
+                self.device_notes = notes;
                 self.notify(text, warn);
                 true
             }
@@ -174,23 +181,29 @@ impl App {
             }
             return;
         }
+        if self.panel_open {
+            if ctrl && key.code == KeyCode::Char('c') {
+                self.quit = true;
+            } else {
+                self.panel_key(key);
+            }
+            return;
+        }
         let sel = self.scope.settings.selected;
         let s = &mut self.scope.settings;
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('?') | KeyCode::F(1) => self.help = true,
+            KeyCode::Char('S') | KeyCode::F(2) => {
+                self.panel_open = true;
+                return;
+            }
 
             // Run control.
-            KeyCode::Char(' ') => {
-                let run = !self.scope.running;
-                self.scope.set_running(run);
-            }
-            KeyCode::Char('o') => {
-                self.scope.arm_single();
-                self.notify("Single: waiting for a trigger", false);
-            }
-            KeyCode::Char('a') => self.scope.start_autoset(),
+            KeyCode::Char(' ') => self.action(Action::RunStop),
+            KeyCode::Char('o') => self.action(Action::Single),
+            KeyCode::Char('a') => self.action(Action::Autoset),
 
             // Channels.
             KeyCode::Tab => s.selected = (sel + 1) % 3,
@@ -243,7 +256,7 @@ impl App {
             KeyCode::Char('-') | KeyCode::Char('_') => {
                 s.trigger.level -= 0.1 * s.channels[s.trigger.source].volts_per_div()
             }
-            KeyCode::Char('T') => self.trigger_to_middle(),
+            KeyCode::Char('T') => self.action(Action::TriggerToMiddle),
             KeyCode::Char(',') | KeyCode::Char('<') => {
                 s.trigger.position = (s.trigger.position - 0.05).max(0.0)
             }
@@ -284,17 +297,74 @@ impl App {
             }
 
             // Files.
-            KeyCode::Char('E') => self.export(false),
-            KeyCode::Char('W') => self.export(true),
-            KeyCode::Char('R') => {
-                let keep = self.scope.settings.selected;
-                self.scope.settings = Settings::default();
-                self.scope.settings.selected = keep;
-                self.notify("Settings reset to defaults", false);
-            }
+            KeyCode::Char('E') => self.action(Action::ExportCsv),
+            KeyCode::Char('W') => self.action(Action::ExportJson),
+            KeyCode::Char('R') => self.action(Action::Reset),
             _ => return,
         }
         self.changed();
+    }
+
+    /// A key while the settings panel is open.
+    fn panel_key(&mut self, key: KeyEvent) {
+        let d = self.device_info();
+        let persistence = self.scope.settings.display.persistence;
+        match self.panel.handle_key(key, &mut self.scope.settings, &d) {
+            Outcome::None => {}
+            Outcome::Changed => {
+                if self.scope.settings.display.persistence != persistence {
+                    self.scope.history.clear();
+                }
+                self.changed();
+            }
+            Outcome::Close => self.panel_open = false,
+            Outcome::Action(a) => {
+                self.action(a);
+                self.changed();
+            }
+            Outcome::Message(text, error) => self.notify(text, error),
+        }
+    }
+
+    /// Run/stop, autoset, export and the other things that are not settings.
+    pub fn action(&mut self, a: Action) {
+        match a {
+            Action::RunStop => {
+                let run = !self.scope.running;
+                self.scope.set_running(run);
+            }
+            Action::Single => {
+                self.scope.arm_single();
+                self.notify("Single: waiting for a trigger", false);
+            }
+            Action::Autoset => self.scope.start_autoset(),
+            Action::TriggerToMiddle => self.trigger_to_middle(),
+            Action::ExportCsv => self.export(false),
+            Action::ExportJson => self.export(true),
+            Action::Reset => {
+                let keep = self.scope.settings.selected;
+                self.scope.settings = Settings::default();
+                self.scope.settings.selected = keep;
+                self.scope.history.clear();
+                self.notify("Settings reset to defaults", false);
+            }
+        }
+    }
+
+    /// Facts for the Device and Files parts of the settings panel.
+    pub fn device_info(&self) -> DeviceInfo {
+        DeviceInfo {
+            name: self.device_name.clone(),
+            connected: self.connected,
+            notes: self.device_notes.clone(),
+            rate: self.scope.hw.as_ref().map(|h| h.rate.rate),
+            running: self.scope.running,
+            export_dir: self.export_dir.display().to_string(),
+            settings_file: self
+                .settings_path
+                .as_ref()
+                .map_or_else(|| "not saved".to_string(), |p| p.display().to_string()),
+        }
     }
 
     /// Set the trigger level to the middle of the source signal.

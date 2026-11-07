@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::dsp::fft::Window;
 use crate::dsp::math::MathMode;
 use crate::dsp::trigger::Slope;
+use crate::theme::ColorMode;
 
 /// Screen grid: 10 divisions wide, 8 divisions high, like a real scope.
 pub const H_DIVS: f64 = 10.0;
@@ -227,6 +228,8 @@ pub struct DisplaySettings {
     /// Draw dots, not lines.
     pub dots: bool,
     pub measurements: bool,
+    /// Colours: auto, true colour, 256 or 16 colours.
+    pub colors: ColorMode,
 }
 
 impl Default for DisplaySettings {
@@ -241,9 +244,15 @@ impl Default for DisplaySettings {
             persistence: 0,
             dots: false,
             measurements: true,
+            colors: ColorMode::Auto,
         }
     }
 }
+
+/// Averaging steps for the `A` key.
+pub const AVERAGING: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+/// Persistence steps for the `P` key.
+pub const PERSISTENCE: [usize; 5] = [0, 2, 4, 8, 16];
 
 /// Spectrum zoom steps: up to 1/256 of the Nyquist frequency.
 pub const MAX_SPECTRUM_ZOOM: u32 = 8;

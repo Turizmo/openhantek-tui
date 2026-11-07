@@ -71,6 +71,7 @@ fn main() -> Result<()> {
     if let Some(dir) = &args.export_dir {
         app.export_dir = dir.clone();
     }
+    app.settings_path = save_path.clone();
     if let Some(e) = &load_error {
         app.notify(
             format!("{e}. Using defaults; the file will not be changed"),
