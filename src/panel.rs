@@ -802,8 +802,6 @@ pub struct Panel {
     pub input: Option<String>,
     /// Error from the last typed value.
     pub error: Option<String>,
-    /// Settings from before entering the value column, for Esc.
-    revert: Option<Settings>,
     pending_g: bool,
     cats: Vec<Category>,
 }
@@ -825,7 +823,6 @@ impl Panel {
             searching: false,
             input: None,
             error: None,
-            revert: None,
             pending_g: false,
             cats: categories(),
         }
@@ -929,7 +926,7 @@ impl Panel {
             KeyCode::Char('G') => self.jump(usize::MAX, s, d),
             KeyCode::Char('j') | KeyCode::Down => self.step(1, s, d),
             KeyCode::Char('k') | KeyCode::Up => self.step(-1, s, d),
-            KeyCode::Char('h') | KeyCode::Left => self.back(s),
+            KeyCode::Char('h') | KeyCode::Left => self.back(),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.enter(s, d),
             KeyCode::Esc => match self.focus {
                 Focus::Categories if !self.filter.is_empty() => {
@@ -939,10 +936,9 @@ impl Panel {
                     Outcome::None
                 }
                 Focus::Categories => Outcome::Close,
-                _ => self.back(s),
+                _ => self.back(),
             },
             KeyCode::Char('q') | KeyCode::Char('S') | KeyCode::F(2) => {
-                self.revert = None;
                 if self.focus == Focus::Values {
                     self.focus = Focus::Items;
                 }
@@ -1039,19 +1035,13 @@ impl Panel {
         }
     }
 
-    /// h: go to the parent column. In the value column this undoes the
-    /// live changes.
-    fn back(&mut self, s: &mut Settings) -> Outcome {
+    /// h / Esc: go to the parent column. A value picked in the value
+    /// column is already applied and stays.
+    fn back(&mut self) -> Outcome {
         match self.focus {
             Focus::Values => {
                 self.focus = Focus::Items;
-                match self.revert.take() {
-                    Some(old) if old != *s => {
-                        *s = old;
-                        Outcome::Changed
-                    }
-                    _ => Outcome::None,
-                }
+                Outcome::None
             }
             Focus::Items => {
                 self.focus = Focus::Categories;
@@ -1078,7 +1068,6 @@ impl Panel {
                 };
                 match f.kind() {
                     Kind::Choice | Kind::Bool => {
-                        self.revert = Some(s.clone());
                         self.value = f.index(s);
                         self.focus = Focus::Values;
                         Outcome::None
@@ -1094,8 +1083,7 @@ impl Panel {
                 }
             }
             Focus::Values => {
-                // Keep the value.
-                self.revert = None;
+                // The value is already applied: go back to the settings.
                 self.focus = Focus::Items;
                 Outcome::None
             }
@@ -1317,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn value_column_applies_live_and_esc_reverts() {
+    fn value_column_applies_at_once_and_keeps_it() {
         let mut p = Panel::new();
         let mut s = Settings::default();
         goto(&mut p, &mut s, "Channel 1", "Coupling");
@@ -1325,22 +1313,29 @@ mod tests {
         assert_eq!(p.focus, Focus::Values);
         assert_eq!(key(&mut p, &mut s, KeyCode::Char('j')), Outcome::Changed);
         assert_eq!(s.channels[0].coupling, Coupling::Ac);
-        // Esc puts the old value back.
-        assert_eq!(key(&mut p, &mut s, KeyCode::Esc), Outcome::Changed);
-        assert_eq!(s.channels[0].coupling, Coupling::Dc);
+        // Esc goes back a column and keeps the new value.
+        assert_eq!(key(&mut p, &mut s, KeyCode::Esc), Outcome::None);
+        assert_eq!(s.channels[0].coupling, Coupling::Ac);
         assert_eq!(p.focus, Focus::Items);
-        // Enter keeps the new value.
+        // h keeps it too.
+        key(&mut p, &mut s, KeyCode::Char('l'));
+        assert_eq!(key(&mut p, &mut s, KeyCode::Char('k')), Outcome::Changed);
+        assert_eq!(s.channels[0].coupling, Coupling::Dc);
+        assert_eq!(key(&mut p, &mut s, KeyCode::Char('h')), Outcome::None);
+        assert_eq!(s.channels[0].coupling, Coupling::Dc);
+        // Enter only goes back, the value is already set.
         key(&mut p, &mut s, KeyCode::Char('l'));
         key(&mut p, &mut s, KeyCode::Char('j'));
-        key(&mut p, &mut s, KeyCode::Enter);
+        assert_eq!(key(&mut p, &mut s, KeyCode::Enter), Outcome::None);
         assert_eq!(s.channels[0].coupling, Coupling::Ac);
         assert_eq!(p.focus, Focus::Items);
-        // h after a change also reverts.
+        // Esc at the top closes, still with the new value.
         key(&mut p, &mut s, KeyCode::Char('l'));
         key(&mut p, &mut s, KeyCode::Char('k'));
+        key(&mut p, &mut s, KeyCode::Esc);
+        key(&mut p, &mut s, KeyCode::Esc);
+        assert_eq!(key(&mut p, &mut s, KeyCode::Esc), Outcome::Close);
         assert_eq!(s.channels[0].coupling, Coupling::Dc);
-        key(&mut p, &mut s, KeyCode::Char('h'));
-        assert_eq!(s.channels[0].coupling, Coupling::Ac);
     }
 
     #[test]

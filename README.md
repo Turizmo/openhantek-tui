@@ -171,9 +171,9 @@ columns scroll to keep the cursor in view.
 | Key | What it does |
 |---|---|
 | `j` `k` `↓` `↑` | move down / up |
-| `l` `→` `Enter` | go into the next column; on a value: keep it |
-| `h` `←` | go back one column; in the value column this undoes the change |
-| `Esc` | go back one column (undoes in the value column); at the left: clear the search, then close |
+| `l` `→` `Enter` | go into the next column; in the value column: go back |
+| `h` `←` | go back one column |
+| `Esc` | go back one column; at the left: clear the search, then close |
 | `Space` | toggle on/off, or the next value |
 | `+` `-` | next / previous value; on numbers: one step up / down |
 | `=` `i` | type an exact number, like `500m`, `2k`, `1.5u`, `-0.2V`, `25%` |
@@ -181,7 +181,9 @@ columns scroll to keep the cursor in view.
 | `gg` `G` | first / last row |
 | `S` `F2` `q` | close the panel (changes stay) |
 
-Moving in the value column changes the setting at once. Offsets take
+Moving in the value column changes the setting at once, and it stays:
+there is no Enter to confirm and no undo. Moving away or closing the
+panel keeps it, and it is saved with the other settings. Offsets take
 divisions, or volts when you type a `V` (like `1.5V`). Time cursors take
 seconds, voltage cursors and the trigger level take volts, the trigger
 position takes percent. Every setting with a key is in the panel, and so

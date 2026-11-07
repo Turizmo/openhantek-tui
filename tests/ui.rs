@@ -434,7 +434,7 @@ fn settings_panel_opens_and_closes() {
 }
 
 #[test]
-fn settings_panel_changes_coupling_live_and_reverts() {
+fn settings_panel_changes_coupling_at_once_and_keeps_it() {
     use openhantek_tui::panel::Focus;
     let mut r = rig();
     r.char('S');
@@ -450,14 +450,13 @@ fn settings_panel_changes_coupling_live_and_reverts() {
     // Live: the channel line shows AC at once.
     assert_eq!(r.app.scope.settings.channels[0].coupling, Coupling::Ac);
     assert!(r.text(140, 40).contains("CH1 1 V/div AC x1"));
-    // Esc puts DC back.
+    // Esc goes back a column and keeps AC; no Enter needed.
     r.key(KeyCode::Esc);
-    assert_eq!(r.app.scope.settings.channels[0].coupling, Coupling::Dc);
-    // Enter keeps the new value.
-    r.char('l');
-    r.char('j');
-    r.key(KeyCode::Enter);
+    assert_eq!(r.app.panel.focus, Focus::Items);
     assert_eq!(r.app.scope.settings.channels[0].coupling, Coupling::Ac);
+    assert!(r.text(140, 40).contains("CH1 1 V/div AC x1"));
+    // The key hints no longer talk about keeping a value.
+    assert!(!r.text(140, 40).contains("keep"));
     r.char('S');
     assert!(!r.app.panel_open);
     assert_eq!(r.app.scope.settings.channels[0].coupling, Coupling::Ac);

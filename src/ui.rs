@@ -1153,12 +1153,12 @@ fn panel_foot(
         ])
     } else if width >= 108 {
         Line::styled(
-            " j/k move · h/l out/in · ⏎ keep · esc back · space toggle · +/- step · = type · / search · gg/G · S close",
+            " j/k move · h/l out/in · esc back · space toggle · +/- step · = type · / search · gg/G · S close",
             hint,
         )
     } else {
         Line::styled(
-            " hjkl move · ⏎ keep · esc back · space toggle · = type · / find · S close",
+            " hjkl move · esc back · space toggle · = type · / find · S close",
             hint,
         )
     };
