@@ -1497,3 +1497,51 @@ fn alt_gives_a_tenth_of_the_position_and_trigger_steps() {
     r.char('k');
     assert!((r.app.scope.settings.trigger.level - 0.12).abs() < 1e-9);
 }
+
+#[test]
+fn measure_cursors_heading_is_right_aligned_in_the_value_colour() {
+    use openhantek_tui::settings::CursorColor;
+    use openhantek_tui::theme::Palette;
+    let check = |r: &Rig, w: u16, h: u16| {
+        let lines = r.screen(w, h);
+        let buf = r.buffer(w, h);
+        let l = layout(r, w, h);
+        let x0 = (w - l.width()) as usize;
+        // Right edge (column of the last character) of `needle` in a row.
+        let right = |y: usize, needle: &str| -> usize {
+            let cells: Vec<char> = lines[y].chars().collect();
+            let s: String = cells[x0..].iter().collect();
+            let i = s.find(needle).unwrap();
+            x0 + s[..i].chars().count() + needle.chars().count() - 1
+        };
+        let ch1 = lines.iter().position(|s| s.contains("CH1 ") || s.contains("CH1│")).unwrap();
+        let hy = lines.iter().position(|s| s.contains("Cursors")).unwrap_or_else(|| panic!("{}", lines.join("\n")));
+        assert_eq!(right(hy, "Cursors"), right(ch1, "CH1"), "{w}x{h}\n{}", lines.join("\n"));
+        let vy = lines.iter().position(|s| s.contains("│ΔT ") || s.contains("ΔT ")).unwrap();
+        let head = buf[(right(hy, "Cursors") as u16, hy as u16)].style().fg;
+        let value = buf[(right(vy, "ms") as u16, vy as u16)].style().fg;
+        let pal = Palette::for_setting(r.app.scope.settings.display.colors);
+        assert_eq!(head, value, "{w}x{h}");
+        assert_eq!(head, Some(ui::cursor_section_color(&r.app.scope.settings, &pal)));
+        l.columns
+    };
+    let mut r = rig();
+    cursors_on(&mut r, &[0, 1]);
+    // Stacked and side by side.
+    assert_eq!(check(&r, 150, 60), 1);
+    assert!(check(&r, 200, 40) > 1);
+    // One colour for all cursors: the heading takes it.
+    for i in 0..2 {
+        r.app.scope.settings.cursors.get_mut(i).color = CursorColor::Green;
+    }
+    check(&r, 150, 60);
+    let pal = Palette::for_setting(r.app.scope.settings.display.colors);
+    assert_eq!(
+        ui::cursor_section_color(&r.app.scope.settings, &pal),
+        ratatui::style::Color::LightGreen
+    );
+    // Two colours: the palette cursor colour for heading and values.
+    r.app.scope.settings.cursors.get_mut(1).color = CursorColor::Red;
+    check(&r, 200, 40);
+    assert_eq!(ui::cursor_section_color(&r.app.scope.settings, &pal), pal.cursor);
+}

@@ -274,6 +274,19 @@ pub fn cursor_colors(c: &Cursor, pal: &Palette) -> (Color, Color) {
     (fixed, fixed)
 }
 
+/// Colour of the Cursors section of the Measure panel, its heading and
+/// its values: the name colour of the cursors that are on when they all
+/// have the same one, else the palette cursor colour.
+pub fn cursor_section_color(s: &Settings, pal: &Palette) -> Color {
+    let mut colors = (0..4)
+        .filter(|&i| s.cursors.shown(i))
+        .map(|i| cursor_colors(s.cursors.get(i), pal).1);
+    match colors.next() {
+        Some(c) if colors.all(|o| o == c) => c,
+        _ => pal.cursor,
+    }
+}
+
 /// One cursor line: vertical at x (`time`) or horizontal at y, in
 /// divisions, in the cursor's style and colour.
 pub fn draw_cursor_line(plot: &mut Plot, c: &Cursor, time: bool, pal: &Palette) {
@@ -1021,11 +1034,17 @@ fn draw_measurements(f: &mut TermFrame, app: &App, layout: &MeasLayout, area: Re
         if s.cursors.shown(2) || s.cursors.shown(3) {
             head.push_str(&format!(" · {}", NAMES[main_trace(app).unwrap_or(0)]));
         }
-        let mut lines = vec![Line::styled(head, label_style.add_modifier(Modifier::BOLD))];
+        // Right-aligned over the value column like the CH1 / CH2
+        // headings, in the colour of the cursor values.
+        let color = Style::default().fg(cursor_section_color(s, pal));
+        let mut lines = vec![Line::styled(
+            format!("{head:>w$}", w = lw + vw),
+            color.add_modifier(Modifier::BOLD),
+        )];
         for (label, value) in cur {
             lines.push(Line::from(vec![
                 Span::styled(format!("{label:<lw$}"), label_style),
-                Span::raw(format!("{value:>vw$}")),
+                Span::styled(format!("{value:>vw$}"), color),
             ]));
         }
         lines
