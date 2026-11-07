@@ -33,6 +33,8 @@ pub enum Field {
     ChCoupling(usize),
     ChProbe(usize),
     ChInvert(usize),
+    /// Trace style of CH1, CH2 or MATH.
+    Style(usize),
     MathEnabled,
     MathMode,
     MathScale,
@@ -51,6 +53,7 @@ pub enum Field {
     Persistence,
     Xy,
     Colors,
+    CursorLook,
     SpecOn,
     SpecWindow,
     SpecZoom,
@@ -129,6 +132,7 @@ pub fn categories() -> Vec<Category> {
             ChCoupling(c),
             ChProbe(c),
             ChInvert(c),
+            Style(c),
         ]
     };
     vec![
@@ -142,7 +146,7 @@ pub fn categories() -> Vec<Category> {
         },
         Category {
             name: "Math",
-            fields: vec![MathEnabled, MathMode, MathScale, MathOffset],
+            fields: vec![MathEnabled, MathMode, MathScale, MathOffset, Style(2)],
         },
         Category {
             name: "Trigger",
@@ -170,6 +174,7 @@ pub fn categories() -> Vec<Category> {
                 Persistence,
                 Xy,
                 Colors,
+                CursorLook,
             ],
         },
         Category {
@@ -178,7 +183,14 @@ pub fn categories() -> Vec<Category> {
         },
         Category {
             name: "Cursors",
-            fields: vec![CursorMode, CursorT(0), CursorT(1), CursorV(0), CursorV(1)],
+            fields: vec![
+                CursorMode,
+                CursorT(0),
+                CursorT(1),
+                CursorV(0),
+                CursorV(1),
+                CursorLook,
+            ],
         },
         Category {
             name: "Measurements",
@@ -237,6 +249,7 @@ impl Field {
             ChCoupling(_) => "Coupling",
             ChProbe(_) => "Probe",
             ChInvert(_) => "Invert",
+            Style(_) => "Style",
             MathMode => "Function",
             MathScale => "Units/div",
             TrigMode => "Mode",
@@ -253,6 +266,7 @@ impl Field {
             Persistence => "Persistence",
             Xy => "XY mode",
             Colors => "Colours",
+            CursorLook => "Cursor style",
             SpecOn => "Show spectrum",
             SpecWindow => "Window",
             SpecZoom => "Span",
@@ -292,6 +306,7 @@ impl Field {
             ChCoupling(_) => "AC takes away the DC part (in software). Key c.",
             ChProbe(_) => "Set this to match the switch on the probe. Key p.",
             ChInvert(_) => "Turn the trace upside down. Key i.",
+            Style(_) => "classic: lines through the low and high value of each dot column. braille thin: one dot thick. bold: two dots thick.",
             MathEnabled => "Show the math trace. Key 3.",
             MathMode => "How the math trace is made from CH1 and CH2. Key m.",
             MathScale => "Units per division of the math trace.",
@@ -310,6 +325,7 @@ impl Field {
             Persistence => "Keep this many old traces on screen, dimmed. Key P.",
             Xy => "Draw CH1 against CH2. Key x.",
             Colors => "auto uses true colour when COLORTERM says so.",
+            CursorLook => "classic: grey dashes, names inside the plot. fine dashes: short dashes, names in the margin.",
             SpecOn => "Show the spectrum (FFT) below the trace. Key f.",
             SpecWindow => "Window function for the FFT. Key w.",
             SpecZoom => "Highest frequency on the spectrum screen. Key F.",
@@ -399,6 +415,14 @@ impl Field {
                 .iter()
                 .map(|m| m.name().to_string())
                 .collect(),
+            Style(_) => crate::settings::TraceStyle::ALL
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect(),
+            CursorLook => crate::settings::CursorStyle::ALL
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect(),
             SpecWindow => Window::ALL.iter().map(|w| w.name().to_string()).collect(),
             SpecZoom => (0..=MAX_SPECTRUM_ZOOM)
                 .map(|z| match d.rate {
@@ -444,6 +468,8 @@ impl Field {
             Averaging => index_of(&AVERAGING, &s.display.averaging),
             Persistence => index_of(&PERSISTENCE, &s.display.persistence),
             Colors => index_of(&ColorMode::ALL, &s.display.colors),
+            Style(t) => index_of(&crate::settings::TraceStyle::ALL, &s.display.trace_style[t]),
+            CursorLook => index_of(&crate::settings::CursorStyle::ALL, &s.display.cursor_style),
             SpecWindow => index_of(&Window::ALL, &s.display.window),
             SpecZoom => s.display.spectrum_zoom as usize,
             CursorMode => index_of(
@@ -505,6 +531,14 @@ impl Field {
             Averaging => s.display.averaging = AVERAGING[i.min(AVERAGING.len() - 1)],
             Persistence => s.display.persistence = PERSISTENCE[i.min(PERSISTENCE.len() - 1)],
             Colors => s.display.colors = ColorMode::ALL[i.min(ColorMode::ALL.len() - 1)],
+            Style(t) => {
+                let all = crate::settings::TraceStyle::ALL;
+                s.display.trace_style[t] = all[i.min(all.len() - 1)]
+            }
+            CursorLook => {
+                let all = crate::settings::CursorStyle::ALL;
+                s.display.cursor_style = all[i.min(all.len() - 1)]
+            }
             SpecWindow => s.display.window = Window::ALL[i.min(Window::ALL.len() - 1)],
             SpecZoom => s.display.spectrum_zoom = (i as u32).min(MAX_SPECTRUM_ZOOM),
             CursorMode => {
@@ -1245,7 +1279,7 @@ mod tests {
         key(&mut p, &mut s, KeyCode::Char('l'));
         assert_eq!(p.focus, Focus::Items);
         key(&mut p, &mut s, KeyCode::Char('G'));
-        assert_eq!(p.current(), Some(Field::ChInvert(0)));
+        assert_eq!(p.current(), Some(Field::Style(0)));
         keys(&mut p, &mut s, "gg");
         assert_eq!(p.current(), Some(Field::ChEnabled(0)));
         key(&mut p, &mut s, KeyCode::Char('h'));

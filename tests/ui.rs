@@ -468,3 +468,146 @@ fn settings_panel_fits_small_screens() {
         }
     }
 }
+
+/// Braille dots on the screen, counted dot by dot.
+fn braille_dots(lines: &[String]) -> u32 {
+    lines
+        .iter()
+        .flat_map(|l| l.chars())
+        .filter(|c| ('\u{2801}'..='\u{28FF}').contains(c))
+        .map(|c| (c as u32 - 0x2800).count_ones())
+        .sum()
+}
+
+fn styled_rig(style: TraceStyle) -> Rig {
+    let mut r = Rig::new([SINE_1K, Wave::CalOut]);
+    r.app.scope.settings.display.trace_style = [style; 3];
+    r.feed();
+    r
+}
+
+#[test]
+fn classic_styles_are_the_default() {
+    let s = Settings::default();
+    assert_eq!(s.display.trace_style, [TraceStyle::Classic; 3]);
+    assert_eq!(s.display.cursor_style, CursorStyle::Classic);
+}
+
+#[test]
+fn every_trace_style_draws_with_dots_persistence_and_interpolation() {
+    for style in TraceStyle::ALL {
+        let mut r = styled_rig(style);
+        let base = braille_dots(&r.screen(120, 30));
+        assert!(base > 300, "{style:?}: only {base} dots");
+        // Dots only.
+        r.char('d');
+        r.feed();
+        assert!(r.app.scope.settings.display.dots);
+        let dots = braille_dots(&r.screen(120, 30));
+        assert!(dots > 100, "{style:?} dots: only {dots}");
+        r.char('d');
+        // Persistence: old traces too.
+        r.char('P');
+        for _ in 0..4 {
+            r.feed();
+        }
+        assert!(!r.app.scope.history.is_empty(), "{style:?}");
+        assert!(
+            braille_dots(&r.screen(120, 30)) >= base * 9 / 10,
+            "{style:?} persistence"
+        );
+        r.char('P');
+        // Few samples: sin(x)/x and linear both draw a line.
+        for _ in 0..8 {
+            r.key(KeyCode::Left);
+        }
+        r.feed();
+        let sinc = braille_dots(&r.screen(120, 30));
+        r.char('z');
+        r.feed();
+        assert_eq!(
+            r.app.scope.settings.display.interpolation,
+            Interpolation::Linear
+        );
+        let linear = braille_dots(&r.screen(120, 30));
+        assert!(sinc > 100 && linear > 100, "{style:?}: {sinc} {linear}");
+        // The spectrum uses the style too, and small screens do not panic.
+        r.char('f');
+        r.feed();
+        assert!(r.text(140, 50).contains("Spectrum"));
+        for (w, h) in [(20, 8), (40, 10), (80, 24), (300, 100)] {
+            r.screen(w, h);
+        }
+    }
+}
+
+#[test]
+fn trace_styles_look_different() {
+    let thin = braille_dots(&styled_rig(TraceStyle::Thin).screen(120, 30));
+    let classic = braille_dots(&styled_rig(TraceStyle::Classic).screen(120, 30));
+    let bold = braille_dots(&styled_rig(TraceStyle::Bold).screen(120, 30));
+    // Classic goes through the low and high value of every column, so it
+    // is at least as heavy as the thin line; bold is about twice as heavy.
+    assert!(classic > thin, "classic {classic} thin {thin}");
+    assert!(bold > thin * 3 / 2, "bold {bold} thin {thin}");
+}
+
+/// Line of the screen where the cursor name `A` is, above the status lines.
+fn cursor_name_line(lines: &[String]) -> usize {
+    lines[..lines.len() - 3]
+        .iter()
+        .position(|l| l.contains(" A "))
+        .expect("no cursor name")
+}
+
+#[test]
+fn cursor_styles() {
+    let mut r = rig();
+    r.char('v');
+    let classic = r.screen(140, 40);
+    let marker = classic.iter().position(|l| l.contains('▾')).unwrap();
+    // Classic: the names are inside the plot, below the trigger mark row.
+    assert!(
+        cursor_name_line(&classic) > marker,
+        "{}",
+        classic.join("\n")
+    );
+    r.app.scope.settings.display.cursor_style = CursorStyle::Fine;
+    let fine = r.screen(140, 40);
+    // Fine: in the margin row above the plot, with the trigger mark.
+    assert_eq!(cursor_name_line(&fine), marker, "{}", fine.join("\n"));
+    assert_ne!(classic, fine);
+    // Voltage cursors draw in both styles.
+    r.char('v');
+    let v_fine = r.text(140, 40);
+    r.app.scope.settings.display.cursor_style = CursorStyle::Classic;
+    let v_classic = r.text(140, 40);
+    assert!(v_fine.contains("ΔV") && v_classic.contains("ΔV"));
+    assert_ne!(v_fine, v_classic);
+}
+
+#[test]
+fn settings_panel_changes_trace_style_live() {
+    let mut r = rig();
+    let before = r.screen(140, 40);
+    r.char('S');
+    // Channel 1 › Style is the last item.
+    r.char('l');
+    r.char('G');
+    assert!(r.text(140, 40).contains("Settings · Channel 1 › Style"));
+    r.char('l');
+    r.char('j');
+    assert_eq!(
+        r.app.scope.settings.display.trace_style[0],
+        TraceStyle::Thin
+    );
+    assert!(r.text(140, 40).contains("braille thin"));
+    r.key(KeyCode::Enter);
+    r.char('S');
+    assert!(!r.app.panel_open);
+    assert_eq!(
+        r.app.scope.settings.display.trace_style,
+        [TraceStyle::Thin, TraceStyle::Classic, TraceStyle::Classic]
+    );
+    assert_ne!(r.screen(140, 40), before);
+}
