@@ -134,6 +134,7 @@ fn records_single_samples_at_2_5_us() {
     // than 400 kS/s, and that is not a logger fault. Count the frames
     // (two bytes each) it gave while the log recorded.
     let frames = || fake.lock().bulk_bytes as f64 / 2.0;
+    let f_start = frames();
     acq.send(Command::StartLog(req));
     wait_state(&acq, &sh, 10.0, |s| *s == LogState::Recording);
     let f0 = frames();
@@ -156,18 +157,19 @@ fn records_single_samples_at_2_5_us() {
         "2.5 µs: {got} samples in {took:.3} s = {:.1} kS/s (fake gave {:.0}..{:.0}), file {} bytes",
         got / took / 1e3,
         f_stop - f0,
-        f_done - f0,
+        f_done - f_start,
         std::fs::metadata(&path).unwrap().len()
     );
-    // Every sample the fake gave while recording is in the file, give
-    // or take one bulk read at each end: the writer flips to Recording
-    // a little after the stream starts, and one read is about 0.1 s.
+    // The file has no more samples than the fake gave from the start
+    // command to the end, and every sample it gave from the Recording
+    // state (seen a little late on a busy machine) to the stop, less
+    // one bulk read (about 0.1 s) that may still be on its way.
     let slack = 0.15 * 400e3;
     assert!(
-        got > f_stop - f0 - slack && got < f_done - f0 + slack,
+        got > f_stop - f0 - slack && got <= f_done - f_start,
         "{got} samples, fake gave {}..{}",
         f_stop - f0,
-        f_done - f0
+        f_done - f_start
     );
     // And it is not far off real time (loose: only catches a logger
     // that drops most of the stream).
