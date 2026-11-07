@@ -190,6 +190,7 @@ time view and the spectrum:
 | `braille thin` | one braille dot thick, one dot run per column |
 | `bold` | the thin line, two dots thick |
 | `ascii lines` | no braille, for fonts that draw it badly: one character per cell, `\|` on steep runs, `/` and `\` on slopes, `_` `-` `‾` for flat parts at the bottom, middle or top of the cell; dots mode puts `.` `·` `'` per sample |
+| `box lines` | no braille: one connected line of box-drawing characters, which the terminal joins cell to cell. `─` for flat runs at the level of the cell row, `│` for steep runs and noise, `╭` `╮` `╰` `╯` where the line turns, `╵` `╷` where a run stops in a cell; dots mode puts `•` per sample |
 
 Display › Cursor style (also under Cursors) picks `classic` (grey dashes,
 `A`/`B` inside the plot, the default) or `fine dashes` (short dashes,
