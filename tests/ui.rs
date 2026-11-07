@@ -514,6 +514,76 @@ fn settings_panel_runs_actions_and_shows_device() {
     assert!(t.contains("connected"));
 }
 
+/// Rows of the open settings panel on the screen, borders included.
+fn panel_rows(lines: &[String]) -> usize {
+    let top = lines
+        .iter()
+        .position(|l| l.starts_with("┌ Settings"))
+        .expect("no panel");
+    let bottom = lines[top..]
+        .iter()
+        .position(|l| l.starts_with('└'))
+        .expect("no panel bottom");
+    bottom + 1
+}
+
+#[test]
+fn settings_panel_height_is_fixed_and_fits_its_content() {
+    use openhantek_tui::panel::Focus;
+    let mut r = rig();
+    r.char('S');
+    let first = panel_rows(&r.screen(120, 40));
+    // Smaller than the old 40 % of the screen (16 rows at 120x40).
+    assert!(first < 16, "{first}");
+    let cats = r.app.panel.groups().len();
+    let mut seen = 0;
+    for c in 0..cats {
+        assert_eq!(r.app.panel.cat, c);
+        assert_eq!(panel_rows(&r.screen(120, 40)), first, "category {c}");
+        r.char('l');
+        assert_eq!(r.app.panel.focus, Focus::Items);
+        let items = r.app.panel.groups()[c].items.len();
+        for i in 0..items {
+            assert_eq!(r.app.panel.item, i);
+            let lines = r.screen(120, 40);
+            assert_eq!(panel_rows(&lines), first, "category {c} item {i}");
+            seen += 1;
+            r.char('j');
+        }
+        r.char('h');
+        r.char('j');
+    }
+    assert!(seen > 40, "{seen}");
+    // A long option list (time/div) scrolls inside the same panel, and
+    // the help line and key hints stay.
+    let mut r = rig();
+    r.char('S');
+    while r.app.panel.groups()[r.app.panel.cat].name != "Timebase" {
+        r.char('j');
+    }
+    r.char('l');
+    r.char('l');
+    assert_eq!(r.app.panel.focus, Focus::Values);
+    let opts = r.app.panel.current().unwrap();
+    assert!(
+        opts.options(&r.app.scope.settings, &r.app.device_info())
+            .len()
+            > 20
+    );
+    let lines = r.screen(120, 40);
+    assert_eq!(panel_rows(&lines), first);
+    let t = lines.join("\n");
+    assert!(t.contains("●"), "{t}");
+    assert!(t.contains("S close"), "{t}");
+    // At 80x24 the panel shrinks so a small plot stays above it, and it
+    // too keeps its size.
+    r.key(KeyCode::Esc);
+    let small = panel_rows(&r.screen(80, 24));
+    assert!(small <= first);
+    r.char('j');
+    assert_eq!(panel_rows(&r.screen(80, 24)), small);
+}
+
 #[test]
 fn settings_panel_fits_small_screens() {
     let mut r = rig();

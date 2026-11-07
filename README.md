@@ -159,6 +159,15 @@ columns, like the file manager yazi: categories, the settings in that
 category with their values, and the possible values (or help) of the
 setting under the cursor.
 
+The panel is only as high as its longest column needs: the 12
+categories, the most settings in any category, or the longest list of
+values, plus the title, the help line and the key hints (15 rows). It is
+worked out over all settings, not the one under the cursor, so it never
+changes size while you move. Value lists longer than 20 rows (time/div,
+calibration frequency) do not count; they scroll in the value column. On
+a short screen the panel shrinks so a small plot stays above it, and its
+columns scroll to keep the cursor in view.
+
 | Key | What it does |
 |---|---|
 | `j` `k` `↓` `↑` | move down / up |

@@ -26,14 +26,24 @@ const NAMES: [&str; 3] = ["CH1", "CH2", "MATH"];
 pub const SPECTRUM_TOP_DBV: f64 = 20.0;
 pub const SPECTRUM_DB_PER_DIV: f64 = 15.0;
 
-/// Smallest settings panel, in rows.
-const PANEL_MIN_ROWS: u16 = 10;
+/// Smallest settings panel, in rows, when the screen is short.
+const PANEL_MIN_ROWS: u16 = 7;
+/// Rows of the panel around its columns: the top border with the title,
+/// the help line, and the bottom border with the key hints.
+pub const PANEL_CHROME_ROWS: u16 = 3;
+/// Rows the main view keeps under an open panel: a bordered plot of one
+/// row per division with no margins.
+const PLOT_MIN_ROWS: u16 = 2 + V_DIVS as u16 + 1;
+/// The status lines below the panel.
+const STATUS_ROWS: u16 = 3;
 
 pub fn draw(f: &mut TermFrame, app: &App) {
     let area = f.area();
     let pal = Palette::for_setting(app.scope.settings.display.colors);
     let panel_h = if app.panel_open {
-        panel_height(area.height)
+        let s = &app.scope.settings;
+        let rows = app.panel.column_rows(s, &app.device_info()) as u16;
+        panel_height(rows + PANEL_CHROME_ROWS, area.height)
     } else {
         0
     };
@@ -76,11 +86,15 @@ pub fn draw(f: &mut TermFrame, app: &App) {
     }
 }
 
-/// Rows for the settings panel: 40 % of the screen, at least 10 rows,
-/// and the plot keeps at least 6 rows.
-pub fn panel_height(h: u16) -> u16 {
-    let want = (h as u32 * 40 / 100) as u16;
-    want.max(PANEL_MIN_ROWS).min(h.saturating_sub(3 + 6))
+/// Rows for the settings panel on a screen `h` rows high, when its
+/// content needs `need` rows. It does not depend on the cursor, so the
+/// panel keeps its size while moving. It shrinks (and the columns scroll)
+/// only when the screen is too short for it and a small plot; then it
+/// keeps at least [`PANEL_MIN_ROWS`], and the plot at least 6 rows.
+pub fn panel_height(need: u16, h: u16) -> u16 {
+    let room = h.saturating_sub(STATUS_ROWS + PLOT_MIN_ROWS);
+    need.min(room.max(PANEL_MIN_ROWS))
+        .min(h.saturating_sub(STATUS_ROWS + 6))
 }
 
 /// Height of the time view when the spectrum is below it: about 55 % of
@@ -954,21 +968,19 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let p = &app.panel;
     let s = &app.scope.settings;
     let d = app.device_info();
+    let current = p.current();
+    // The key hints or the input line go in the bottom border.
     let block = Block::bordered()
         .title(format!(" Settings · {} ", p.breadcrumb()))
+        .title_bottom(panel_foot(app, current, area.width.saturating_sub(2), pal))
         .border_style(Style::default().fg(pal.axis));
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
-    if inner.height < 3 || inner.width < 24 {
+    if inner.height < 2 || inner.width < 24 {
         return;
     }
-    let [cols, help, foot] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
+    let [cols, help] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
     let cat_w = (inner.width / 4).clamp(12, 22);
     let item_w = ((inner.width - cat_w) / 2 + 4).min(46);
     let [cat_area, sep1, item_area, sep2, val_area] = Layout::horizontal([
@@ -1040,7 +1052,6 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     }
 
     // Values or help for the field under the cursor.
-    let current = p.current();
     let mut right: Vec<Line> = Vec::new();
     if let Some(field) = current {
         match field.kind() {
@@ -1091,7 +1102,7 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     }
     f.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), val_area);
 
-    // Help for the field, then the key hints or the input line.
+    // Help for the field.
     let help_text = current.map_or("", |f| f.help());
     f.render_widget(
         Paragraph::new(Line::styled(
@@ -1100,6 +1111,16 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         )),
         help,
     );
+}
+
+/// The bottom line of the panel: key hints, or the line being typed.
+fn panel_foot(
+    app: &App,
+    current: Option<crate::panel::Field>,
+    width: u16,
+    pal: &Palette,
+) -> Line<'static> {
+    let p = &app.panel;
     let hint = Style::default().fg(Color::DarkGray);
     let foot_line = if let Some(text) = &p.input {
         let label = current.map_or("", |f| f.label());
@@ -1130,7 +1151,7 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
             ),
             Span::styled("  ⏎ done · esc clear · ↑↓ move", hint),
         ])
-    } else if foot.width >= 108 {
+    } else if width >= 108 {
         Line::styled(
             " j/k move · h/l out/in · ⏎ keep · esc back · space toggle · +/- step · = type · / search · gg/G · S close",
             hint,
@@ -1141,7 +1162,7 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
             hint,
         )
     };
-    f.render_widget(Paragraph::new(foot_line), foot);
+    foot_line
 }
 
 /// Every key, for the help screen and the README.
@@ -1233,11 +1254,15 @@ mod tests {
 
     #[test]
     fn panel_height_rules() {
-        assert_eq!(panel_height(24), 10);
-        assert_eq!(panel_height(40), 16);
-        assert_eq!(panel_height(60), 24);
+        // As big as needed when there is room.
+        assert_eq!(panel_height(15, 40), 15);
+        assert_eq!(panel_height(15, 60), 15);
+        assert_eq!(panel_height(8, 40), 8);
+        // A short screen keeps a small plot, then the panel shrinks.
+        assert_eq!(panel_height(15, 24), 10);
+        assert_eq!(panel_height(15, 20), PANEL_MIN_ROWS);
         // A tiny screen still leaves room for the plot and status lines.
-        assert_eq!(panel_height(15), 6);
+        assert_eq!(panel_height(15, 15), 6);
     }
 
     #[test]

@@ -774,6 +774,11 @@ pub enum Outcome {
     Message(String, bool),
 }
 
+/// Longest option list that sets the height of the panel. Longer lists
+/// (like time/div) scroll in the value column instead, so the panel does
+/// not take most of the screen for one setting.
+pub const OPTION_ROWS_MAX: usize = 20;
+
 /// A list of items to show in the middle column.
 #[derive(Clone, Debug)]
 pub struct Group {
@@ -856,6 +861,28 @@ impl Panel {
             name: format!("Search: {}", self.filter),
             items,
         }]
+    }
+
+    /// Rows the three columns need, the same wherever the cursor is: the
+    /// most of the number of categories, the settings in any category,
+    /// and the rows of any setting in the value column. An option list
+    /// longer than [`OPTION_ROWS_MAX`] does not count: it scrolls.
+    pub fn column_rows(&self, s: &Settings, d: &DeviceInfo) -> usize {
+        let items = self.cats.iter().map(|c| c.fields.len()).max().unwrap_or(0);
+        let values = self
+            .cats
+            .iter()
+            .flat_map(|c| &c.fields)
+            .map(|f| match f.kind() {
+                Kind::Choice | Kind::Bool => f.options(s, d).len(),
+                // Value, step, a blank row and the key hint.
+                Kind::Number => 4,
+                Kind::Info | Kind::Action => 1,
+            })
+            .filter(|&n| n <= OPTION_ROWS_MAX)
+            .max()
+            .unwrap_or(0);
+        self.cats.len().max(items).max(values).max(1)
     }
 
     /// The field under the cursor.
