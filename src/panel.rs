@@ -275,6 +275,16 @@ pub fn categories() -> Vec<Category> {
 
 const OFF_ON: [&str; 2] = ["off", "on"];
 
+/// The end of a long text, like `…/openhantek-tui/logs`.
+fn tail(text: &str, max: usize) -> String {
+    let n = text.chars().count();
+    if n <= max {
+        return text.to_string();
+    }
+    let end: String = text.chars().skip(n + 1 - max).collect();
+    format!("…{end}")
+}
+
 /// Channels a log would record now (at least 1, for the estimates).
 fn logged_channels(s: &Settings) -> usize {
     s.channels.iter().filter(|c| c.enabled).count().max(1)
@@ -581,6 +591,7 @@ impl Field {
                     if ch == 1 { "" } else { "s" }
                 )
             }
+            Field::LogDir => format!("{} · {}", d.log_dir, self.help()),
             _ => self.help().to_string(),
         }
     }
@@ -894,7 +905,7 @@ impl Field {
                     DevRate => d.rate.map_or("--".into(), |r| fmt_si(r, "S/s")),
                     ExportDir => d.export_dir.clone(),
                     SettingsFile => d.settings_file.clone(),
-                    LogDir => d.log_dir.clone(),
+                    LogDir => tail(&d.log_dir, 24),
                     LogFree => d.log_free.map_or("--".into(), crate::logger::fmt_bytes),
                     _ => String::new(),
                 }
@@ -1625,6 +1636,11 @@ mod tests {
             .help_text(&s, &d)
             .contains("ADC at 400 kS/s, 1 sample per step"));
         assert_eq!(Field::LogOpen.value(&s, &d), "2 logs");
+        d.log_dir = "/home/someone/.local/share/openhantek-tui/logs".into();
+        assert_eq!(Field::LogDir.value(&s, &d), "…are/openhantek-tui/logs");
+        assert!(Field::LogDir
+            .help_text(&s, &d)
+            .starts_with("/home/someone/"));
         // Enter on a recent log opens it.
         let mut p = Panel::new();
         p.cat = cats.iter().position(|c| c.name == "Logger").unwrap();

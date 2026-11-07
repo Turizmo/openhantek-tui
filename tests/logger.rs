@@ -330,3 +330,104 @@ fn the_r_key_records_and_the_log_view_follows() {
     drop(app);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Speed of a big log: `OHT_BIG_MB=2000 cargo test --release --test
+/// logger big -- --ignored --nocapture`. Writes a 2.5 µs log of that
+/// size to the temp folder (deleted afterwards).
+#[test]
+#[ignore]
+fn big_log_opens_fast_after_the_summary() {
+    use openhantek_tui::logger::format::{ChannelInfo, ChunkHead, Header, OPEN};
+    use openhantek_tui::logger::view::LogView;
+    use std::io::Write;
+    let mb: u64 = std::env::var("OHT_BIG_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
+    let dir = temp_dir("big");
+    let path = dir.join("big.ohlog");
+    let ch = ChannelInfo {
+        enabled: true,
+        ..Default::default()
+    };
+    let h = Header {
+        start_ns: 1_794_573_296_000_000_000,
+        step_ns: 2_500,
+        adc_rate: 400e3,
+        samples_per_step: 1,
+        channels: [ch.clone(), ch],
+        device: "BIG".into(),
+    };
+    let n = mb * 1_000_000 / 8;
+    let t0 = Instant::now();
+    {
+        let mut f =
+            std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(&path).unwrap());
+        f.write_all(&h.encode()).unwrap();
+        f.write_all(
+            &ChunkHead {
+                flags: 0,
+                first: 0,
+                count: OPEN,
+            }
+            .encode(),
+        )
+        .unwrap();
+        let mut buf = Vec::with_capacity(1 << 20);
+        for i in 0..n {
+            let v = ((i % 400) as f32 / 400.0 * std::f32::consts::TAU).sin();
+            buf.extend_from_slice(&v.to_le_bytes());
+            buf.extend_from_slice(&(v * 0.5).to_le_bytes());
+            if buf.len() >= 1 << 20 {
+                f.write_all(&buf).unwrap();
+                buf.clear();
+            }
+        }
+        f.write_all(&buf).unwrap();
+    }
+    println!(
+        "wrote {mb} MB ({n} steps) in {:.2} s",
+        t0.elapsed().as_secs_f64()
+    );
+    let t0 = Instant::now();
+    let mut v = LogView::open(&path, false).unwrap();
+    while v.summary_progress() < 1.0 {
+        v.tick().unwrap();
+    }
+    v.tick().unwrap();
+    println!("summary built in {:.2} s", t0.elapsed().as_secs_f64());
+    assert!(openhantek_tui::logger::pyramid::Pyramid::sidecar(&path).exists());
+    // Open again: the summary comes from the sidecar.
+    let t0 = Instant::now();
+    let mut v = LogView::open(&path, false).unwrap();
+    v.tick().unwrap();
+    let w = 240;
+    let cols = v.columns(w).unwrap();
+    let open = t0.elapsed().as_secs_f64();
+    assert_eq!(cols.len(), w);
+    assert!(cols.iter().all(|c| c[0].max > 0.99 && c[0].min < -0.99));
+    // Some zoom levels and scroll positions.
+    let t1 = Instant::now();
+    let mut draws = 0;
+    for m in [
+        openhantek_tui::logger::view::Move::ZoomIn,
+        openhantek_tui::logger::view::Move::Pages(-3),
+        openhantek_tui::logger::view::Move::ZoomIn,
+        openhantek_tui::logger::view::Move::ZoomIn,
+        openhantek_tui::logger::view::Move::Divs(-7),
+        openhantek_tui::logger::view::Move::Native,
+        openhantek_tui::logger::view::Move::Home,
+        openhantek_tui::logger::view::Move::Fit,
+    ] {
+        v.go(m, w, 24);
+        v.columns(w).unwrap();
+        draws += 1;
+    }
+    let per = t1.elapsed().as_secs_f64() / draws as f64;
+    println!(
+        "open + first draw {open:.3} s, then {:.1} ms per redraw",
+        per * 1e3
+    );
+    assert!(open < 1.0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
