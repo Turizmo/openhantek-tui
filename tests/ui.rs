@@ -296,3 +296,175 @@ fn clipping_is_shown() {
     r.feed();
     assert!(r.text(150, 40).contains("CLIP CH1"));
 }
+
+/// Cells of the plot grid row that has the center cross: the columns of
+/// its `┼` signs.
+fn cross_columns(lines: &[String]) -> Vec<usize> {
+    let row = lines
+        .iter()
+        .find(|l| l.contains("┼╌") || l.contains("┼┴"))
+        .expect("no center row");
+    row.chars()
+        .enumerate()
+        .filter(|(_, c)| *c == '┼')
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[test]
+fn grid_divisions_are_even_at_every_size() {
+    let mut r = rig();
+    // Traces off, so they do not cover the center row.
+    r.char('1');
+    r.char('2');
+    for (w, h) in [(80, 24), (100, 30), (140, 40), (200, 60), (123, 37)] {
+        let lines = r.screen(w, h);
+        let cols = cross_columns(&lines);
+        assert_eq!(cols.len(), 11, "{w}x{h}: {cols:?}");
+        let gaps: Vec<usize> = cols.windows(2).map(|p| p[1] - p[0]).collect();
+        assert!(gaps.iter().all(|g| *g == gaps[0]), "{w}x{h}: {gaps:?}");
+    }
+}
+
+#[test]
+fn trace_colours_follow_the_colour_setting() {
+    use openhantek_tui::theme::ColorMode;
+    use ratatui::style::Color;
+    let mut r = rig();
+    for (mode, want) in [
+        (ColorMode::TrueColor, Color::Rgb(255, 214, 10)),
+        (ColorMode::Ansi256, Color::Indexed(220)),
+        (ColorMode::Ansi16, Color::LightYellow),
+    ] {
+        r.app.scope.settings.display.colors = mode;
+        let mut term = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        term.draw(|f| ui::draw(f, &r.app)).unwrap();
+        let buf = term.backend().buffer();
+        let found = buf.content().iter().any(|c| {
+            c.fg == want
+                && c.symbol()
+                    .chars()
+                    .all(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch))
+        });
+        assert!(found, "{mode:?}: no CH1 braille in {want:?}");
+    }
+}
+
+#[test]
+fn settings_panel_opens_and_closes() {
+    let mut r = rig();
+    r.char('S');
+    assert!(r.app.panel_open);
+    let t = r.text(140, 40);
+    assert!(t.contains("Settings · Channel 1"), "{t}");
+    assert!(t.contains("Calibration output"));
+    assert!(t.contains("hjkl") || t.contains("j/k move"));
+    // The plot is still drawn above the panel.
+    assert!(t.contains("1▸"));
+    r.key(KeyCode::Esc);
+    assert!(!r.app.panel_open);
+    assert!(!r.app.quit);
+    r.key(KeyCode::F(2));
+    assert!(r.app.panel_open);
+    r.char('q');
+    assert!(!r.app.panel_open);
+    assert!(!r.app.quit);
+    // Ctrl-C still quits from the panel.
+    r.char('S');
+    r.app
+        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(r.app.quit);
+}
+
+#[test]
+fn settings_panel_changes_coupling_live_and_reverts() {
+    use openhantek_tui::panel::Focus;
+    let mut r = rig();
+    r.char('S');
+    // Channel 1 › Coupling is the 4th item.
+    r.char('l');
+    for _ in 0..3 {
+        r.char('j');
+    }
+    assert!(r.text(140, 40).contains("Settings · Channel 1 › Coupling"));
+    r.char('l');
+    assert_eq!(r.app.panel.focus, Focus::Values);
+    r.char('j');
+    // Live: the channel line shows AC at once.
+    assert_eq!(r.app.scope.settings.channels[0].coupling, Coupling::Ac);
+    assert!(r.text(140, 40).contains("CH1 1 V/div AC x1"));
+    // Esc puts DC back.
+    r.key(KeyCode::Esc);
+    assert_eq!(r.app.scope.settings.channels[0].coupling, Coupling::Dc);
+    // Enter keeps the new value.
+    r.char('l');
+    r.char('j');
+    r.key(KeyCode::Enter);
+    assert_eq!(r.app.scope.settings.channels[0].coupling, Coupling::Ac);
+    r.char('S');
+    assert!(!r.app.panel_open);
+    assert_eq!(r.app.scope.settings.channels[0].coupling, Coupling::Ac);
+}
+
+#[test]
+fn settings_panel_search_and_typed_value() {
+    let mut r = rig();
+    r.char('S');
+    r.char('/');
+    for c in "level".chars() {
+        r.char(c);
+    }
+    let t = r.text(140, 40);
+    assert!(t.contains("Trigger › Level"), "{t}");
+    assert!(t.contains("/level"));
+    r.key(KeyCode::Enter);
+    // Type an exact trigger level.
+    r.char('=');
+    for _ in 0..8 {
+        r.key(KeyCode::Backspace);
+    }
+    for c in "750m".chars() {
+        r.char(c);
+    }
+    assert!(r.text(140, 40).contains("Level = 750m"));
+    r.key(KeyCode::Enter);
+    assert!((r.app.scope.settings.trigger.level - 0.75).abs() < 1e-12);
+    assert!(r.text(140, 40).contains("Trig Auto CH1 ↑ 750 mV"));
+}
+
+#[test]
+fn settings_panel_runs_actions_and_shows_device() {
+    let mut r = rig();
+    r.char('S');
+    r.char('/');
+    for c in "run".chars() {
+        r.char(c);
+    }
+    r.key(KeyCode::Enter);
+    assert!(r.app.scope.running);
+    r.key(KeyCode::Enter);
+    assert!(!r.app.scope.running);
+    // Device info is read-only.
+    r.key(KeyCode::Esc);
+    r.key(KeyCode::Esc);
+    r.char('/');
+    for c in "device".chars() {
+        r.char(c);
+    }
+    let t = r.text(140, 40);
+    assert!(t.contains("Device › Model"), "{t}");
+    assert!(t.contains("TESTSCOPE"));
+    assert!(t.contains("connected"));
+}
+
+#[test]
+fn settings_panel_fits_small_screens() {
+    let mut r = rig();
+    r.char('S');
+    for (w, h) in [(80, 24), (60, 20), (40, 12), (20, 8), (300, 100)] {
+        let t = r.text(w, h);
+        if w >= 60 {
+            assert!(t.contains("Settings"), "{w}x{h}");
+        }
+    }
+}
