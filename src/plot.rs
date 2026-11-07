@@ -2,10 +2,12 @@
 //!
 //! A cell holds 2 x 4 braille dots and one colour. Each division is a whole
 //! number of cells, so the grid looks the same in every division. Traces
-//! are drawn one dot thick: each dot column gets one vertical run of dots.
+//! are drawn in one of the [`TraceStyle`]s: classic lines from point to
+//! point, one dot thick (one vertical run of dots per dot column), or bold.
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
+use crate::settings::TraceStyle;
 use crate::theme::Palette;
 
 /// Draw layers, lowest first. A higher layer takes over a cell from a
@@ -203,11 +205,83 @@ impl Plot {
         }
     }
 
+    /// Draw a trace through `points` (in divisions, in time order) in
+    /// `style`. With `dots`, only the points, no lines between them.
+    pub fn styled(
+        &mut self,
+        points: &[(f64, f64)],
+        style: TraceStyle,
+        dots: bool,
+        layer: u8,
+        color: Color,
+    ) {
+        match (style, dots) {
+            (TraceStyle::Classic, _) => self.classic(points, dots, layer, color),
+            (TraceStyle::Thin, false) => self.trace(points, layer, color),
+            (TraceStyle::Thin, true) => self.points(points, layer, color),
+            (TraceStyle::Bold, false) => self.trace_run(points, true, layer, color),
+            (TraceStyle::Bold, true) => self.points_bold(points, layer, color),
+        }
+    }
+
+    /// The classic look: straight lines from point to point. More than two
+    /// points per dot column are cut to the low and high value of each
+    /// column first, low then high, so a noisy or steep trace is drawn as
+    /// a zigzag that fills its column. With `dots`, only those points.
+    pub fn classic(&mut self, points: &[(f64, f64)], dots: bool, layer: u8, color: Color) {
+        let w = self.dots_w();
+        let finite = |p: &&(f64, f64)| p.0.is_finite() && p.1.is_finite();
+        let n = points.iter().filter(finite).count();
+        // Dot positions; `None` breaks the line.
+        let pts: Vec<Option<(i64, i64)>> = if n > 2 * w {
+            let mut cols: Vec<Option<(f64, f64)>> = vec![None; w];
+            for p in points.iter().filter(finite) {
+                let c = self.px(p.0).floor();
+                if c < 0.0 || c >= w as f64 {
+                    continue;
+                }
+                let r = &mut cols[c as usize];
+                *r = Some(r.map_or((p.1, p.1), |(lo, hi)| (lo.min(p.1), hi.max(p.1))));
+            }
+            cols.iter()
+                .enumerate()
+                .filter_map(|(c, r)| r.map(|(lo, hi)| (c as i64, lo, hi)))
+                .flat_map(|(c, lo, hi)| {
+                    [
+                        Some((c, self.py(lo).floor() as i64)),
+                        Some((c, self.py(hi).floor() as i64)),
+                    ]
+                })
+                .collect()
+        } else {
+            points
+                .iter()
+                .map(|p| {
+                    finite(&p).then(|| (self.px(p.0).floor() as i64, self.py(p.1).floor() as i64))
+                })
+                .collect()
+        };
+        let mut prev: Option<(i64, i64)> = None;
+        for p in pts {
+            match (p, prev) {
+                (Some(b), Some(a)) if !dots => self.line(a, b, layer, color),
+                (Some(b), _) => self.set(b.0, b.1, layer, color),
+                _ => {}
+            }
+            prev = p;
+        }
+    }
+
     /// Draw a trace through `points` (in divisions, in time order).
     /// Each dot column gets one vertical run: from the last value of the
     /// column before, through all samples in this column. A non-finite
     /// point breaks the line.
     pub fn trace(&mut self, points: &[(f64, f64)], layer: u8, color: Color) {
+        self.trace_run(points, false, layer, color);
+    }
+
+    /// [`Plot::trace`], two dots wide and high with `bold`.
+    fn trace_run(&mut self, points: &[(f64, f64)], bold: bool, layer: u8, color: Color) {
         let w = self.dots_w();
         let y_max = self.dots_h() as f64 - 1e-6;
         let mut ranges: Vec<Option<(f64, f64)>> = vec![None; w];
@@ -273,6 +347,10 @@ impl Plot {
                 }
             }
             self.vrun(c as i64, a, b, layer, color);
+            if bold {
+                self.vrun(c as i64, a, b + 1, layer, color);
+                self.vrun(c as i64 + 1, a, b + 1, layer, color);
+            }
             last = Some((a, b));
         }
     }
@@ -287,6 +365,18 @@ impl Plot {
                     layer,
                     color,
                 );
+            }
+        }
+    }
+
+    /// Two by two dots per point (in divisions).
+    pub fn points_bold(&mut self, points: &[(f64, f64)], layer: u8, color: Color) {
+        for &(x, y) in points {
+            if x.is_finite() && y.is_finite() {
+                let (x, y) = (self.px(x).floor() as i64, self.py(y).floor() as i64);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    self.set(x + dx, y + dy, layer, color);
+                }
             }
         }
     }
@@ -353,6 +443,21 @@ impl Plot {
             if x % 4 < 2 {
                 self.set(x, y, layer, color);
             }
+        }
+    }
+
+    /// The classic cursor line from `a` to `b` (in divisions): 81 points
+    /// along it, two on and two off, so the dashes have the same length
+    /// at every plot size.
+    pub fn dashed_classic(&mut self, a: (f64, f64), b: (f64, f64), layer: u8, color: Color) {
+        let steps = 80;
+        for i in (0..=steps).filter(|i| i % 4 < 2) {
+            let k = i as f64 / steps as f64;
+            let (x, y) = (a.0 + (b.0 - a.0) * k, a.1 + (b.1 - a.1) * k);
+            // The far edge maps one dot past the plot: keep it on.
+            let px = (self.px(x).floor() as i64).min(self.dots_w() as i64 - 1);
+            let py = (self.py(y).floor() as i64).min(self.dots_h() as i64 - 1);
+            self.set(px, py, layer, color);
         }
     }
 
@@ -687,6 +792,81 @@ mod tests {
         let x = p.px(0.0).floor() as usize;
         let n = column(&p, x).len();
         assert_eq!(n, p.dots_h() / 2);
+    }
+
+    #[test]
+    fn classic_fills_each_column_from_low_to_high() {
+        // Many noisy samples: every column is drawn from its low to its
+        // high value, so the line is thicker than the thin one.
+        let noisy = samples(20_000, |x| 0.3 * (x * 997.0).sin());
+        let mut c = Plot::new(6, 3);
+        c.classic(&noisy, false, LAYER_CH1, RED);
+        let mut t = Plot::new(6, 3);
+        t.trace(&noisy, LAYER_CH1, RED);
+        let dots = |p: &Plot| (0..p.dots_w()).map(|x| column(p, x).len()).sum::<usize>();
+        assert!(dots(&c) >= dots(&t), "{} {}", dots(&c), dots(&t));
+        let (hi, lo) = (c.py(0.3).floor() as usize, c.py(-0.3).floor() as usize);
+        for x in 3..c.dots_w() - 3 {
+            let col = column(&c, x);
+            assert!(
+                col.first() <= Some(&(hi + 1)) && col.last() >= Some(&(lo - 1)),
+                "{x}: {col:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classic_dots_and_lines() {
+        // Few points: straight lines between them, or only the points.
+        let pts = [(-4.0, 0.0), (0.0, 2.0), (4.0, 0.0)];
+        let mut p = Plot::new(4, 2);
+        p.classic(&pts, true, LAYER_CH1, RED);
+        assert_eq!(used_columns(&p).len(), 3);
+        let mut p = Plot::new(4, 2);
+        p.classic(&pts, false, LAYER_CH1, RED);
+        let cols = used_columns(&p);
+        assert_eq!(cols.len(), cols[cols.len() - 1] - cols[0] + 1);
+        // A NaN breaks the line.
+        let mut q = Plot::new(4, 2);
+        q.classic(
+            &[(-4.0, 0.0), (0.0, f64::NAN), (4.0, 0.0)],
+            false,
+            LAYER_CH1,
+            RED,
+        );
+        assert_eq!(used_columns(&q).len(), 2);
+    }
+
+    #[test]
+    fn bold_is_two_dots_thick() {
+        let mut p = Plot::new(6, 3);
+        p.styled(
+            &samples(500, |_| 1.0),
+            TraceStyle::Bold,
+            false,
+            LAYER_CH1,
+            RED,
+        );
+        let row = p.py(1.0).floor() as usize;
+        for x in 2..p.dots_w() - 3 {
+            assert_eq!(column(&p, x), vec![row, row + 1], "col {x}");
+        }
+        let mut p = Plot::new(6, 3);
+        p.styled(&[(0.0, 0.0)], TraceStyle::Bold, true, LAYER_CH1, RED);
+        assert_eq!(used_columns(&p).len(), 2);
+    }
+
+    #[test]
+    fn classic_cursor_dashes_have_a_fixed_count() {
+        for (cx, ry) in [(3, 2), (9, 4)] {
+            let mut p = Plot::new(cx, ry);
+            p.dashed_classic((1.0, -4.0), (1.0, 4.0), LAYER_CURSOR, BLUE);
+            let x = p.px(1.0).floor() as usize;
+            let n = column(&p, x).len();
+            // 41 points; on small plots some land on the same dot.
+            assert!(n <= 41 && n > 20, "{cx}x{ry}: {n}");
+            assert_eq!(used_columns(&p), vec![x]);
+        }
     }
 
     #[test]

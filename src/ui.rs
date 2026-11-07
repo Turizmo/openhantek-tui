@@ -182,11 +182,42 @@ pub fn trace_points(
 }
 
 fn draw_trace(plot: &mut Plot, frame: &Frame, t: usize, s: &Settings, layer: u8, color: Color) {
-    let pts = trace_points(frame, t, s, plot.dots_w(), s.display.dots);
-    if s.display.dots {
-        plot.points(&pts, layer, color);
-    } else {
-        plot.trace(&pts, layer, color);
+    let style = s.display.trace_style[t];
+    // The classic style shows the same points with and without dots, like
+    // the first version did: sin(x)/x points too.
+    let dots = s.display.dots && style != TraceStyle::Classic;
+    let pts = trace_points(frame, t, s, plot.dots_w(), dots);
+    plot.styled(&pts, style, s.display.dots, layer, color);
+}
+
+/// Colour of the classic cursor lines and their names.
+const CLASSIC_CURSOR: Color = Color::Gray;
+const CLASSIC_CURSOR_NAME: Color = Color::White;
+
+fn draw_cursors(plot: &mut Plot, s: &Settings, pal: &Palette) {
+    let (half_h, half_v) = (H_DIVS / 2.0, V_DIVS / 2.0);
+    let classic = s.display.cursor_style == CursorStyle::Classic;
+    let layer = plot::LAYER_CURSOR;
+    match s.cursors.mode {
+        CursorMode::Time => {
+            for &x in &s.cursors.t {
+                if classic {
+                    plot.dashed_classic((x, -half_v), (x, half_v), layer, CLASSIC_CURSOR);
+                } else {
+                    plot.dashed_v(x, layer, pal.cursor);
+                }
+            }
+        }
+        CursorMode::Volt => {
+            for &y in &s.cursors.v {
+                if classic {
+                    plot.dashed_classic((-half_h, y), (half_h, y), layer, CLASSIC_CURSOR);
+                } else {
+                    plot.dashed_h(y, layer, pal.cursor);
+                }
+            }
+        }
+        CursorMode::Off => {}
     }
 }
 
@@ -310,19 +341,7 @@ fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     };
     let mut plot = Plot::new(g.cx, g.ry);
     plot.grid(pal);
-    match s.cursors.mode {
-        CursorMode::Time => {
-            for &x in &s.cursors.t {
-                plot.dashed_v(x, plot::LAYER_CURSOR, pal.cursor);
-            }
-        }
-        CursorMode::Volt => {
-            for &y in &s.cursors.v {
-                plot.dashed_h(y, plot::LAYER_CURSOR, pal.cursor);
-            }
-        }
-        CursorMode::Off => {}
-    }
+    draw_cursors(&mut plot, s, pal);
     let order = draw_order(s);
     // Old frames first, dimmed.
     for old in &sc.history {
@@ -432,17 +451,42 @@ fn time_margins(buf: &mut Buffer, app: &App, g: &Geometry, plot: &Plot, pal: &Pa
         );
     }
     let cur = Style::default().fg(pal.cursor);
+    let names = ["A", "B"];
+    if s.display.cursor_style == CursorStyle::Classic {
+        // Names inside the plot: at the top, right of a time line; at the
+        // right, on the row above a voltage line.
+        let cur = Style::default().fg(CLASSIC_CURSOR_NAME);
+        let half_h = H_DIVS / 2.0;
+        match s.cursors.mode {
+            CursorMode::Time => {
+                let y = g.plot.y + plot.row_of(half_v - 0.3) as u16;
+                for (i, &x) in s.cursors.t.iter().enumerate() {
+                    let x = g.plot.x + plot.col_of((x + 0.05).min(half_h - 0.2)) as u16;
+                    put(buf, x, y, names[i], cur, right_x);
+                }
+            }
+            CursorMode::Volt => {
+                let x = g.plot.x + plot.col_of(half_h - 0.6) as u16;
+                for (i, &y) in s.cursors.v.iter().enumerate() {
+                    let y = g.plot.y + plot.row_of((y + 0.2).min(half_v)) as u16;
+                    put(buf, x, y, names[i], cur, right_x);
+                }
+            }
+            CursorMode::Off => {}
+        }
+        return;
+    }
     match s.cursors.mode {
         CursorMode::Time if g.margins.top >= 1 => {
             for (i, &x) in s.cursors.t.iter().enumerate() {
                 let cx = g.plot.x + plot.col_of(x) as u16 + 1;
-                put(buf, cx, g.plot.y - 1, ["A", "B"][i], cur, right_x);
+                put(buf, cx, g.plot.y - 1, names[i], cur, right_x);
             }
         }
         CursorMode::Volt if g.margins.right >= 2 => {
             for (i, &y) in s.cursors.v.iter().enumerate() {
                 let cy = g.plot.y + plot.row_of(y) as u16;
-                put(buf, right_x + 1, cy, ["A", "B"][i], cur, right_x + 2);
+                put(buf, right_x + 1, cy, names[i], cur, right_x + 2);
             }
         }
         _ => {}
@@ -533,7 +577,13 @@ fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
                 .into_iter()
                 .map(to_div)
                 .collect();
-            p.trace(&pts, layer_of(s, t), pal.trace[t]);
+            p.styled(
+                &pts,
+                s.display.trace_style[t],
+                false,
+                layer_of(s, t),
+                pal.trace[t],
+            );
         }
     }
     f.render_widget(Block::bordered().title(title), area);
