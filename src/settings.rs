@@ -516,19 +516,21 @@ impl CursorStyle {
     }
 }
 
-/// How the division lines of the grid are drawn.
+/// How the division lines of the grid, or the center cross (the axes),
+/// are drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GridStyle {
-    /// `·` dots, with a dashed center cross.
+    /// `·` dots.
     #[default]
     Dots,
     /// `╌` and `╎` dashes.
     Dashed,
     /// `─` and `│` lines with `┼` where they cross.
     Solid,
-    /// `+` where the division lines cross, nothing between.
+    /// `+` where the division lines cross (the grid: nothing between;
+    /// the axes: `·` between in full).
     Crosses,
-    /// No grid and no center cross.
+    /// Nothing.
     None,
 }
 
@@ -552,10 +554,11 @@ impl GridStyle {
     }
 }
 
-/// Where the grid draws its division lines.
+/// Where the grid (or the center cross) draws its lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GridExtent {
-    /// Marks only where the division lines cross, and the center cross.
+    /// Marks only where the division lines cross (the axes: also the
+    /// ticks at 1/5 division).
     #[default]
     Points,
     /// Every division line across the whole plot.
@@ -577,6 +580,10 @@ impl GridExtent {
 pub const GRID_BRIGHTNESS: [u8; 10] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
 /// The grid brightness of the first versions.
 pub const GRID_BRIGHTNESS_DEFAULT: u8 = 30;
+/// The center cross of the first versions: dashed whole lines, as bright
+/// as [`GRID_BRIGHTNESS_DEFAULT`] makes it.
+pub const AXIS_STYLE_DEFAULT: GridStyle = GridStyle::Dashed;
+pub const AXIS_EXTENT_DEFAULT: GridExtent = GridExtent::Full;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -608,6 +615,12 @@ pub struct DisplaySettings {
     pub grid_extent: GridExtent,
     /// Grid brightness in percent, one of [`GRID_BRIGHTNESS`].
     pub grid_brightness: u8,
+    /// The center cross, on its own: drawn over the grid, under the
+    /// traces.
+    pub axis_style: GridStyle,
+    pub axis_extent: GridExtent,
+    /// Axis brightness in percent, one of [`GRID_BRIGHTNESS`].
+    pub axis_brightness: u8,
 }
 
 impl Default for DisplaySettings {
@@ -628,6 +641,9 @@ impl Default for DisplaySettings {
             grid_style: GridStyle::Dots,
             grid_extent: GridExtent::Points,
             grid_brightness: GRID_BRIGHTNESS_DEFAULT,
+            axis_style: AXIS_STYLE_DEFAULT,
+            axis_extent: AXIS_EXTENT_DEFAULT,
+            axis_brightness: GRID_BRIGHTNESS_DEFAULT,
         }
     }
 }
@@ -834,11 +850,14 @@ impl Settings {
         self.display.persistence = self.display.persistence.min(16);
         self.display.spectrum_zoom = self.display.spectrum_zoom.min(MAX_SPECTRUM_ZOOM);
         // The nearest step, so a hand-typed 35 still works.
-        let b = self.display.grid_brightness;
-        self.display.grid_brightness = *GRID_BRIGHTNESS
-            .iter()
-            .min_by_key(|g| g.abs_diff(b))
-            .unwrap_or(&GRID_BRIGHTNESS_DEFAULT);
+        let near = |b: u8| {
+            *GRID_BRIGHTNESS
+                .iter()
+                .min_by_key(|g| g.abs_diff(b))
+                .unwrap_or(&GRID_BRIGHTNESS_DEFAULT)
+        };
+        self.display.grid_brightness = near(self.display.grid_brightness);
+        self.display.axis_brightness = near(self.display.axis_brightness);
         if !CAL_FREQS.contains(&self.cal_freq) {
             self.cal_freq = 1_000;
         }

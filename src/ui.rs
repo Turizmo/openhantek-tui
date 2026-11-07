@@ -238,7 +238,11 @@ pub fn trace_points(
 /// The grid in the style of the display settings.
 fn grid(plot: &mut Plot, s: &Settings, pal: &Palette) {
     let d = &s.display;
-    plot.grid_with(pal, d.grid_style, d.grid_extent, d.grid_brightness);
+    plot.grid_axis(
+        pal,
+        (d.grid_style, d.grid_extent, d.grid_brightness),
+        (d.axis_style, d.axis_extent, d.axis_brightness),
+    );
 }
 
 fn draw_trace(plot: &mut Plot, frame: &Frame, t: usize, s: &Settings, layer: u8, color: Color) {

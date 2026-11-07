@@ -95,6 +95,9 @@ pub const COMMENTS: &[(&str, &str)] = &[
     ("display.grid_style", "Dots Dashed Solid Crosses None"),
     ("display.grid_extent", "\"Points\" (marks at crossings) or \"Full\" (whole lines)"),
     ("display.grid_brightness", "grid brightness in percent: 10 .. 100 in steps of 10"),
+    ("display.axis_style", "center cross (axes): Dots Dashed Solid Crosses None"),
+    ("display.axis_extent", "\"Points\" (marks at divisions and ticks) or \"Full\" (whole lines)"),
+    ("display.axis_brightness", "center cross brightness in percent: 10 .. 100 in steps of 10"),
     ("logger.step", "log step in seconds (2.5e-6 .. 60, 1-2-5 steps)"),
     ("logger.log_limit", "stop the log at this file size in bytes, 0 = no limit"),
     ("logger.log_dir", "log folder (default ~/.local/share/openhantek-tui/logs)"),
@@ -256,6 +259,7 @@ fn to_table(s: &Settings) -> toml::Table {
 pub fn settings_from_table(user: &toml::Table) -> (Settings, Vec<String>) {
     let mut user = user.clone();
     user.remove("keys");
+    axis_from_old_grid(&mut user);
     let mut warnings = Vec::new();
     let defaults = to_table(&Settings::default());
     let known: Vec<String> = leaves(&defaults)
@@ -298,6 +302,24 @@ pub fn settings_from_table(user: &toml::Table) -> (Settings, Vec<String>) {
     }
     let s = Settings::deserialize(good).unwrap_or_default();
     (s, warnings)
+}
+
+/// Files from before the axis settings drew the center cross with the
+/// grid: solid with a solid grid, none with no grid, else dashed. A file
+/// with a grid style but no axis style keeps that look.
+fn axis_from_old_grid(user: &mut toml::Table) {
+    let Some(toml::Value::Table(d)) = user.get_mut("display") else {
+        return;
+    };
+    if d.contains_key("axis_style") {
+        return;
+    }
+    let axis = match d.get("grid_style").and_then(|v| v.as_str()) {
+        Some("Solid") => "Solid",
+        Some("None") => "None",
+        _ => return,
+    };
+    d.insert("axis_style".into(), toml::Value::String(axis.into()));
 }
 
 /// The `[keys]` table as (action, keys) in file order, with warnings for
@@ -523,7 +545,11 @@ pub fn load(path: &Path, old: Option<&Path>) -> Loaded {
             if let Some(old) = old.filter(|p| p.exists()) {
                 match std::fs::read_to_string(old)
                     .map_err(anyhow::Error::from)
-                    .and_then(|t| toml::from_str::<Settings>(&t).map_err(Into::into))
+                    .and_then(|t| toml::from_str::<toml::Table>(&t).map_err(Into::into))
+                    .and_then(|mut t| {
+                        axis_from_old_grid(&mut t);
+                        Settings::deserialize(t).map_err(Into::into)
+                    })
                 {
                     Ok(s) => {
                         settings = s;
@@ -851,6 +877,35 @@ mod tests {
         assert_eq!(l.settings, Settings::default());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_files_keep_their_center_cross() {
+        use crate::settings::{GridExtent, GridStyle};
+        let load = |text: &str| settings_from_table(&toml::from_str(text).unwrap()).0;
+        // No axis settings: the center cross of the first versions.
+        let s = load("[display]\ndots = true\n");
+        assert_eq!(
+            (s.display.axis_style, s.display.axis_extent, s.display.axis_brightness),
+            (GridStyle::Dashed, GridExtent::Full, 30)
+        );
+        // It went with the grid style: solid with solid, none with none.
+        let s = load("[display]\ngrid_style = \"Solid\"\n");
+        assert_eq!(s.display.axis_style, GridStyle::Solid);
+        let s = load("[display]\ngrid_style = \"None\"\n");
+        assert_eq!(s.display.axis_style, GridStyle::None);
+        let s = load("[display]\ngrid_style = \"Crosses\"\n");
+        assert_eq!(s.display.axis_style, GridStyle::Dashed);
+        // A file with axis settings keeps them, apart from the grid.
+        let s = load(
+            "[display]\ngrid_style = \"None\"\naxis_style = \"Solid\"\naxis_extent = \"Points\"\naxis_brightness = 72\n",
+        );
+        assert_eq!(s.display.grid_style, GridStyle::None);
+        assert_eq!(s.display.axis_style, GridStyle::Solid);
+        assert_eq!(s.display.axis_extent, GridExtent::Points);
+        let mut s = s;
+        s.sanitize();
+        assert_eq!(s.display.axis_brightness, 70);
     }
 
     #[test]

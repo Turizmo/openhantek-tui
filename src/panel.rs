@@ -69,6 +69,9 @@ pub enum Field {
     GridLook,
     GridExtent,
     GridBrightness,
+    AxisLook,
+    AxisExtent,
+    AxisBrightness,
     SpecOn,
     SpecWindow,
     SpecZoom,
@@ -214,6 +217,9 @@ pub fn categories() -> Vec<Category> {
                 GridLook,
                 GridExtent,
                 GridBrightness,
+                AxisLook,
+                AxisExtent,
+                AxisBrightness,
             ],
         },
         Category {
@@ -346,6 +352,9 @@ impl Field {
             GridLook => "Grid style",
             GridExtent => "Grid lines",
             GridBrightness => "Grid brightness",
+            AxisLook => "Axis style",
+            AxisExtent => "Axis lines",
+            AxisBrightness => "Axis brightness",
             SpecOn => "Show spectrum",
             SpecWindow => "Window",
             SpecZoom => "Span",
@@ -424,9 +433,12 @@ impl Field {
             Persistence => "Keep this many old traces on screen, dimmed. Key P.",
             Xy => "Draw CH1 against CH2. Key x.",
             Colors => "auto uses true colour when COLORTERM says so.",
-            GridLook => "Look of the division lines. The center cross is brighter in every style.",
+            GridLook => "Look of the division lines. The center cross has its own Axis settings.",
             GridExtent => "points: marks where division lines cross. full: every division line across the whole plot.",
             GridBrightness => "How bright the grid is. Traces are always drawn over it.",
+            AxisLook => "Look of the center cross (the axes through 0). none shows the grid there.",
+            AxisExtent => "points: marks at the divisions and ticks. full: the whole center lines.",
+            AxisBrightness => "How bright the center cross is. It is drawn over the grid, under the traces.",
             CursorLook(_) => "classic: dashes, name inside the plot. fine dashes: short dashes, name in the margin. solid, dotted: name inside.",
             CursorColour(_) => "Colour of the cursor line and its name.",
             SpecOn => "Show the spectrum (FFT) below the trace. Key f.",
@@ -542,15 +554,17 @@ impl Field {
                 .iter()
                 .map(|m| m.name().to_string())
                 .collect(),
-            GridLook => GridStyle::ALL
+            GridLook | AxisLook => GridStyle::ALL
                 .iter()
                 .map(|m| m.name().to_string())
                 .collect(),
-            GridExtent => crate::settings::GridExtent::ALL
+            GridExtent | AxisExtent => crate::settings::GridExtent::ALL
                 .iter()
                 .map(|m| m.name().to_string())
                 .collect(),
-            GridBrightness => GRID_BRIGHTNESS.iter().map(|b| format!("{b} %")).collect(),
+            GridBrightness | AxisBrightness => {
+                GRID_BRIGHTNESS.iter().map(|b| format!("{b} %")).collect()
+            }
             SpecWindow => Window::ALL.iter().map(|w| w.name().to_string()).collect(),
             SpecZoom => (0..=MAX_SPECTRUM_ZOOM)
                 .map(|z| match d.rate {
@@ -650,6 +664,9 @@ impl Field {
             GridLook => index_of(&GridStyle::ALL, &s.display.grid_style),
             GridExtent => index_of(&crate::settings::GridExtent::ALL, &s.display.grid_extent),
             GridBrightness => index_of(&GRID_BRIGHTNESS, &s.display.grid_brightness),
+            AxisLook => index_of(&GridStyle::ALL, &s.display.axis_style),
+            AxisExtent => index_of(&crate::settings::GridExtent::ALL, &s.display.axis_extent),
+            AxisBrightness => index_of(&GRID_BRIGHTNESS, &s.display.axis_brightness),
             SpecWindow => index_of(&Window::ALL, &s.display.window),
             SpecZoom => s.display.spectrum_zoom as usize,
             LogStep => s.logger.step_idx(),
@@ -733,6 +750,14 @@ impl Field {
             }
             GridBrightness => {
                 s.display.grid_brightness = GRID_BRIGHTNESS[i.min(GRID_BRIGHTNESS.len() - 1)]
+            }
+            AxisLook => s.display.axis_style = GridStyle::ALL[i.min(GridStyle::ALL.len() - 1)],
+            AxisExtent => {
+                let all = crate::settings::GridExtent::ALL;
+                s.display.axis_extent = all[i.min(all.len() - 1)]
+            }
+            AxisBrightness => {
+                s.display.axis_brightness = GRID_BRIGHTNESS[i.min(GRID_BRIGHTNESS.len() - 1)]
             }
             SpecWindow => s.display.window = Window::ALL[i.min(Window::ALL.len() - 1)],
             SpecZoom => s.display.spectrum_zoom = (i as u32).min(MAX_SPECTRUM_ZOOM),

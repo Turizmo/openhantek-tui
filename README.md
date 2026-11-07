@@ -355,20 +355,27 @@ Dots (`d`), persistence (`P`) and interpolation
 load: the old style names `Classic` and `Thin` read as `braille thin`,
 `Bold` as `braille bold`.
 
-The grid has three settings under Display, used in the time view, the
-spectrum and XY:
+The grid and the center cross (the axes through 0) have three settings
+each under Display, used in the time view, the spectrum and XY. They are
+independent: for example no grid and a solid center cross.
 
 | Setting | Values |
 |---|---|
-| Grid style | `dots` (default: `·` where division lines cross), `dashed` (`╌` `╎`), `solid` (`─` `│` with `┼` crossings), `crosses` (`+` where lines cross), `none` (no grid, no center cross) |
+| Grid style | `dots` (default: `·` where division lines cross), `dashed` (`╌` `╎`), `solid` (`─` `│` with `┼` crossings), `crosses` (`+` where lines cross), `none` (no grid) |
 | Grid lines | `points` (default: marks only at the crossings, short arms for dashed and solid) or `full` (every division line across the whole plot, with `┌ ┬ ├ ┼` joins) |
 | Grid brightness | 10 % to 100 % in steps of 10 (default 30 %, the old look) |
+| Axis style | `dashed` (default: `╌` `╎` with `┼` and `┴` `├` ticks), `solid` (`─` `│`), `dots` (`·`), `crosses` (`+` at the divisions, `·` between), `none` (the grid shows on the center lines) |
+| Axis lines | `full` (default: the whole center lines) or `points` (only the division points and the 1/5 division ticks, short arms for dashed and solid) |
+| Axis brightness | 10 % to 100 % in steps of 10 (default 30 %; the center cross is a step brighter than the grid at the same percentage) |
 
-The center cross is always a whole line and a little brighter than the
-rest of the grid. Brightness scales the perceptual lightness of the grid
-in true colour, takes the nearest xterm gray in 256 colours, and has four
-steps in 16 colours (dim dark gray, dark gray, gray, white). Traces are
-always drawn over the grid.
+The defaults draw the center cross of the first versions. A config
+file from before the axis settings keeps its look: with `grid_style =
+"Solid"` the center cross is solid, with `"None"` it is off. The axes
+are drawn over the grid, and traces over both. Ticks at 1/5 division
+show when a division is a multiple of 5 cells and at least 10.
+Brightness scales the perceptual lightness in true colour, takes the
+nearest xterm gray in 256 colours, and has four steps in 16 colours
+(dim dark gray, dark gray, gray, white).
 
 Persistence (`P`, time view only) keeps 2, 4, 8 or 16 old traces, and
 each fades by age: the newest old trace is at 85 % of the way from the
