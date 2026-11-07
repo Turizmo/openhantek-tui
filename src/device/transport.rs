@@ -31,7 +31,10 @@ impl Transport for UsbTransport {
             .handle
             .write_control(VENDOR_OUT, request, value, index, data, self.timeout)?;
         if n != data.len() {
-            anyhow::bail!("control request {request:#04x}: wrote {n} of {} bytes", data.len());
+            anyhow::bail!(
+                "control request {request:#04x}: wrote {n} of {} bytes",
+                data.len()
+            );
         }
         Ok(())
     }
@@ -91,4 +94,34 @@ impl Transport for Recorder {
         buf.fill(0x80);
         Ok(buf.len())
     }
+}
+
+impl<T: Transport + ?Sized> Transport for Box<T> {
+    fn control_out(&mut self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
+        (**self).control_out(request, value, index, data)
+    }
+
+    fn control_in(&mut self, request: u8, value: u16, index: u16, buf: &mut [u8]) -> Result<usize> {
+        (**self).control_in(request, value, index, buf)
+    }
+
+    fn bulk_in(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        (**self).bulk_in(endpoint, buf, timeout)
+    }
+}
+
+/// True when the error means the scope is gone (unplugged).
+pub fn is_gone(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        matches!(
+            e.downcast_ref::<rusb::Error>(),
+            Some(rusb::Error::NoDevice) | Some(rusb::Error::Io) | Some(rusb::Error::Pipe)
+        )
+    })
+}
+
+/// True when the error is a USB timeout.
+pub fn is_timeout(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| matches!(e.downcast_ref::<rusb::Error>(), Some(rusb::Error::Timeout)))
 }

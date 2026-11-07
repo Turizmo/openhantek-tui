@@ -108,7 +108,13 @@ mod tests {
         let path = dir.join("settings.toml");
         std::fs::write(&path, "a = 3").unwrap();
         let (v, _): (Demo, _) = load(&path);
-        assert_eq!(v, Demo { a: 3, b: String::new() });
+        assert_eq!(
+            v,
+            Demo {
+                a: 3,
+                b: String::new()
+            }
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -32,7 +32,11 @@ pub fn sinc_interpolate(samples: &[f64], factor: usize) -> Vec<f64> {
             sum += samples[idx] * w;
             weight += w;
         }
-        out.push(if weight.abs() > 1e-12 { sum / weight } else { sum });
+        out.push(if weight.abs() > 1e-12 {
+            sum / weight
+        } else {
+            sum
+        });
     }
     out
 }

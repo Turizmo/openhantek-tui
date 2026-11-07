@@ -58,9 +58,8 @@ pub fn measure(samples: &[f64], dt: f64) -> Measurements {
     };
 
     let edges = find_edges(samples, min, max);
-    let period_from = |e: &[f64]| {
-        (e.len() >= 2).then(|| (e[e.len() - 1] - e[0]) / (e.len() - 1) as f64)
-    };
+    let period_from =
+        |e: &[f64]| (e.len() >= 2).then(|| (e[e.len() - 1] - e[0]) / (e.len() - 1) as f64);
     // Mean period from rising and from falling edges, in samples.
     let periods: Vec<f64> = [period_from(&edges.rising), period_from(&edges.falling)]
         .into_iter()
@@ -94,10 +93,20 @@ pub fn measure(samples: &[f64], dt: f64) -> Measurements {
 
     let lo = base + 0.1 * (top - base);
     let hi = base + 0.9 * (top - base);
-    m.rise = mean_of(edges.rising.iter().filter_map(|&e| transition(samples, e, lo, hi)))
-        .map(|s| s * dt);
-    m.fall = mean_of(edges.falling.iter().filter_map(|&e| transition(samples, e, hi, lo)))
-        .map(|s| s * dt);
+    m.rise = mean_of(
+        edges
+            .rising
+            .iter()
+            .filter_map(|&e| transition(samples, e, lo, hi)),
+    )
+    .map(|s| s * dt);
+    m.fall = mean_of(
+        edges
+            .falling
+            .iter()
+            .filter_map(|&e| transition(samples, e, hi, lo)),
+    )
+    .map(|s| s * dt);
     m
 }
 

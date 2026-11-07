@@ -34,7 +34,10 @@ pub fn parse(text: &str) -> Result<Vec<Record>> {
             .with_context(|| format!("line {lineno}: not hex"))?;
         let len = bytes[0] as usize;
         if bytes.len() != len + 5 {
-            bail!("line {lineno}: length byte says {len}, line has {}", bytes.len() - 5);
+            bail!(
+                "line {lineno}: length byte says {len}, line has {}",
+                bytes.len() - 5
+            );
         }
         let sum = bytes.iter().fold(0u8, |a, b| a.wrapping_add(*b));
         if sum != 0 {
@@ -115,6 +118,8 @@ mod tests {
         let r = parse(&text).unwrap();
         assert!(!r.is_empty());
         // FX2 internal RAM is 16 KiB (0x0000..0x4000).
-        assert!(r.iter().all(|rec| rec.addr as usize + rec.data.len() <= 0x4000));
+        assert!(r
+            .iter()
+            .all(|rec| rec.addr as usize + rec.data.len() <= 0x4000));
     }
 }

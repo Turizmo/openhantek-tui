@@ -12,7 +12,12 @@ pub struct Column<'a> {
 
 /// Write traces as CSV. The first column is time in seconds, starting at
 /// `t0` with `dt` between rows. Short columns get empty cells.
-pub fn write_csv(out: &mut impl Write, t0: f64, dt: f64, columns: &[Column]) -> std::io::Result<()> {
+pub fn write_csv(
+    out: &mut impl Write,
+    t0: f64,
+    dt: f64,
+    columns: &[Column],
+) -> std::io::Result<()> {
     write!(out, "time_s")?;
     for c in columns {
         write!(out, ",{}", c.name)?;
@@ -85,8 +90,14 @@ mod tests {
             -1e-3,
             1e-3,
             &[
-                Column { name: "CH1_V", samples: &ch1 },
-                Column { name: "CH2_V", samples: &ch2 },
+                Column {
+                    name: "CH1_V",
+                    samples: &ch1,
+                },
+                Column {
+                    name: "CH2_V",
+                    samples: &ch2,
+                },
             ],
         )
         .unwrap();
@@ -113,7 +124,16 @@ mod tests {
     fn save_writes_a_file() {
         let dir = std::env::temp_dir().join(format!("oht-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = save_csv(&dir, 0.0, 1.0, &[Column { name: "CH1_V", samples: &[1.0] }]).unwrap();
+        let path = save_csv(
+            &dir,
+            0.0,
+            1.0,
+            &[Column {
+                name: "CH1_V",
+                samples: &[1.0],
+            }],
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("time_s,CH1_V\n"));
         std::fs::remove_dir_all(&dir).unwrap();

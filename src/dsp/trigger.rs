@@ -129,7 +129,10 @@ mod tests {
     fn level_out_of_range_gives_none() {
         let s = sine(1000, 100.0, 0.0);
         assert_eq!(find_trigger(&s, 2.0, Slope::Rising, 0.1, 0, s.len()), None);
-        assert_eq!(find_trigger(&s, -2.0, Slope::Falling, 0.1, 0, s.len()), None);
+        assert_eq!(
+            find_trigger(&s, -2.0, Slope::Falling, 0.1, 0, s.len()),
+            None
+        );
     }
 
     #[test]
@@ -165,6 +168,9 @@ mod tests {
     fn empty_and_tiny_inputs() {
         assert_eq!(find_trigger(&[], 0.0, Slope::Rising, 0.1, 0, 0), None);
         assert_eq!(find_trigger(&[1.0], 0.0, Slope::Rising, 0.1, 0, 1), None);
-        assert_eq!(find_trigger(&[-1.0, 1.0], 0.0, Slope::Rising, 0.1, 5, 2), None);
+        assert_eq!(
+            find_trigger(&[-1.0, 1.0], 0.0, Slope::Rising, 0.1, 5, 2),
+            None
+        );
     }
 }
