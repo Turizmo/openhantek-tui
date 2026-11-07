@@ -195,16 +195,17 @@ time view and the spectrum:
 
 | Style | Look |
 |---|---|
-| `classic` (default) | lines from point to point through the low and high value of each dot column, like the first version |
-| `braille thin` | one braille dot thick, one dot run per column |
-| `bold` | the thin line, two dots thick |
+| `braille thin` (default) | lines from point to point through the low and high value of each dot column, like the first version |
+| `braille bold` | one dot run per column, two dots thick |
 | `ascii lines` | no braille, for fonts that draw it badly: one character per cell, `\|` on steep runs, `/` and `\` on slopes, `_` `-` `‾` for flat parts at the bottom, middle or top of the cell; dots mode puts `.` `·` `'` per sample |
 | `box lines` | no braille: one connected line of box-drawing characters, which the terminal joins cell to cell. `─` for flat runs at the level of the cell row, `│` for steep runs and noise, `╭` `╮` `╰` `╯` where the line turns, `╵` `╷` where a run stops in a cell; dots mode puts `•` per sample |
 
 Display › Cursor style (also under Cursors) picks `classic` (grey dashes,
 `A`/`B` inside the plot, the default) or `fine dashes` (short dashes,
 names in the margin). Dots (`d`), persistence (`P`) and interpolation
-(`z`) work with every style.
+(`z`) work with every style. Settings files from older versions still
+load: the old style names `Classic` and `Thin` read as `braille thin`,
+`Bold` as `braille bold`.
 
 Persistence (`P`, time view only) keeps 2, 4, 8 or 16 old traces, and
 each fades by age: the newest old trace is at 85 % of the way from the

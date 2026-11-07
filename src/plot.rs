@@ -2,9 +2,9 @@
 //!
 //! A cell holds 2 x 4 braille dots and one colour. Each division is a whole
 //! number of cells, so the grid looks the same in every division. Traces
-//! are drawn in one of the [`TraceStyle`]s: classic lines from point to
-//! point, one dot thick (one vertical run of dots per dot column), bold,
-//! text lines with no braille at all (`|`, `/`, `\`, `_`, `-`, `‾`), or
+//! are drawn in one of the [`TraceStyle`]s: braille thin lines from point
+//! to point, braille bold (one vertical run of dots per dot column, two
+//! dots wide), text lines with no braille at all (`|`, `/`, `\`, `_`, `-`, `‾`), or
 //! connected box-drawing lines (`─`, `│`, `╭`, `╮`, `╰`, `╯`).
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
@@ -272,11 +272,9 @@ impl Plot {
         color: Color,
     ) {
         match (style, dots) {
-            (TraceStyle::Classic, _) => self.classic(points, dots, layer, color),
-            (TraceStyle::Thin, false) => self.trace(points, layer, color),
-            (TraceStyle::Thin, true) => self.points(points, layer, color),
-            (TraceStyle::Bold, false) => self.trace_run(points, true, layer, color),
-            (TraceStyle::Bold, true) => self.points_bold(points, layer, color),
+            (TraceStyle::BrailleThin, _) => self.classic(points, dots, layer, color),
+            (TraceStyle::BrailleBold, false) => self.trace_run(points, true, layer, color),
+            (TraceStyle::BrailleBold, true) => self.points_bold(points, layer, color),
             (TraceStyle::Line, false) => self.text_line(points, layer, color),
             (TraceStyle::Line, true) => self.text_points(points, layer, color),
             (TraceStyle::Box, false) => self.box_line(points, layer, color),
@@ -1282,7 +1280,7 @@ mod tests {
         let mut p = Plot::new(6, 3);
         p.styled(
             &samples(500, |_| 1.0),
-            TraceStyle::Bold,
+            TraceStyle::BrailleBold,
             false,
             LAYER_CH1,
             RED,
@@ -1292,7 +1290,7 @@ mod tests {
             assert_eq!(column(&p, x), vec![row, row + 1], "col {x}");
         }
         let mut p = Plot::new(6, 3);
-        p.styled(&[(0.0, 0.0)], TraceStyle::Bold, true, LAYER_CH1, RED);
+        p.styled(&[(0.0, 0.0)], TraceStyle::BrailleBold, true, LAYER_CH1, RED);
         assert_eq!(used_columns(&p).len(), 2);
     }
 

@@ -197,9 +197,9 @@ pub fn trace_points(
 
 fn draw_trace(plot: &mut Plot, frame: &Frame, t: usize, s: &Settings, layer: u8, color: Color) {
     let style = s.display.trace_style[t];
-    // The classic style shows the same points with and without dots, like
-    // the first version did: sin(x)/x points too.
-    let dots = s.display.dots && style != TraceStyle::Classic;
+    // Braille thin shows the same points with and without dots, like the
+    // first version did: sin(x)/x points too.
+    let dots = s.display.dots && style != TraceStyle::BrailleThin;
     let pts = trace_points(frame, t, s, plot.dots_w(), dots);
     plot.styled(&pts, style, s.display.dots, layer, color);
 }

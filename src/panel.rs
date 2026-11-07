@@ -306,7 +306,7 @@ impl Field {
             ChCoupling(_) => "AC takes away the DC part (in software). Key c.",
             ChProbe(_) => "Set this to match the switch on the probe. Key p.",
             ChInvert(_) => "Turn the trace upside down. Key i.",
-            Style(_) => "classic: lines through the low and high value of each dot column. braille thin: one dot thick. bold: two dots thick.",
+            Style(_) => "braille thin: lines through the low and high value of each dot column. braille bold: two dots thick. ascii and box lines: no braille.",
             MathEnabled => "Show the math trace. Key 3.",
             MathMode => "How the math trace is made from CH1 and CH2. Key m.",
             MathScale => "Units per division of the math trace.",

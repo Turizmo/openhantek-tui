@@ -638,7 +638,7 @@ fn styled_rig(style: TraceStyle) -> Rig {
 #[test]
 fn classic_styles_are_the_default() {
     let s = Settings::default();
-    assert_eq!(s.display.trace_style, [TraceStyle::Classic; 3]);
+    assert_eq!(s.display.trace_style, [TraceStyle::BrailleThin; 3]);
     assert_eq!(s.display.cursor_style, CursorStyle::Classic);
 }
 
@@ -689,13 +689,16 @@ fn every_trace_style_draws_with_dots_persistence_and_interpolation() {
 
 #[test]
 fn trace_styles_look_different() {
-    let thin = braille_dots(&styled_rig(TraceStyle::Thin).screen(120, 30));
-    let classic = braille_dots(&styled_rig(TraceStyle::Classic).screen(120, 30));
-    let bold = braille_dots(&styled_rig(TraceStyle::Bold).screen(120, 30));
-    // Classic goes through the low and high value of every column, so it
-    // is at least as heavy as the thin line; bold is about twice as heavy.
-    assert!(classic > thin, "classic {classic} thin {thin}");
-    assert!(bold > thin * 3 / 2, "bold {bold} thin {thin}");
+    let thin = styled_rig(TraceStyle::BrailleThin).screen(120, 30);
+    let bold = styled_rig(TraceStyle::BrailleBold).screen(120, 30);
+    // Bold is two dots wide, so it has more dots than the thin line.
+    assert_ne!(thin, bold);
+    assert!(
+        braille_dots(&bold) > braille_dots(&thin),
+        "bold {} thin {}",
+        braille_dots(&bold),
+        braille_dots(&thin)
+    );
 }
 
 #[test]
@@ -712,7 +715,7 @@ fn line_style_draws_without_braille() {
     assert!(count('/') >= 4 && count('\\') >= 4, "{text}");
     // Mixed with a braille style, each trace keeps its own look.
     let mut r = styled_rig(TraceStyle::Line);
-    r.app.scope.settings.display.trace_style[1] = TraceStyle::Classic;
+    r.app.scope.settings.display.trace_style[1] = TraceStyle::BrailleThin;
     let mixed = r.screen(120, 36);
     assert!(braille_dots(&mixed) > 100);
     assert!(mixed.join("").contains('/'));
@@ -738,7 +741,7 @@ fn box_style_draws_connected_box_lines() {
     assert!(text.contains("╰─╯"), "{text}");
     // Mixed with a braille style, each trace keeps its own look.
     let mut r = styled_rig(TraceStyle::Box);
-    r.app.scope.settings.display.trace_style[1] = TraceStyle::Classic;
+    r.app.scope.settings.display.trace_style[1] = TraceStyle::BrailleThin;
     let mixed = r.screen(120, 36);
     assert!(braille_dots(&mixed) > 100);
     assert!(mixed.join("").contains('╭'));
@@ -798,15 +801,15 @@ fn settings_panel_changes_trace_style_live() {
     r.char('j');
     assert_eq!(
         r.app.scope.settings.display.trace_style[0],
-        TraceStyle::Thin
+        TraceStyle::BrailleBold
     );
-    assert!(r.text(140, 40).contains("braille thin"));
+    assert!(r.text(140, 40).contains("braille bold"));
     r.key(KeyCode::Enter);
     r.char('S');
     assert!(!r.app.panel_open);
     assert_eq!(
         r.app.scope.settings.display.trace_style,
-        [TraceStyle::Thin, TraceStyle::Classic, TraceStyle::Classic]
+        [TraceStyle::BrailleBold, TraceStyle::BrailleThin, TraceStyle::BrailleThin]
     );
     assert_ne!(r.screen(140, 40), before);
 }

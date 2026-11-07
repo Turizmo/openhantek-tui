@@ -215,12 +215,14 @@ pub enum Interpolation {
 pub enum TraceStyle {
     /// Braille lines from point to point, through the low and high value
     /// of each dot column. Thicker where the signal is noisy or steep.
+    /// Files from before the rename say `Classic`; the old one dot thick
+    /// `Thin` style is gone and loads as this one.
     #[default]
-    Classic,
-    /// One braille dot thick: one vertical run per dot column.
-    Thin,
-    /// The thin line, two dots wide.
-    Bold,
+    #[serde(alias = "Classic", alias = "Thin")]
+    BrailleThin,
+    /// One braille dot run per dot column, two dots wide.
+    #[serde(alias = "Bold")]
+    BrailleBold,
     /// No braille: one text character per cell, like an old ASCII scope.
     /// `|` for steep runs, `/` and `\` for slopes, `_`, `-` and `‾` for
     /// flat parts at the bottom, middle and top of the cell.
@@ -232,19 +234,17 @@ pub enum TraceStyle {
 }
 
 impl TraceStyle {
-    pub const ALL: [TraceStyle; 5] = [
-        TraceStyle::Classic,
-        TraceStyle::Thin,
-        TraceStyle::Bold,
+    pub const ALL: [TraceStyle; 4] = [
+        TraceStyle::BrailleThin,
+        TraceStyle::BrailleBold,
         TraceStyle::Line,
         TraceStyle::Box,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
-            TraceStyle::Classic => "classic",
-            TraceStyle::Thin => "braille thin",
-            TraceStyle::Bold => "bold",
+            TraceStyle::BrailleThin => "braille thin",
+            TraceStyle::BrailleBold => "braille bold",
             TraceStyle::Line => "ascii lines",
             TraceStyle::Box => "box lines",
         }
@@ -310,7 +310,7 @@ impl Default for DisplaySettings {
             dots: false,
             measurements: true,
             colors: ColorMode::Auto,
-            trace_style: [TraceStyle::Classic; 3],
+            trace_style: [TraceStyle::BrailleThin; 3],
             cursor_style: CursorStyle::Classic,
         }
     }
@@ -490,7 +490,7 @@ mod tests {
         s.trigger.slope = Slope::Both;
         s.display.window = Window::FlatTop;
         s.math.mode = MathMode::Mul;
-        s.display.trace_style = [TraceStyle::Thin, TraceStyle::Box, TraceStyle::Line];
+        s.display.trace_style = [TraceStyle::BrailleBold, TraceStyle::Box, TraceStyle::Line];
         s.display.cursor_style = CursorStyle::Fine;
         let text = toml::to_string_pretty(&s).unwrap();
         let back: Settings = toml::from_str(&text).unwrap();
@@ -504,17 +504,33 @@ mod tests {
         let text = "[display]\ndots = true\n";
         let s: Settings = toml::from_str(text).unwrap();
         assert!(s.display.dots);
-        assert_eq!(s.display.trace_style, [TraceStyle::Classic; 3]);
+        assert_eq!(s.display.trace_style, [TraceStyle::BrailleThin; 3]);
         assert_eq!(s.display.cursor_style, CursorStyle::Classic);
         // Each style is saved by name.
         let mut s = Settings::default();
-        s.display.trace_style[1] = TraceStyle::Bold;
+        s.display.trace_style[1] = TraceStyle::BrailleBold;
         s.display.trace_style[2] = TraceStyle::Box;
         let text = toml::to_string_pretty(&s).unwrap();
         let text: String = text.split_whitespace().collect();
         assert!(
-            text.contains(r#"trace_style=["Classic","Bold","Box",]"#),
+            text.contains(r#"trace_style=["BrailleThin","BrailleBold","Box",]"#),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn old_style_names_still_load() {
+        // Before the rename: Classic was the default, Thin a one dot
+        // line (now gone), Bold the two dot line.
+        let text = "[display]\ntrace_style = [\"Classic\", \"Thin\", \"Bold\"]\n";
+        let s: Settings = toml::from_str(text).unwrap();
+        assert_eq!(
+            s.display.trace_style,
+            [
+                TraceStyle::BrailleThin,
+                TraceStyle::BrailleThin,
+                TraceStyle::BrailleBold
+            ]
         );
     }
 }
