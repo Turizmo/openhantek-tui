@@ -58,6 +58,10 @@ pub struct ChannelSettings {
     /// Probe attenuation: 1 or 10.
     pub probe: u32,
     pub invert: bool,
+    /// Fine volts/div (Alt-↑ ↓): a factor on the step `volt_idx`, between
+    /// the step below and this one; 1 = the step itself. The hardware gain
+    /// is the one of the step, so the range covers the screen.
+    pub volts_fine: f64,
 }
 
 impl Default for ChannelSettings {
@@ -69,6 +73,7 @@ impl Default for ChannelSettings {
             coupling: Coupling::Dc,
             probe: 1,
             invert: false,
+            volts_fine: 1.0,
         }
     }
 }
@@ -76,7 +81,77 @@ impl Default for ChannelSettings {
 impl ChannelSettings {
     /// Volts per division at the probe tip.
     pub fn volts_per_div(&self) -> f64 {
-        VOLT_DIVS[self.volt_idx.min(VOLT_DIVS.len() - 1)] * self.probe as f64
+        self.volts_div_bnc() * self.probe as f64
+    }
+
+    /// Volts per division at the BNC (probe x1), with the fine factor.
+    pub fn volts_div_bnc(&self) -> f64 {
+        VOLT_DIVS[self.volt_idx.min(VOLT_DIVS.len() - 1)] * self.volts_fine
+    }
+}
+
+/// A value between the steps of a 1-2-5 list: the index of the step at or
+/// above it, and the factor on that step (1 = on the step). Values out
+/// of the list's range are clamped to it.
+pub fn fine_step(steps: &[f64], value: f64) -> (usize, f64) {
+    let v = if value.is_finite() { value } else { steps[0] };
+    let v = v.clamp(steps[0], steps[steps.len() - 1]);
+    let i = steps
+        .iter()
+        .position(|s| *s >= v * (1.0 - 1e-6))
+        .unwrap_or(steps.len() - 1);
+    let f = v / steps[i];
+    (i, if f > 0.9999 { 1.0 } else { f })
+}
+
+/// One fine step from `value` (Alt with ↑ ↓ ← →): a tenth of the gap to
+/// the next step down (`up` false) or up, rounded to 3 significant digits.
+pub fn fine_move(steps: &[f64], value: f64, up: bool) -> (usize, f64) {
+    let eps = 1e-6;
+    let lo = steps
+        .iter()
+        .rev()
+        .find(|s| {
+            if up {
+                **s <= value * (1.0 + eps)
+            } else {
+                **s < value * (1.0 - eps)
+            }
+        })
+        .copied();
+    let hi = steps
+        .iter()
+        .find(|s| {
+            if up {
+                **s > value * (1.0 + eps)
+            } else {
+                **s >= value * (1.0 - eps)
+            }
+        })
+        .copied();
+    let (Some(lo), Some(hi)) = (lo, hi) else {
+        return fine_step(steps, value);
+    };
+    let v = value + if up { 1.0 } else { -1.0 } * (hi - lo) / 10.0;
+    fine_step(steps, round_sig(v, 3))
+}
+
+/// `v` rounded to `n` significant digits.
+pub fn round_sig(v: f64, n: i32) -> f64 {
+    if v == 0.0 || !v.is_finite() {
+        return v;
+    }
+    let p = 10f64.powi(n - 1 - v.abs().log10().floor() as i32);
+    (v * p).round() / p
+}
+
+/// One normal step of a 1-2-5 list from (`idx`, `fine`): a fine value
+/// snaps to the step below (`up` false) or to its own step.
+pub fn coarse_move(len: usize, idx: usize, fine: f64, up: bool) -> usize {
+    if up {
+        (idx + usize::from(fine >= 1.0)).min(len - 1)
+    } else {
+        idx.saturating_sub(1)
     }
 }
 
@@ -142,6 +217,8 @@ pub struct MathSettings {
     /// Index into [`VOLT_DIVS`] (units per division).
     pub volt_idx: usize,
     pub offset: f64,
+    /// Fine units/div: a factor on the step, like `volts_fine`.
+    pub units_fine: f64,
 }
 
 impl Default for MathSettings {
@@ -151,13 +228,14 @@ impl Default for MathSettings {
             mode: MathMode::Add,
             volt_idx: 6, // 2 per div
             offset: 0.0,
+            units_fine: 1.0,
         }
     }
 }
 
 impl MathSettings {
     pub fn units_per_div(&self) -> f64 {
-        VOLT_DIVS[self.volt_idx.min(VOLT_DIVS.len() - 1)]
+        VOLT_DIVS[self.volt_idx.min(VOLT_DIVS.len() - 1)] * self.units_fine
     }
 }
 
@@ -668,6 +746,10 @@ pub struct Settings {
     pub math: MathSettings,
     /// Index into [`TIME_DIVS`].
     pub time_idx: usize,
+    /// Fine time/div (Alt-← →): a factor on the step `time_idx`, between
+    /// the step below and this one; 1 = the step. The sample rate is the
+    /// one of the step, so enough samples cover the screen.
+    pub time_fine: f64,
     pub trigger: TriggerSettings,
     pub cursors: CursorSettings,
     pub display: DisplaySettings,
@@ -692,6 +774,7 @@ impl Default for Settings {
             channels: [ch1, ch2],
             math: MathSettings::default(),
             time_idx: 14, // 1 ms/div
+            time_fine: 1.0,
             trigger: TriggerSettings::default(),
             cursors: CursorSettings::default(),
             display: DisplaySettings::default(),
@@ -706,16 +789,25 @@ impl Settings {
     /// Fix values that a hand-edited file may have out of range.
     pub fn sanitize(&mut self) {
         let half_v = V_DIVS / 2.0;
+        let fine = |steps: &[f64], idx: &mut usize, f: &mut f64| {
+            let i = (*idx).min(steps.len() - 1);
+            let v = steps[i] * if f.is_finite() && *f > 0.0 { *f } else { 1.0 };
+            (*idx, *f) = fine_step(steps, v);
+        };
         for ch in &mut self.channels {
-            ch.volt_idx = ch.volt_idx.min(VOLT_DIVS.len() - 1);
+            fine(&VOLT_DIVS, &mut ch.volt_idx, &mut ch.volts_fine);
             ch.offset = finite_or(ch.offset, 0.0).clamp(-half_v, half_v);
             if ch.probe != 1 && ch.probe != 10 {
                 ch.probe = 1;
             }
         }
-        self.math.volt_idx = self.math.volt_idx.min(VOLT_DIVS.len() - 1);
+        fine(
+            &VOLT_DIVS,
+            &mut self.math.volt_idx,
+            &mut self.math.units_fine,
+        );
         self.math.offset = finite_or(self.math.offset, 0.0).clamp(-half_v, half_v);
-        self.time_idx = self.time_idx.min(TIME_DIVS.len() - 1);
+        fine(&TIME_DIVS, &mut self.time_idx, &mut self.time_fine);
         self.trigger.source = self.trigger.source.min(1);
         self.trigger.level = finite_or(self.trigger.level, 0.0);
         self.trigger.position = finite_or(self.trigger.position, 0.5).clamp(0.0, 1.0);
@@ -756,7 +848,14 @@ impl Settings {
         lg.log_limit = crate::logger::LIMITS[lg.limit_idx()];
     }
 
+    /// Time per division, with the fine factor.
     pub fn time_per_div(&self) -> f64 {
+        self.coarse_time_per_div() * self.time_fine
+    }
+
+    /// The time/div step (`time_idx`), without the fine factor: the
+    /// sample rate and roll mode are chosen for it.
+    pub fn coarse_time_per_div(&self) -> f64 {
         TIME_DIVS[self.time_idx.min(TIME_DIVS.len() - 1)]
     }
 
@@ -765,9 +864,14 @@ impl Settings {
         self.time_per_div() * H_DIVS
     }
 
+    /// Screen time of the time/div step: the sample rate covers it.
+    pub fn coarse_screen_time(&self) -> f64 {
+        self.coarse_time_per_div() * H_DIVS
+    }
+
     /// True when the screen scrolls (slow time bases).
     pub fn roll(&self) -> bool {
-        self.time_per_div() >= ROLL_FROM * 0.999
+        self.coarse_time_per_div() >= ROLL_FROM * 0.999
     }
 }
 
@@ -923,6 +1027,56 @@ mod tests {
             text.contains("[cursors.volt_b]") && !text.contains("\nt = "),
             "{text}"
         );
+    }
+
+    #[test]
+    fn fine_steps_between_the_1_2_5_steps() {
+        // 1 V up: a tenth of the gap to 2 V.
+        assert_eq!(fine_move(&VOLT_DIVS, 1.0, true), (6, 0.55));
+        // 1.1 V down: back on 1 V.
+        assert_eq!(fine_move(&VOLT_DIVS, 1.1, false), (5, 1.0));
+        // 2 V down: a tenth of the gap to 1 V.
+        let (i, f) = fine_move(&VOLT_DIVS, 2.0, false);
+        assert_eq!(i, 6);
+        assert!((VOLT_DIVS[i] * f - 1.9).abs() < 1e-12);
+        // At the ends it stays.
+        assert_eq!(fine_move(&VOLT_DIVS, 10.0, true), (8, 1.0));
+        assert_eq!(fine_move(&VOLT_DIVS, 0.02, false), (0, 1.0));
+        // Time: 1 ms up gives 1.1 ms on the 2 ms step.
+        let (i, f) = fine_move(&TIME_DIVS, 1e-3, true);
+        assert_eq!(TIME_DIVS[i], 2e-3);
+        assert!((TIME_DIVS[i] * f - 1.1e-3).abs() < 1e-15);
+        // Normal steps snap: 1.35 (on the 2 step) goes to 1 down, 2 up.
+        assert_eq!(coarse_move(9, 6, 0.675, false), 5);
+        assert_eq!(coarse_move(9, 6, 0.675, true), 6);
+        assert_eq!(coarse_move(9, 6, 1.0, true), 7);
+        assert_eq!(round_sig(1.34999, 3), 1.35);
+    }
+
+    #[test]
+    fn fine_values_round_trip_and_old_files_load() {
+        let mut s = Settings::default();
+        s.channels[0].volt_idx = 6;
+        s.channels[0].volts_fine = 0.675;
+        s.math.units_fine = 0.8;
+        s.time_idx = 15;
+        s.time_fine = 0.55;
+        s.sanitize();
+        assert!((s.channels[0].volts_per_div() - 1.35).abs() < 1e-12);
+        assert!((s.time_per_div() - 1.1e-3).abs() < 1e-15);
+        assert_eq!(s.coarse_time_per_div(), 2e-3);
+        let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+        // Old files have no fine factors: the steps.
+        let s: Settings =
+            toml::from_str("time_idx = 3\n[[channels]]\nvolt_idx = 2\n[[channels]]\n").unwrap();
+        assert_eq!((s.time_fine, s.channels[0].volts_fine), (1.0, 1.0));
+        // A factor that is out of its step is moved to the right step.
+        let mut s = Settings::default();
+        s.channels[1].volt_idx = 6; // 2 V
+        s.channels[1].volts_fine = 0.25; // 0.5 V
+        s.sanitize();
+        assert_eq!((s.channels[1].volt_idx, s.channels[1].volts_fine), (4, 1.0));
     }
 
     #[test]

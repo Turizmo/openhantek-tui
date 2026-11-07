@@ -534,18 +534,24 @@ impl App {
             Act::Ch1 => s.channels[0].enabled ^= true,
             Act::Ch2 => s.channels[1].enabled ^= true,
             Act::Math => s.math.enabled ^= true,
-            Act::VoltsSmaller => {
-                let v = volt_idx(s, sel);
-                *v = v.saturating_sub(1);
+            Act::VoltsSmaller | Act::VoltsBigger => {
+                let (idx, fine) = volt_idx(s, sel);
+                *idx = coarse_move(VOLT_DIVS.len(), *idx, *fine, a == Act::VoltsBigger);
+                *fine = 1.0;
             }
-            Act::VoltsBigger => {
-                let v = volt_idx(s, sel);
-                *v = (*v + 1).min(VOLT_DIVS.len() - 1);
+            Act::VoltsSmallerFine | Act::VoltsBiggerFine => {
+                let (idx, fine) = volt_idx(s, sel);
+                let v = VOLT_DIVS[*idx] * *fine;
+                (*idx, *fine) = fine_move(&VOLT_DIVS, v, a == Act::VoltsBiggerFine);
             }
             Act::TraceUp => move_offset(s, sel, 0.5),
             Act::TraceDown => move_offset(s, sel, -0.5),
             Act::TraceUpFine => move_offset(s, sel, 0.1),
             Act::TraceDownFine => move_offset(s, sel, -0.1),
+            Act::TraceUpAlt => move_offset(s, sel, 0.05),
+            Act::TraceDownAlt => move_offset(s, sel, -0.05),
+            Act::TraceUpFineAlt => move_offset(s, sel, 0.01),
+            Act::TraceDownFineAlt => move_offset(s, sel, -0.01),
             Act::TraceCenter => *offset(s, sel) = 0.0,
             Act::Coupling if sel < 2 => {
                 s.channels[sel].coupling = s.channels[sel].coupling.toggle()
@@ -566,8 +572,19 @@ impl App {
             }
 
             // Time base.
-            Act::TimeSmaller => s.time_idx = s.time_idx.saturating_sub(1),
-            Act::TimeBigger => s.time_idx = (s.time_idx + 1).min(TIME_DIVS.len() - 1),
+            Act::TimeSmaller | Act::TimeBigger => {
+                s.time_idx = coarse_move(
+                    TIME_DIVS.len(),
+                    s.time_idx,
+                    s.time_fine,
+                    a == Act::TimeBigger,
+                );
+                s.time_fine = 1.0;
+            }
+            Act::TimeSmallerFine | Act::TimeBiggerFine => {
+                let up = a == Act::TimeBiggerFine;
+                (s.time_idx, s.time_fine) = fine_move(&TIME_DIVS, s.time_per_div(), up);
+            }
 
             // Trigger.
             Act::TriggerMode => s.trigger.mode = s.trigger.mode.next(),
@@ -580,6 +597,14 @@ impl App {
             Act::TriggerToMiddle => self.action(Action::TriggerToMiddle),
             Act::TriggerLeft => s.trigger.position = (s.trigger.position - 0.05).max(0.0),
             Act::TriggerRight => s.trigger.position = (s.trigger.position + 0.05).min(1.0),
+            Act::TriggerUpFine => {
+                s.trigger.level += 0.01 * s.channels[s.trigger.source].volts_per_div()
+            }
+            Act::TriggerDownFine => {
+                s.trigger.level -= 0.01 * s.channels[s.trigger.source].volts_per_div()
+            }
+            Act::TriggerLeftFine => s.trigger.position = (s.trigger.position - 0.005).max(0.0),
+            Act::TriggerRightFine => s.trigger.position = (s.trigger.position + 0.005).min(1.0),
 
             // Display.
             Act::Averaging => s.display.averaging = next_in(&AVERAGING, s.display.averaging),
@@ -785,11 +810,13 @@ impl App {
     }
 }
 
-fn volt_idx(s: &mut Settings, sel: usize) -> &mut usize {
+/// The volts/div step and fine factor of trace `sel`.
+fn volt_idx(s: &mut Settings, sel: usize) -> (&mut usize, &mut f64) {
     if sel == MATH {
-        &mut s.math.volt_idx
+        (&mut s.math.volt_idx, &mut s.math.units_fine)
     } else {
-        &mut s.channels[sel].volt_idx
+        let c = &mut s.channels[sel];
+        (&mut c.volt_idx, &mut c.volts_fine)
     }
 }
 
@@ -803,7 +830,7 @@ fn offset(s: &mut Settings, sel: usize) -> &mut f64 {
 
 fn move_offset(s: &mut Settings, sel: usize, by: f64) {
     let o = offset(s, sel);
-    *o = ((*o + by) * 10.0).round() / 10.0;
+    *o = ((*o + by) * 100.0).round() / 100.0;
     *o = o.clamp(-V_DIVS / 2.0, V_DIVS / 2.0);
 }
 

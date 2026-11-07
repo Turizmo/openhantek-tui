@@ -146,6 +146,9 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `j` `k` | move voltage cursor A (when it is on) |
 | `J` `K` | move voltage cursor B (when it is on) |
 | `Alt` + `h` `l` `H` `L` `j` `k` `J` `K` | move that cursor a hundredth of a division (fine) |
+| `Alt-↑` `Alt-↓` | volts/div between the steps (fine) |
+| `Alt-←` `Alt-→` | time/div between the steps (fine) |
+| `Alt` + `[` `]` `{` `}` `+` `-` `,` `.` | a tenth of the normal step (fine) |
 | `A` | averaging: 1 2 4 8 16 32 64 |
 | `P` | persistence: 0 2 4 8 16 traces |
 | `d` | dots / lines |
@@ -157,6 +160,22 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `r` | start / stop the envelope logger (see below) |
 | `V` | log view on / off |
 | `Ctrl-C` | quit |
+
+**Fine steps with Alt.** `Alt` with a step key takes a small step:
+the cursor keys move a hundredth of a division (less than one braille
+dot), `[` `]` `{` `}` `+` `-` `,` `.` a tenth of their step, and in the
+value box of a number setting `Alt-j` `Alt-k` step a tenth. `Alt-↑`
+`Alt-↓` and `Alt-←` `Alt-→` give a volts/div or time/div between the
+1-2-5 steps, in tenths of the gap to the next step (1 V, 1.1 V, 1.2 V
+... 2 V, 2.3 V ...), shown like `1.1 V/div`. The scope then works at the
+next bigger step: the hardware gain (so the input range covers the
+screen) and the sample rate (so enough samples cover it) are those of
+that step, and the plot, the measurements, the cursors, the trigger and
+the logger use the exact value. A normal `↑` `↓` `←` `→` snaps back to
+the 1-2-5 list. The value is saved as a factor on the step
+(`volts_fine`, `units_fine`, `time_fine`; 1 = on the step), so older
+files load as before. `Alt` works in every terminal, also VTE ones like
+xfce4-terminal, and in tmux.
 
 On screen: `1▸` and `2▸` on the left show each channel's 0 V line. `◂` on
 the right is the trigger level, `▾` at the top the trigger position.

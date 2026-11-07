@@ -41,168 +41,74 @@ pub fn old_settings_path() -> Option<PathBuf> {
 }
 
 /// A comment for every setting, by path (array indexes left out).
+#[rustfmt::skip]
 pub const COMMENTS: &[(&str, &str)] = &[
-    (
-        "time_idx",
-        "time/div: index into 20ns 50ns 100ns ... 1s 2s 5s 10s (0..26, 14 = 1 ms)",
-    ),
-    (
-        "cal_freq",
-        "calibration output frequency in Hz (32 .. 100000, fixed steps)",
-    ),
+    ("time_idx", "time/div: index into 20ns 50ns 100ns ... 1s 2s 5s 10s (0..26, 14 = 1 ms)"),
+    ("time_fine", "fine time/div (Alt-← →): factor on the time_idx step, 1 = the step"),
+    ("cal_freq", "calibration output frequency in Hz (32 .. 100000, fixed steps)"),
     ("selected", "selected trace: 0 = CH1, 1 = CH2, 2 = MATH"),
     ("channels.enabled", "channel on / off"),
-    (
-        "channels.volt_idx",
-        "volts/div: index into 20mV 50mV 100mV 200mV 500mV 1V 2V 5V 10V (x probe)",
-    ),
-    (
-        "channels.offset",
-        "height of the 0 V line, in divisions (-4 .. 4)",
-    ),
-    (
-        "channels.coupling",
-        "\"Dc\" or \"Ac\" (AC is done in software)",
-    ),
+    ("channels.volt_idx", "volts/div: index into 20mV 50mV 100mV 200mV 500mV 1V 2V 5V 10V (x probe)"),
+    ("channels.offset", "height of the 0 V line, in divisions (-4 .. 4)"),
+    ("channels.coupling", "\"Dc\" or \"Ac\" (AC is done in software)"),
     ("channels.probe", "probe factor: 1 or 10"),
     ("channels.invert", "turn the trace upside down"),
+    ("channels.volts_fine", "fine volts/div (Alt-↑ ↓): factor on the volt_idx step, 1 = the step"),
     ("math.enabled", "math trace on / off"),
     ("math.mode", "Add Sub SubRev Mul Div Avg NegCh1 NegCh2"),
     ("math.volt_idx", "units/div: index like channels.volt_idx"),
     ("math.offset", "height of the math 0 line, in divisions"),
+    ("math.units_fine", "fine units/div: factor on the volt_idx step, 1 = the step"),
     ("trigger.mode", "\"Auto\", \"Normal\" or \"Single\""),
     ("trigger.source", "0 = CH1, 1 = CH2"),
     ("trigger.slope", "\"Rising\", \"Falling\" or \"Both\""),
     ("trigger.level", "trigger level in volts at the probe tip"),
-    (
-        "trigger.position",
-        "trigger point on the screen: 0 = left edge, 1 = right edge",
-    ),
-    (
-        "cursors.hidden",
-        "all cursors hidden (key v); each keeps its own enabled",
-    ),
+    ("trigger.position", "trigger point on the screen: 0 = left edge, 1 = right edge"),
+    ("cursors.hidden", "all cursors hidden (key v); each keeps its own enabled"),
     ("cursors.time_a.enabled", "time cursor A on / off"),
-    (
-        "cursors.time_a.position",
-        "divisions from the screen center (-5 .. 5)",
-    ),
-    (
-        "cursors.time_a.style",
-        "\"Classic\", \"Fine\" (fine dashes), \"Solid\" or \"Dotted\"",
-    ),
-    (
-        "cursors.time_a.color",
-        "Grey White Yellow Cyan Magenta Green Red Blue",
-    ),
+    ("cursors.time_a.position", "divisions from the screen center (-5 .. 5)"),
+    ("cursors.time_a.style", "\"Classic\", \"Fine\" (fine dashes), \"Solid\" or \"Dotted\""),
+    ("cursors.time_a.color", "Grey White Yellow Cyan Magenta Green Red Blue"),
     ("cursors.time_b.enabled", "time cursor B on / off"),
-    (
-        "cursors.time_b.position",
-        "divisions from the screen center (-5 .. 5)",
-    ),
-    (
-        "cursors.time_b.style",
-        "\"Classic\", \"Fine\", \"Solid\" or \"Dotted\"",
-    ),
-    (
-        "cursors.time_b.color",
-        "Grey White Yellow Cyan Magenta Green Red Blue",
-    ),
+    ("cursors.time_b.position", "divisions from the screen center (-5 .. 5)"),
+    ("cursors.time_b.style", "\"Classic\", \"Fine\", \"Solid\" or \"Dotted\""),
+    ("cursors.time_b.color", "Grey White Yellow Cyan Magenta Green Red Blue"),
     ("cursors.volt_a.enabled", "voltage cursor A on / off"),
-    (
-        "cursors.volt_a.position",
-        "divisions from the screen center (-4 .. 4)",
-    ),
-    (
-        "cursors.volt_a.style",
-        "\"Classic\", \"Fine\", \"Solid\" or \"Dotted\"",
-    ),
-    (
-        "cursors.volt_a.color",
-        "Grey White Yellow Cyan Magenta Green Red Blue",
-    ),
+    ("cursors.volt_a.position", "divisions from the screen center (-4 .. 4)"),
+    ("cursors.volt_a.style", "\"Classic\", \"Fine\", \"Solid\" or \"Dotted\""),
+    ("cursors.volt_a.color", "Grey White Yellow Cyan Magenta Green Red Blue"),
     ("cursors.volt_b.enabled", "voltage cursor B on / off"),
-    (
-        "cursors.volt_b.position",
-        "divisions from the screen center (-4 .. 4)",
-    ),
-    (
-        "cursors.volt_b.style",
-        "\"Classic\", \"Fine\", \"Solid\" or \"Dotted\"",
-    ),
-    (
-        "cursors.volt_b.color",
-        "Grey White Yellow Cyan Magenta Green Red Blue",
-    ),
+    ("cursors.volt_b.position", "divisions from the screen center (-4 .. 4)"),
+    ("cursors.volt_b.style", "\"Classic\", \"Fine\", \"Solid\" or \"Dotted\""),
+    ("cursors.volt_b.color", "Grey White Yellow Cyan Magenta Green Red Blue"),
     ("display.spectrum", "spectrum (FFT) below the time view"),
-    (
-        "display.spectrum_zoom",
-        "spectrum span = Nyquist / 2^zoom (0 .. 8)",
-    ),
-    (
-        "display.window",
-        "FFT window: Rectangular Hann Hamming Blackman FlatTop",
-    ),
+    ("display.spectrum_zoom", "spectrum span = Nyquist / 2^zoom (0 .. 8)"),
+    ("display.window", "FFT window: Rectangular Hann Hamming Blackman FlatTop"),
     ("display.xy", "XY mode: CH1 on x, CH2 on y"),
     ("display.interpolation", "\"Sinc\" (sin(x)/x) or \"Linear\""),
-    (
-        "display.averaging",
-        "captures to average: 1 (off) 2 4 8 16 32 64",
-    ),
-    (
-        "display.persistence",
-        "old traces kept on screen: 0 (off) 2 4 8 16",
-    ),
+    ("display.averaging", "captures to average: 1 (off) 2 4 8 16 32 64"),
+    ("display.persistence", "old traces kept on screen: 0 (off) 2 4 8 16"),
     ("display.dots", "draw only the samples"),
     ("display.measurements", "measurement panel on the right"),
     ("display.colors", "Auto TrueColor Ansi256 Ansi16"),
-    (
-        "display.trace_style",
-        "CH1, CH2, MATH: BrailleThin BrailleBold Line Box",
-    ),
+    ("display.trace_style", "CH1, CH2, MATH: BrailleThin BrailleBold Line Box"),
     ("display.grid_style", "Dots Dashed Solid Crosses None"),
-    (
-        "display.grid_extent",
-        "\"Points\" (marks at crossings) or \"Full\" (whole lines)",
-    ),
-    (
-        "display.grid_brightness",
-        "grid brightness in percent: 10 .. 100 in steps of 10",
-    ),
-    (
-        "logger.step",
-        "log step in seconds (2.5e-6 .. 60, 1-2-5 steps)",
-    ),
-    (
-        "logger.log_limit",
-        "stop the log at this file size in bytes, 0 = no limit",
-    ),
-    (
-        "logger.log_dir",
-        "log folder (default ~/.local/share/openhantek-tui/logs)",
-    ),
-    (
-        "logger.time_axis",
-        "log view time labels: \"Clock\" (UTC) or \"Seconds\"",
-    ),
-    (
-        "logger.csv_time",
-        "log CSV time column: \"Iso\" (UTC) or \"Seconds\"",
-    ),
+    ("display.grid_extent", "\"Points\" (marks at crossings) or \"Full\" (whole lines)"),
+    ("display.grid_brightness", "grid brightness in percent: 10 .. 100 in steps of 10"),
+    ("logger.step", "log step in seconds (2.5e-6 .. 60, 1-2-5 steps)"),
+    ("logger.log_limit", "stop the log at this file size in bytes, 0 = no limit"),
+    ("logger.log_dir", "log folder (default ~/.local/share/openhantek-tui/logs)"),
+    ("logger.time_axis", "log view time labels: \"Clock\" (UTC) or \"Seconds\""),
+    ("logger.csv_time", "log CSV time column: \"Iso\" (UTC) or \"Seconds\""),
 ];
 
 /// Comments above the tables.
+#[rustfmt::skip]
 const TABLE_COMMENTS: &[(&str, &str)] = &[
-    (
-        "channels",
-        "One [[channels]] table per channel: CH1, then CH2.",
-    ),
+    ("channels", "One [[channels]] table per channel: CH1, then CH2."),
     ("math", "The math trace."),
     ("trigger", "Software trigger."),
-    (
-        "cursors",
-        "Four cursors: time A and B, voltage A and B (volts of the selected trace).",
-    ),
+    ("cursors", "Four cursors: time A and B, voltage A and B (volts of the selected trace)."),
     ("display", "How the screen looks."),
     ("logger", "Envelope logger (chart recorder)."),
 ];

@@ -214,9 +214,9 @@ impl Scope {
             || s.display.xy
             || (!roll && s.trigger.source == 1);
         let rate = if roll {
-            roll_rate(s.screen_time())
+            roll_rate(s.coarse_screen_time())
         } else {
-            choose_rate(s.screen_time(), need_ch2)
+            choose_rate(s.coarse_screen_time(), need_ch2)
         };
         let channels = if need_ch2 || rate.slow() { 2 } else { 1 };
         let gains = [0, 1].map(|c| gain_index(VOLT_DIVS[s.channels[c].volt_idx]));
@@ -507,7 +507,9 @@ impl Scope {
         let s = &mut self.settings;
         for ch in &mut s.channels {
             ch.volt_idx = VOLT_DIVS.len() - 2; // 5 V/div: the biggest range
+            ch.volts_fine = 1.0;
         }
+        s.time_fine = 1.0;
         s.time_idx = time_index(1e-3);
         s.trigger.mode = TriggerMode::Auto;
         self.running = true;

@@ -672,7 +672,10 @@ impl Field {
             Xy => s.display.xy = on,
             SpecOn => s.display.spectrum = on,
             MeasPanel => s.display.measurements = on,
-            ChVolts(c) => s.channels[c].volt_idx = i.min(VOLT_DIVS.len() - 1),
+            ChVolts(c) => {
+                s.channels[c].volt_idx = i.min(VOLT_DIVS.len() - 1);
+                s.channels[c].volts_fine = 1.0;
+            }
             ChCoupling(c) => s.channels[c].coupling = if on { Coupling::Ac } else { Coupling::Dc },
             ChProbe(c) => {
                 let ch = &mut s.channels[c];
@@ -687,14 +690,20 @@ impl Field {
                 let all = crate::dsp::math::MathMode::ALL;
                 s.math.mode = all[i.min(all.len() - 1)]
             }
-            MathScale => s.math.volt_idx = i.min(VOLT_DIVS.len() - 1),
+            MathScale => {
+                s.math.volt_idx = i.min(VOLT_DIVS.len() - 1);
+                s.math.units_fine = 1.0;
+            }
             TrigMode => {
                 s.trigger.mode =
                     [TriggerMode::Auto, TriggerMode::Normal, TriggerMode::Single][i.min(2)]
             }
             TrigSource => s.trigger.source = i.min(1),
             TrigSlope => s.trigger.slope = [Slope::Rising, Slope::Falling, Slope::Both][i.min(2)],
-            TimeDiv => s.time_idx = i.min(TIME_DIVS.len() - 1),
+            TimeDiv => {
+                s.time_idx = i.min(TIME_DIVS.len() - 1);
+                s.time_fine = 1.0;
+            }
             Selected => s.selected = i.min(2),
             Interpolation => {
                 s.display.interpolation = if on {
@@ -738,6 +747,16 @@ impl Field {
             LogAxis => s.logger.time_axis = TimeAxis::ALL[i.min(1)],
             LogCsvTime => s.logger.csv_time = CsvTime::ALL[i.min(1)],
             _ => {}
+        }
+    }
+
+    /// The fine factor of volts/div and time/div (1 for the others).
+    fn fine(self, s: &Settings) -> f64 {
+        match self {
+            Field::ChVolts(c) => s.channels[c].volts_fine,
+            Field::MathScale => s.math.units_fine,
+            Field::TimeDiv => s.time_fine,
+            _ => 1.0,
         }
     }
 
@@ -835,11 +854,17 @@ impl Field {
     /// step of the calibration frequency, the value plus [`Field::step`]
     /// for the others.
     pub fn step_number(self, s: &mut Settings, dir: i64) {
+        self.step_number_by(s, dir, 1.0);
+    }
+
+    /// Like [`Field::step_number`], with the step times `scale` (0.1 for
+    /// Alt-j/k: a fine step). The calibration frequency has fixed steps.
+    pub fn step_number_by(self, s: &mut Settings, dir: i64, scale: f64) {
         if self == Field::CalFreq {
             let i = index_of(&CAL_FREQS, &s.cal_freq) as i64 + dir;
             s.cal_freq = CAL_FREQS[i.clamp(0, CAL_FREQS.len() as i64 - 1) as usize];
         } else {
-            let v = self.number(s) + dir as f64 * self.step(s);
+            let v = self.number(s) + dir as f64 * self.step(s) * scale;
             let _ = self.set_number(s, v, "");
         }
     }
@@ -878,6 +903,18 @@ impl Field {
                 .recent_logs
                 .first()
                 .map_or("none".into(), |_| format!("{} logs", d.recent_logs.len())),
+            // A fine value (Alt-↑ ↓ ← →) between the steps of the list.
+            Kind::Choice
+                if matches!(self, ChVolts(_) | MathScale | TimeDiv) && self.fine(s) < 1.0 =>
+            {
+                match self {
+                    ChVolts(c) => format!("{}/div", fmt_si(s.channels[c].volts_per_div(), "V")),
+                    MathScale => {
+                        format!("{}/div", fmt_si(s.math.units_per_div(), s.math.mode.unit()))
+                    }
+                    _ => format!("{}/div", fmt_si(s.time_per_div(), "s")),
+                }
+            }
             Kind::Choice | Kind::Bool => self
                 .options(s, d)
                 .get(self.index(s))
@@ -1173,7 +1210,7 @@ impl Panel {
         }
         let act = keys.action(&[View::Panel], &key);
         if self.on_number() {
-            if let Some(out) = self.number_key(key, act, s) {
+            if let Some(out) = self.number_key(key, act, s, keys) {
                 self.pending_g = false;
                 return out;
             }
@@ -1421,7 +1458,13 @@ impl Panel {
 
     /// A key in the value column of a number setting, when not typing.
     /// `None`: the key does what it does in any column.
-    fn number_key(&mut self, key: KeyEvent, act: Option<Act>, s: &mut Settings) -> Option<Outcome> {
+    fn number_key(
+        &mut self,
+        key: KeyEvent,
+        act: Option<Act>,
+        s: &mut Settings,
+        keys: &KeyMap,
+    ) -> Option<Outcome> {
         let f = self.current()?;
         let step = |s: &mut Settings, dir: i64| {
             let before = s.clone();
@@ -1435,6 +1478,26 @@ impl Panel {
         let plain = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        // Alt with a step key: a tenth of the step.
+        if key.modifiers == KeyModifiers::ALT
+            || key.modifiers == KeyModifiers::ALT | KeyModifiers::SHIFT
+        {
+            let bare = KeyEvent::new(key.code, key.modifiers - KeyModifiers::ALT);
+            let dir = match keys.action(&[View::Panel], &bare) {
+                Some(Act::PanelUp | Act::PanelNext) => 1,
+                Some(Act::PanelDown | Act::PanelPrevious) => -1,
+                _ => 0,
+            };
+            if dir != 0 {
+                let before = s.clone();
+                f.step_number_by(s, dir, 0.1);
+                return Some(if *s == before {
+                    Outcome::None
+                } else {
+                    Outcome::Changed
+                });
+            }
+        }
         Some(match (act, key.code) {
             // Digits, a point or a minus start a new value (before any
             // binding: `-` types a minus here).

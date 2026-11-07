@@ -1388,3 +1388,101 @@ fn fine_cursor_keys_move_a_hundredth_of_a_division() {
     ));
     assert!((r.app.scope.settings.cursors.volt_b.position - 1.02).abs() < 1e-9);
 }
+
+fn alt(r: &mut Rig, code: KeyCode) {
+    r.app.handle_key(KeyEvent::new(code, KeyModifiers::ALT));
+}
+
+#[test]
+fn fine_volts_div_keeps_the_gain_of_the_bigger_step() {
+    let mut r = rig();
+    let gain_1v = r.app.scope.hw.unwrap().gains[0];
+    // Alt-↓ from 1 V/div: 1.1 V/div, on the 2 V step.
+    alt(&mut r, KeyCode::Down);
+    let ch = &r.app.scope.settings.channels[0];
+    assert!((ch.volts_per_div() - 1.1).abs() < 1e-12);
+    assert_eq!(VOLT_DIVS[ch.volt_idx], 2.0);
+    r.feed();
+    let hw = r.app.scope.hw.unwrap();
+    assert_eq!(
+        hw.gains[0],
+        openhantek_tui::device::protocol::gain_index(2.0)
+    );
+    assert_ne!(hw.gains[0], gain_1v);
+    let t = r.text(160, 40);
+    assert!(t.contains("CH1 1.1 V/div"), "{t}");
+    // The plot labels use the exact value: 2 divisions above 0 V is 2.2 V.
+    assert!(t.contains("2.2V"), "{t}");
+    // Measurements are in volts, not divisions: the same sine.
+    let vpp = r.app.scope.measure(0).unwrap().pk_pk;
+    assert!((vpp - 3.0).abs() < 0.1, "{vpp}");
+    for _ in 0..3 {
+        alt(&mut r, KeyCode::Down);
+    }
+    assert!((r.app.scope.settings.channels[0].volts_per_div() - 1.4).abs() < 1e-12);
+    alt(&mut r, KeyCode::Up);
+    assert!((r.app.scope.settings.channels[0].volts_per_div() - 1.3).abs() < 1e-12);
+    // A normal ↑ snaps to the step below, ↓ to the step above.
+    r.key(KeyCode::Up);
+    assert_eq!(r.app.scope.settings.channels[0].volts_per_div(), 1.0);
+    alt(&mut r, KeyCode::Down);
+    r.key(KeyCode::Down);
+    assert_eq!(r.app.scope.settings.channels[0].volts_per_div(), 2.0);
+    assert_eq!(r.app.scope.settings.channels[0].volts_fine, 1.0);
+}
+
+#[test]
+fn fine_time_div_keeps_the_rate_of_the_bigger_step() {
+    let mut r = rig();
+    // 1 ms/div; Alt-→ gives 1.1 ms/div on the 2 ms step.
+    alt(&mut r, KeyCode::Right);
+    let s = &r.app.scope.settings;
+    assert!((s.time_per_div() - 1.1e-3).abs() < 1e-15);
+    assert_eq!(s.coarse_time_per_div(), 2e-3);
+    r.feed();
+    let mut want = openhantek_tui::scope::Scope::new(Settings::default());
+    want.settings.time_idx = time_index(2e-3);
+    assert_eq!(r.app.scope.hw.unwrap().rate, want.hw_config().rate);
+    let t = r.text(160, 40);
+    assert!(t.contains("1.1 ms/div"), "{t}");
+    // The screen shows 11 ms: the labels end at 5.5 ms.
+    assert!(t.contains("5.5ms"), "{t}");
+    // Frequency is still right.
+    let f = r.app.scope.measure(0).unwrap().freq.unwrap();
+    assert!((f - 1000.0).abs() < 5.0, "{f}");
+    alt(&mut r, KeyCode::Left);
+    assert_eq!(r.app.scope.settings.time_per_div(), 1e-3);
+    alt(&mut r, KeyCode::Left);
+    assert!((r.app.scope.settings.time_per_div() - 0.95e-3).abs() < 1e-15);
+    // Normal ←/→ snap back to the list.
+    r.key(KeyCode::Right);
+    assert_eq!(r.app.scope.settings.time_per_div(), 1e-3);
+    assert_eq!(r.app.scope.settings.time_fine, 1.0);
+}
+
+#[test]
+fn alt_gives_a_tenth_of_the_position_and_trigger_steps() {
+    let mut r = rig();
+    alt(&mut r, KeyCode::Char(']'));
+    assert!((r.app.scope.settings.channels[0].offset - 2.05).abs() < 1e-9);
+    alt(&mut r, KeyCode::Char('{'));
+    assert!((r.app.scope.settings.channels[0].offset - 2.04).abs() < 1e-9);
+    alt(&mut r, KeyCode::Char('+'));
+    assert!((r.app.scope.settings.trigger.level - 0.01).abs() < 1e-9);
+    alt(&mut r, KeyCode::Char('.'));
+    assert!((r.app.scope.settings.trigger.position - 0.505).abs() < 1e-9);
+    // In the value box of a number, Alt-k steps a tenth.
+    r.char('s');
+    while r.app.panel.groups()[r.app.panel.cat].name != "Trigger" {
+        r.char('j');
+    }
+    r.char('l');
+    while r.app.panel.current() != Some(openhantek_tui::panel::Field::TrigLevel) {
+        r.char('j');
+    }
+    r.char('l');
+    alt(&mut r, KeyCode::Char('k'));
+    assert!((r.app.scope.settings.trigger.level - 0.02).abs() < 1e-9);
+    r.char('k');
+    assert!((r.app.scope.settings.trigger.level - 0.12).abs() < 1e-9);
+}
