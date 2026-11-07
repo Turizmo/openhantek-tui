@@ -307,29 +307,43 @@ fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style, max_x: u16) {
     }
 }
 
-/// Labels left of the plot, one per division line, right-aligned.
-fn left_labels(buf: &mut Buffer, g: &Geometry, label: impl Fn(usize) -> String, style: Style) {
-    if g.margins.left < LABEL_W + MARKER_W {
+/// The labels left of the plot, one per division line from the top.
+fn labels(label: impl Fn(usize) -> String) -> Vec<String> {
+    (0..=plot::V_DIVS).map(label).collect()
+}
+
+/// Columns the longest label needs, at most [`LABEL_W`].
+fn label_width(labels: &[String]) -> u16 {
+    let w = labels.iter().map(|t| t.chars().count()).max().unwrap_or(0);
+    (w as u16).min(LABEL_W)
+}
+
+/// Labels left of the plot, one per division line, right-aligned in the
+/// label part of the left margin.
+fn left_labels(buf: &mut Buffer, g: &Geometry, labels: &[String], style: Style) {
+    let w = g.margins.label_w();
+    if w == 0 {
         return;
     }
     let x = g.plot.x - g.margins.left;
-    for j in 0..=plot::V_DIVS {
+    for (j, text) in labels.iter().enumerate() {
         let y = g.plot.y + (j * g.ry) as u16;
-        let text = label(j);
-        let text: String = text.chars().take(LABEL_W as usize).collect();
-        let pad = LABEL_W as usize - text.chars().count();
-        put(buf, x + pad as u16, y, &text, style, x + LABEL_W);
+        let text: String = text.chars().take(w as usize).collect();
+        let pad = w as usize - text.chars().count();
+        put(buf, x + pad as u16, y, &text, style, x + w);
     }
 }
 
 /// Labels below the plot, one per division (fewer when they do not fit).
+/// The end labels may stick out into the spare cells next to the margins;
+/// a label that would touch the one before it is left out.
 fn bottom_labels(buf: &mut Buffer, g: &Geometry, label: impl Fn(usize) -> String, style: Style) {
     if g.margins.bottom == 0 {
         return;
     }
     let y = g.plot.y + g.plot.height;
-    let min_x = g.plot.x - g.margins.left;
-    let max_x = g.plot.x + g.plot.width + g.margins.right;
+    let min_x = g.area.x;
+    let max_x = g.area.x + g.area.width;
     let texts: Vec<String> = (0..=plot::H_DIVS).map(&label).collect();
     let widest = texts.iter().map(|t| t.chars().count()).max().unwrap_or(1);
     // Every division, every 2nd or every 5th, so labels do not touch.
@@ -337,6 +351,7 @@ fn bottom_labels(buf: &mut Buffer, g: &Geometry, label: impl Fn(usize) -> String
         .into_iter()
         .find(|e| e * g.cx > widest)
         .unwrap_or(10);
+    let mut free_x = min_x;
     for (k, text) in texts.iter().enumerate() {
         if k % every != 0 {
             continue;
@@ -346,7 +361,11 @@ fn bottom_labels(buf: &mut Buffer, g: &Geometry, label: impl Fn(usize) -> String
         let x = center
             .saturating_sub(w / 2)
             .clamp(min_x, max_x.saturating_sub(w));
+        if x < free_x {
+            continue;
+        }
         put(buf, x, y, text, style, max_x);
+        free_x = x + w + 1;
     }
 }
 
@@ -356,7 +375,12 @@ fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let block = Block::bordered().title(title(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let Some(g) = Geometry::fit(inner) else {
+    let volts = time_labels(s);
+    // One cell on the right for the trigger mark; two when the fine
+    // voltage cursors put their names there.
+    let fine_v = s.display.cursor_style == CursorStyle::Fine && s.cursors.mode == CursorMode::Volt;
+    let right = if fine_v { 2 } else { 1 };
+    let Some(g) = Geometry::fit(inner, label_width(&volts), right) else {
         return;
     };
     let mut plot = Plot::new(g.cx, g.ry);
@@ -389,7 +413,7 @@ fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     }
     let buf = f.buffer_mut();
     plot.render(buf, g.plot);
-    time_margins(buf, app, &g, &plot, pal);
+    time_margins(buf, app, &g, &plot, &volts, pal);
     if sc.frame.is_none() {
         let text = app
             .status
@@ -407,20 +431,28 @@ fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     }
 }
 
+/// The value labels of the time view, for the selected trace.
+fn time_labels(s: &Settings) -> Vec<String> {
+    let sel = s.selected;
+    let (scale, offset) = trace_scale(s, sel);
+    let unit = trace_unit(s, sel);
+    labels(|j| compact((V_DIVS / 2.0 - j as f64 - offset) * scale, scale / 100.0, unit))
+}
+
 /// Labels, ground markers, trigger marks and cursor names around the plot.
-fn time_margins(buf: &mut Buffer, app: &App, g: &Geometry, plot: &Plot, pal: &Palette) {
+fn time_margins(
+    buf: &mut Buffer,
+    app: &App,
+    g: &Geometry,
+    plot: &Plot,
+    volts: &[String],
+    pal: &Palette,
+) {
     let sc = &app.scope;
     let s = &sc.settings;
     let half_v = V_DIVS / 2.0;
     let sel = s.selected;
-    let (scale, offset) = trace_scale(s, sel);
-    let unit = trace_unit(s, sel);
-    left_labels(
-        buf,
-        g,
-        |j| compact((half_v - j as f64 - offset) * scale, scale / 100.0, unit),
-        Style::default().fg(pal.trace[sel]),
-    );
+    left_labels(buf, g, volts, Style::default().fg(pal.trace[sel]));
     let roll = sc.frame.as_ref().is_some_and(|f| f.roll) || s.roll();
     let x_ref = match &sc.frame {
         Some(f) => f.x_ref(s),
@@ -573,7 +605,8 @@ fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         fmt_si(span, "Hz")
     );
     let block_inner = Block::bordered().inner(area);
-    let geo = Geometry::fit(block_inner);
+    let db = labels(|j| format!("{:.0}dB", SPECTRUM_TOP_DBV - j as f64 * SPECTRUM_DB_PER_DIV));
+    let geo = Geometry::fit(block_inner, label_width(&db), 0);
     let mut plot = geo.map(|g| Plot::new(g.cx, g.ry));
     if let Some(p) = plot.as_mut() {
         grid(p, &app.scope.settings, pal);
@@ -621,12 +654,7 @@ fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     };
     let buf = f.buffer_mut();
     p.render(buf, g.plot);
-    left_labels(
-        buf,
-        &g,
-        |j| format!("{:.0}dB", SPECTRUM_TOP_DBV - j as f64 * SPECTRUM_DB_PER_DIV),
-        Style::default().fg(pal.label),
-    );
+    left_labels(buf, &g, &db, Style::default().fg(pal.label));
     bottom_labels(
         buf,
         &g,
@@ -670,7 +698,10 @@ fn draw_xy(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let block = Block::bordered().title(t);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let Some(g) = Geometry::fit(inner) else {
+    let (sx, ox) = trace_scale(s, 0);
+    let (sy, oy) = trace_scale(s, 1);
+    let volts = labels(|j| compact((V_DIVS / 2.0 - j as f64 - oy) * sy, sy / 100.0, "V"));
+    let Some(g) = Geometry::fit(inner, label_width(&volts), 0) else {
         return;
     };
     let mut plot = Plot::new(g.cx, g.ry);
@@ -682,14 +713,7 @@ fn draw_xy(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     }
     let buf = f.buffer_mut();
     plot.render(buf, g.plot);
-    let (sx, ox) = trace_scale(s, 0);
-    let (sy, oy) = trace_scale(s, 1);
-    left_labels(
-        buf,
-        &g,
-        |j| compact((V_DIVS / 2.0 - j as f64 - oy) * sy, sy / 100.0, "V"),
-        Style::default().fg(pal.trace[1]),
-    );
+    left_labels(buf, &g, &volts, Style::default().fg(pal.trace[1]));
     bottom_labels(
         buf,
         &g,
@@ -1276,7 +1300,7 @@ mod tests {
         for h in [30u16, 37, 50, 60] {
             let t = split_height(h);
             assert!(t <= h * 55 / 100, "{h}: {t}");
-            let g = Geometry::fit(Rect::new(0, 0, 100, t - 2)).unwrap();
+            let g = Geometry::fit(Rect::new(0, 0, 100, t - 2), 3, 1).unwrap();
             // No spare rows inside the time view.
             assert_eq!(g.plot.height + 2, t - 2, "{h}");
         }

@@ -150,6 +150,10 @@ the right is the trigger level, `▾` at the top the trigger position.
 `CLIP CH1` in the title means the signal is bigger than the input range.
 The labels on the left are the volts of the selected trace at each
 division line; the labels below are the time from the trigger point.
+The margins are kept small, so the plot gets the room: the left labels
+are only as wide as the longest one, the `1▸` markers sit right next to
+them, and the right side has one column for `◂` (two with the fine
+voltage cursors, whose names go there).
 
 ## Settings panel
 

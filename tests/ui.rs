@@ -421,6 +421,51 @@ fn grid_settings_in_the_panel_change_the_grid() {
 }
 
 #[test]
+fn margins_are_small_and_nothing_is_cut() {
+    // Plot widths before the margins got smaller.
+    for (w, h, old) in [(120u16, 40u16, 71usize), (80, 24, 41)] {
+        let mut r = rig();
+        r.char('1');
+        r.char('2');
+        let cols = cross_columns(&r.screen(w, h));
+        let width = cols[10] - cols[0] + 1;
+        assert!(width > old, "{w}x{h}: plot {width} wide, was {old}");
+        r.char('1');
+        r.char('2');
+        let lines = r.screen(w, h);
+        let text = lines.join("\n");
+        // Labels as wide as the longest one, the ground marker right
+        // after it, and the plot right after the marker.
+        let ground = lines.iter().find(|l| l.contains("1▸")).unwrap();
+        assert!(ground.starts_with("│ 0V1▸"), "{w}x{h}:\n{text}");
+        assert!(text.contains("│-6V  "), "{w}x{h}:\n{text}");
+        assert!(lines.iter().any(|l| l.contains("│-4V2▸")), "{w}x{h}");
+        // The trigger mark is in the one column right of the plot.
+        let trig = lines.iter().find(|l| l.contains('◂')).unwrap();
+        // (At most one spare cell after it, from centering the plot.)
+        assert!(trig.contains("◂│") || trig.contains("◂ │"), "{w}x{h}: {trig}");
+        // The time labels are whole and do not touch.
+        let time = lines.iter().find(|l| l.contains("-5ms")).unwrap();
+        assert!(time.contains("5ms│") || time.contains("5ms "), "{time}");
+        assert!(!time.contains("ms-") && !time.contains("s0s"), "{time}");
+    }
+    // Long labels make the margin wider, and still fit.
+    let mut r = rig();
+    r.app.scope.settings.channels[0].volt_idx = 0; // 20 mV/div
+    r.app.scope.settings.channels[0].offset = 0.5;
+    let text = r.text(120, 40);
+    assert!(text.contains("-90mV"), "{text}");
+    // Fine voltage cursors put their names in a second right column.
+    r.app.scope.settings.display.cursor_style = CursorStyle::Fine;
+    r.app.scope.settings.cursors.mode = CursorMode::Volt;
+    let lines = r.screen(120, 40);
+    for name in [" A ", " B "] {
+        let row = lines.iter().find(|l| l.starts_with('│') && l.contains(name));
+        assert!(row.is_some(), "{name}\n{}", lines.join("\n"));
+    }
+}
+
+#[test]
 fn persistence_fades_old_frames_by_age() {
     use openhantek_tui::theme::{ColorMode, Palette};
     use ratatui::style::Color;
@@ -830,7 +875,7 @@ fn box_style_draws_connected_box_lines() {
     for c in ['╭', '╮', '╰', '╯'] {
         assert!(count(c) >= 20, "{c}: {}\n{text}", count(c));
     }
-    assert!(text.contains("╭──╮") && text.contains("╰───╯"), "{text}");
+    assert!(text.contains("╭───╮") && text.contains("╰───╯"), "{text}");
     assert!(text.contains("╰─╯"), "{text}");
     // Mixed with a braille style, each trace keeps its own look.
     let mut r = styled_rig(TraceStyle::Box);

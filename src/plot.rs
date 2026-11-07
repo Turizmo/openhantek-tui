@@ -1010,38 +1010,54 @@ pub struct Margins {
     pub bottom: u16,
 }
 
-/// Width of the value labels on the left.
+/// Widest value label on the left: longer labels are cut.
 pub const LABEL_W: u16 = 7;
 /// Width of the `1▸` markers between the labels and the plot.
 pub const MARKER_W: u16 = 2;
 
 impl Margins {
-    /// Labels, markers, trigger marks and time labels.
-    pub const FULL: Margins = Margins {
-        left: LABEL_W + MARKER_W,
-        right: 2,
-        top: 1,
-        bottom: 1,
-    };
-    /// Markers only, no labels above or below.
-    pub const SIDES: Margins = Margins {
-        left: LABEL_W + MARKER_W,
-        right: 2,
-        top: 0,
-        bottom: 0,
-    };
-    pub const MARKERS: Margins = Margins {
-        left: MARKER_W,
-        right: 1,
-        top: 0,
-        bottom: 0,
-    };
+    /// Labels `label_w` wide and the markers on the left, `right` cells on
+    /// the right (the trigger mark), and a row above (trigger and cursor
+    /// marks) and below (time labels).
+    pub fn full(label_w: u16, right: u16) -> Margins {
+        Margins {
+            left: label_w.min(LABEL_W) + MARKER_W,
+            right,
+            top: 1,
+            bottom: 1,
+        }
+    }
+
+    /// Labels and markers on the sides, no rows above or below.
+    pub fn sides(label_w: u16, right: u16) -> Margins {
+        Margins {
+            top: 0,
+            bottom: 0,
+            ..Margins::full(label_w, right)
+        }
+    }
+
+    /// Markers only.
+    pub fn markers(right: u16) -> Margins {
+        Margins {
+            left: MARKER_W,
+            right,
+            top: 0,
+            bottom: 0,
+        }
+    }
+
     pub const NONE: Margins = Margins {
         left: 0,
         right: 0,
         top: 0,
         bottom: 0,
     };
+
+    /// Width of the value labels: the left margin without the markers.
+    pub fn label_w(&self) -> u16 {
+        self.left.saturating_sub(MARKER_W)
+    }
 }
 
 /// Where the plot and its margins go on the screen.
@@ -1052,16 +1068,20 @@ pub struct Geometry {
     /// The plot cells.
     pub plot: Rect,
     pub margins: Margins,
+    /// The whole area the plot is centered in. Labels may use its spare
+    /// cells next to the margins.
+    pub area: Rect,
 }
 
 impl Geometry {
     /// The biggest plot with whole cells per division that fits in `area`,
-    /// centered. Tries smaller margins when the area is small.
-    pub fn fit(area: Rect) -> Option<Geometry> {
+    /// centered, with value labels `label_w` wide on the left and `right`
+    /// cells on the right. Tries smaller margins when the area is small.
+    pub fn fit(area: Rect, label_w: u16, right: u16) -> Option<Geometry> {
         for m in [
-            Margins::FULL,
-            Margins::SIDES,
-            Margins::MARKERS,
+            Margins::full(label_w, right),
+            Margins::sides(label_w, right),
+            Margins::markers(right.min(1)),
             Margins::NONE,
         ] {
             let w = area.width.saturating_sub(m.left + m.right) as usize;
@@ -1082,6 +1102,7 @@ impl Geometry {
                 ry,
                 plot: Rect::new(x, y, pw, ph),
                 margins: m,
+                area,
             });
         }
         None
@@ -1089,7 +1110,8 @@ impl Geometry {
 
     /// Rows of the plot when it is `ry` cells per division, with margins.
     pub fn height_for(ry: usize) -> u16 {
-        (V_DIVS * ry + 1) as u16 + Margins::FULL.top + Margins::FULL.bottom
+        let m = Margins::full(0, 0);
+        (V_DIVS * ry + 1) as u16 + m.top + m.bottom
     }
 }
 
@@ -1904,8 +1926,8 @@ mod tests {
 
     #[test]
     fn fit_uses_whole_cells_and_centers() {
-        let g = Geometry::fit(Rect::new(0, 0, 107, 35)).unwrap();
-        assert_eq!(g.margins, Margins::FULL);
+        let g = Geometry::fit(Rect::new(0, 0, 107, 35), 7, 2).unwrap();
+        assert_eq!(g.margins, Margins::full(7, 2));
         assert_eq!(g.cx, 9);
         assert_eq!(g.ry, 4);
         assert_eq!(g.plot.width, 91);
@@ -1915,10 +1937,18 @@ mod tests {
         let right = 107 - (g.plot.x + g.plot.width + g.margins.right);
         assert!(left.abs_diff(right) <= 1, "{left} {right}");
         // Small areas drop the margins, then give up.
-        let g = Geometry::fit(Rect::new(0, 0, 30, 9)).unwrap();
+        let g = Geometry::fit(Rect::new(0, 0, 30, 9), 7, 2).unwrap();
         assert_eq!(g.ry, 1);
         assert!(g.margins.top == 0);
-        assert!(Geometry::fit(Rect::new(0, 0, 8, 5)).is_none());
+        assert!(Geometry::fit(Rect::new(0, 0, 8, 5), 7, 2).is_none());
+        // Short labels and one cell on the right leave room for a wider
+        // plot: 3 + 2 + 1 cells of margin, 101 for the plot.
+        let g = Geometry::fit(Rect::new(0, 0, 107, 35), 3, 1).unwrap();
+        assert_eq!(g.margins.left, 5);
+        assert_eq!(g.margins.label_w(), 3);
+        assert_eq!(g.cx, 10);
+        assert_eq!(g.plot.width, 101);
+        assert_eq!(g.plot.x, 5);
     }
 
     #[test]
