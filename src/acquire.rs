@@ -6,13 +6,17 @@ use std::sync::mpsc::{
     self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
 };
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 
-use crate::device::protocol::HwConfig;
+use crate::device::hantek::{Captured, Scope6022};
+use crate::device::protocol::{HwConfig, Rate};
 use crate::device::transport::{is_gone, is_timeout};
 use crate::device::Connection;
+use crate::logger::binner::Binner;
+use crate::logger::format::{ChannelInfo, Header};
+use crate::logger::writer::{self, LogState, Msg, Shared, Writer};
 
 pub enum Command {
     /// Use these hardware settings from now on.
@@ -22,7 +26,172 @@ pub enum Command {
     },
     /// Capture (true) or stop (false).
     Run(bool),
+    /// Start the envelope logger. While it runs, the scope streams with
+    /// the logger's settings, `Configure` waits until the log stops, and
+    /// no blocks go to the UI.
+    StartLog(LogRequest),
+    StopLog,
     Quit,
+}
+
+/// What to log.
+#[derive(Clone, Debug)]
+pub struct LogRequest {
+    /// The writer reports here, and its `path` is the file to write.
+    pub shared: Shared,
+    pub step_ns: u64,
+    /// Channels to log.
+    pub channels: [bool; 2],
+    pub probe: [u32; 2],
+    pub invert: [bool; 2],
+    /// Volts/div at the probe tip (sets the gain, like in the scope view).
+    pub volts_per_div: [f64; 2],
+    pub gains: [usize; 2],
+    pub dc: [bool; 2],
+    pub cal_freq: u32,
+}
+
+impl LogRequest {
+    /// Hardware settings: both channels, no oversampling, streaming.
+    pub fn hw_config(&self) -> (HwConfig, u32) {
+        let (rate, n) = crate::logger::adc_for_step(self.step_ns);
+        (
+            HwConfig {
+                rate,
+                channels: 2,
+                gains: self.gains,
+                dc: self.dc,
+                cal_freq: self.cal_freq,
+                roll: true,
+            },
+            n,
+        )
+    }
+}
+
+/// Lost samples are flagged when the data is this far behind the clock
+/// (or two reads, if that is more).
+pub const GAP_THRESHOLD: Duration = Duration::from_millis(300);
+
+/// A running log, in the acquisition thread.
+struct LogSession {
+    req: LogRequest,
+    cfg: HwConfig,
+    binner: Binner,
+    writer: Writer,
+    /// When the first piece came, and the samples since then (lost ones
+    /// included).
+    clock: Option<(Instant, u64)>,
+    /// The stream started again (after an error): flag a gap.
+    restart: bool,
+    clip_at: Option<Instant>,
+}
+
+impl LogSession {
+    fn new(req: LogRequest) -> Self {
+        let (cfg, n) = req.hw_config();
+        let logged = (0..2).filter(|&c| req.channels[c]).collect();
+        let k = [0, 1].map(|c| req.probe[c] as f64 * if req.invert[c] { -1.0 } else { 1.0 });
+        let writer = Writer::spawn(req.shared.clone());
+        Self {
+            req,
+            cfg,
+            binner: Binner::new(n, logged, k),
+            writer,
+            clock: None,
+            restart: false,
+            clip_at: None,
+        }
+    }
+
+    fn header(&self, conn: &Connection, start_ns: i64) -> Header {
+        let r = &self.req;
+        let cal = &conn.driver.cal;
+        let ch = [0, 1].map(|c| {
+            let g = r.gains[c];
+            let zero = cal.raw(0.0, g, c, false);
+            ChannelInfo {
+                enabled: r.channels[c],
+                gain: g as u8,
+                probe: r.probe[c].min(255) as u8,
+                invert: r.invert[c],
+                dc: r.dc[c],
+                volts_per_div: r.volts_per_div[c] as f32,
+                zero_count: zero as f32,
+                volts_per_count: (cal.volts(zero + 1.0, g, c, false) - cal.volts(zero, g, c, false))
+                    as f32,
+            }
+        });
+        let (cfg, n) = r.hw_config();
+        Header {
+            start_ns,
+            step_ns: r.step_ns,
+            adc_rate: cfg.rate.raw,
+            samples_per_step: n,
+            channels: ch,
+            device: conn.name.clone(),
+        }
+    }
+
+    /// True when the writer stopped by itself (size limit, error).
+    fn writer_done(&self) -> bool {
+        matches!(self.req.shared.lock().unwrap().state, LogState::Done(_))
+    }
+
+    /// Take one piece of the stream.
+    fn piece(&mut self, cap: &Captured, conn: &Connection) {
+        let raw = self.cfg.rate.raw;
+        let n = cap.data[0].len().min(cap.data[1].len()) as u64;
+        let now = Instant::now();
+        match &mut self.clock {
+            None => {
+                let start = writer::start_time(SystemTime::now(), n as usize, raw);
+                self.writer.send(Msg::Begin(self.header(conn, start)));
+                self.clock = Some((now, 0));
+            }
+            Some((t0, got)) => {
+                let piece = Scope6022::<Box<dyn crate::device::transport::Transport>>::roll_piece(
+                    &self.cfg,
+                ) as f64
+                    / (2.0 * raw);
+                let limit = GAP_THRESHOLD.as_secs_f64().max(2.0 * piece) * raw;
+                let expected = now.duration_since(*t0).as_secs_f64() * raw;
+                let behind = expected - (*got + n) as f64;
+                if self.restart || behind > limit {
+                    let lost = behind.max(0.0) as u64;
+                    self.binner.gap(lost);
+                    *got += lost;
+                    self.restart = false;
+                }
+                *got += n;
+            }
+        }
+        self.binner.push(&cap.data);
+        for m in self.binner.take() {
+            self.writer.send(m);
+        }
+        let clipped = (0..2).any(|c| self.req.channels[c] && cap.clipped[c]);
+        if clipped {
+            self.clip_at = Some(now);
+        }
+        let recent = self
+            .clip_at
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(1));
+        self.req.shared.lock().unwrap().clipped = recent;
+    }
+
+    fn finish(mut self) {
+        self.binner.finish();
+        for m in self.binner.take() {
+            self.writer.send(m);
+        }
+        self.writer.finish();
+    }
+}
+
+/// The rate the logger streams at for a step (for the UI).
+pub fn log_rate(step_ns: u64) -> Rate {
+    crate::logger::adc_for_step(step_ns).0
 }
 
 /// One block of samples, in volts at the BNC.
@@ -110,6 +279,7 @@ struct Worker {
     running: bool,
     quit: bool,
     last_error: Option<String>,
+    log: Option<LogSession>,
 }
 
 impl Worker {
@@ -123,6 +293,7 @@ impl Worker {
             running: true,
             quit: false,
             last_error: None,
+            log: None,
         }
     }
 
@@ -131,13 +302,29 @@ impl Worker {
             Command::Configure { gen, cfg } => self.want = Some((gen, cfg)),
             Command::Run(run) => {
                 self.running = run;
-                if !run {
+                // A log keeps the scope running.
+                if !run && self.log.is_none() {
                     if let Some(c) = &mut self.conn {
                         let _ = c.driver.stop();
                     }
                 }
             }
+            Command::StartLog(req) => {
+                self.stop_log();
+                self.log = Some(LogSession::new(req));
+            }
+            Command::StopLog => self.stop_log(),
             Command::Quit => self.quit = true,
+        }
+    }
+
+    fn stop_log(&mut self) {
+        if let Some(l) = self.log.take() {
+            l.finish();
+            // Start the normal capture from scratch.
+            if let Some(c) = &mut self.conn {
+                let _ = c.driver.stop();
+            }
         }
     }
 
@@ -186,6 +373,15 @@ impl Worker {
                 break;
             }
             if self.conn.is_none() && !self.connect() {
+                continue;
+            }
+            if self.log.as_ref().is_some_and(|l| l.writer_done()) {
+                // The size limit (or a write error) ended the log.
+                self.stop_log();
+                continue;
+            }
+            if let Some(cfg) = self.log.as_ref().map(|l| l.cfg) {
+                self.log_step(cfg);
                 continue;
             }
             let (Some((gen, cfg)), true) = (self.want, self.running) else {
@@ -241,8 +437,44 @@ impl Worker {
                 }
             }
         }
+        self.stop_log();
         if let Some(c) = &mut self.conn {
             let _ = c.driver.stop();
+        }
+    }
+
+    /// Read one piece of the log stream.
+    fn log_step(&mut self, cfg: HwConfig) {
+        let conn = self.conn.as_mut().expect("connected");
+        match conn.driver.stream(&cfg) {
+            Ok(cap) => {
+                self.last_error = None;
+                let conn = self.conn.as_ref().expect("connected");
+                if let Some(l) = &mut self.log {
+                    l.piece(&cap, conn);
+                }
+            }
+            Err(e) => {
+                if let Some(l) = &mut self.log {
+                    l.restart = true;
+                }
+                if is_gone(&e) {
+                    self.conn = None;
+                    if !self.emit(Event::Disconnected(format!("{e:#}"))) {
+                        self.quit = true;
+                    }
+                    self.poll(Some(Duration::from_millis(500)));
+                } else if is_timeout(&e) {
+                    if !self.error_once("USB timeout, trying again".into()) {
+                        self.quit = true;
+                    }
+                } else {
+                    if !self.error_once(format!("{e:#}")) {
+                        self.quit = true;
+                    }
+                    self.poll(Some(Duration::from_millis(200)));
+                }
+            }
         }
     }
 

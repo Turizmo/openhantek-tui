@@ -98,6 +98,10 @@ pub struct FakeState {
     pub unplugged: bool,
     /// Sleep in bulk reads like the real scope takes time.
     pub realtime: bool,
+    /// Lose this many samples (per channel) at the next bulk read, like
+    /// a scope FIFO that overflowed: the time passes, the data does not
+    /// come.
+    pub drop_samples: usize,
     pub calls: Vec<ControlCall>,
     pub bulk_bytes: usize,
     /// Signal time, in seconds. Runs on with every sample.
@@ -148,6 +152,7 @@ impl FakeScope {
                 junk: 1500,
                 unplugged: false,
                 realtime: false,
+                drop_samples: 0,
                 calls: Vec::new(),
                 bulk_bytes: 0,
                 t: 0.0,
@@ -276,6 +281,10 @@ impl Transport for FakeScope {
             let channels = s.channels.clamp(1, 2) as usize;
             let dt = 1.0 / raw_rate;
             let n = buf.len() - buf.len() % channels;
+            for _ in 0..std::mem::take(&mut s.drop_samples) {
+                s.t += dt;
+                s.since_start += 1;
+            }
             for frame in buf[..n].chunks_mut(channels) {
                 for (c, b) in frame.iter_mut().enumerate() {
                     *b = s.sample(c);
