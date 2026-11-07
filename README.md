@@ -32,11 +32,13 @@ Features:
 - Envelope logger (chart recorder): records min, max and mean per time
   step (2.5 µs to 1 min) without gaps, for hours or days, with a strip
   chart log view and CSV export
-- Settings panel (`S`) with yazi-style keys: every setting in one place,
+- Settings panel (`s`, `Enter` or `F2`) with yazi-style keys: every setting in one place,
   with search and typed values
 - Clean braille plot: whole cells per division, so the grid lines up, and
   one-dot-thick traces; true colour, with 256 and 16 colour fallbacks
-- Settings are saved on quit
+- One config file with every setting and every key binding, with a
+  comment on each line; changes are saved on quit, in place, so your own
+  comments and formatting stay
 - Demo mode with a fake scope, so you can try it without hardware
 
 ## Run it
@@ -73,8 +75,9 @@ Close OpenHantek6022 first: only one program can use the scope.
 ```
 --demo              fake scope with made-up signals
 --firmware FILE     firmware file (Intel HEX)
---settings FILE     settings file (default ~/.config/openhantek-tui/settings.toml)
---no-settings       do not load or save settings
+--config FILE       config file (default ~/.config/openhantek-tui/config.toml;
+                    --settings FILE is the old name and still works)
+--no-settings       do not load or save the config file (also --no-config)
 --export-dir DIR    folder for CSV and JSON exports (default: current folder)
 --log-dir DIR       folder for envelope logs (default ~/.local/share/openhantek-tui/logs)
 --open-log FILE     open this log in the log view
@@ -111,7 +114,7 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 |---|---|
 | `q` `Esc` | quit (saves settings) |
 | `?` `F1` | help |
-| `S` `F2` | settings panel (see below) |
+| `s` `Enter` `F2` | settings panel (see below) |
 | `space` | run / stop |
 | `o` | single shot: arm the trigger once |
 | `a` | autoset |
@@ -124,10 +127,10 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `c` | coupling DC / AC |
 | `p` | probe x1 / x10 |
 | `i` | invert |
-| `m` | next math function (turns MATH on) |
+| `M` | next math function (turns MATH on) |
 | `←` `→` | time/div |
 | `t` | trigger mode: Auto / Normal / Single |
-| `s` | trigger source CH1 / CH2 |
+| `S` | trigger source CH1 / CH2 |
 | `e` | trigger edge: rising / falling / both |
 | `+` `-` | trigger level |
 | `T` | trigger level to the middle of the signal |
@@ -136,12 +139,13 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `F` | spectrum zoom (span / 2) |
 | `w` | FFT window |
 | `x` | XY mode |
-| `M` | measurement panel |
+| `m` | measurement panel |
 | `v` | hide / show all cursors (each keeps its own on/off) |
 | `h` `l` | move time cursor A (when it is on) |
 | `H` `L` | move time cursor B (when it is on) |
 | `j` `k` | move voltage cursor A (when it is on) |
 | `J` `K` | move voltage cursor B (when it is on) |
+| `Alt` + `h` `l` `H` `L` `j` `k` `J` `K` | move that cursor a hundredth of a division (fine) |
 | `A` | averaging: 1 2 4 8 16 32 64 |
 | `P` | persistence: 0 2 4 8 16 traces |
 | `d` | dots / lines |
@@ -174,9 +178,83 @@ are only as wide as the longest one, the `1▸` markers sit right next to
 them, and the right side has one column for `◂` (two with fine dashes
 voltage cursors, whose names go there).
 
+## Config file
+
+Every setting and every key binding is in one file,
+`~/.config/openhantek-tui/config.toml` (or
+`$XDG_CONFIG_HOME/openhantek-tui/config.toml`; `--config FILE` picks
+another one, `--no-settings` uses none). When it is missing, the app
+writes it at start: every setting with a short comment above it, then a
+`[keys]` table with every action and its default keys. It starts like
+this:
+
+```toml
+# openhantek-tui config. Every setting, then the key bindings.
+# The app writes changed values back in place: your comments stay.
+# A bad entry gives a warning and its default.
+
+# time/div: index into 20ns 50ns 100ns ... 1s 2s 5s 10s (0..26, 14 = 1 ms)
+time_idx = 14
+...
+
+# Key bindings: action = key or [keys]. ...
+[keys]
+# quit (saves the settings)
+quit = ["q", "Esc"]
+# key help
+help = ["?", "F1"]
+# settings panel
+settings = ["s", "Enter", "F2"]
+...
+# run / stop
+run_stop = "Space"
+```
+
+- **Saving.** Settings changed in the app are written on quit, and only
+  the values that changed: the file is edited in place (with
+  `toml_edit`), so your comments, the order and the formatting stay. If
+  nothing changed, the file is not touched.
+- **Bad entries.** A value of the wrong type or an unknown name (like
+  `mode = "Sometimes"`) gives a warning on the message line and that
+  setting keeps its default; the other entries still load. Unknown
+  settings and actions also warn. All warnings are listed in Settings ›
+  Files › Config warnings. The file is not rewritten: a change in the app
+  later writes only that value, the bad entries stay as they are for you
+  to fix. A file that is not TOML at all is never written.
+- **Old settings.toml.** When there is no config.toml yet but a
+  `settings.toml` from an older version is in the same folder, its
+  values are taken once into the new config.toml. The old file is left
+  in place, untouched; the app does not read it again.
+
+**Keys.** `action = "key"` or `action = ["key", "key"]`; `[]` unbinds.
+A key is a single character (`a`, `A`, `+`, `?`), or one of `Enter`
+`Esc` `Tab` `Shift-Tab` `Space` `Backspace` `Delete` `Insert` `F1` to
+`F12` `Up` `Down` `Left` `Right` `PgUp` `PgDn` `Home` `End`, with
+`Ctrl-` or `Alt-` in front (`Ctrl-r`, `Alt-Left`). Shift is in the
+character: `A` is Shift-a (`Shift-a` works too). Names are not case
+sensitive. For example `settings = ["o", "F2"]` and `single = "O"`.
+Actions are in four views: global (the scope and the log view), scope,
+log view (which also takes the scope keys it does not use itself) and
+the settings panel. A key bound to two actions of one view gives a
+warning, and the first of them in the file keeps it (actions missing
+from the file come after the ones in it). `Ctrl-C` always quits. Typing
+a number or a search text in the panel uses fixed keys (characters,
+`Enter`, `Esc`, `Backspace`, the arrows); in the value column of a
+number, digits, `.` and `-` always start typing. The help screen (`?`)
+and the key hints show the keys in use.
+
+**Ctrl and Alt in terminals.** `Alt` works in every terminal (the fine
+cursor keys use it). `Ctrl` with a letter works too, but a terminal
+without the kitty keyboard protocol (xfce4-terminal, GNOME Terminal and
+other VTE terminals, tmux) sends Ctrl-Shift-h like Ctrl-h, and Ctrl-h
+like Backspace in some setups, so bind such keys with care. When the
+terminal supports the kitty protocol (kitty, foot, WezTerm, Ghostty,
+Alacritty), the app turns it on (and off again on exit), and these keys
+are all different.
+
 ## Settings panel
 
-Press `S` (or `F2`). The panel opens at the bottom of the screen, and the
+Press `s` (or `Enter`, or `F2`). The panel opens at the bottom of the screen, and the
 live trace stays above it, so you see each change at once. It has three
 columns, like the file manager yazi: categories, the settings in that
 category with their values, and the possible values (or help) of the
@@ -223,7 +301,7 @@ columns scroll to keep the cursor in view.
 | `=` `i` | on a number: type it, starting from the current value |
 | `/` | search all settings as you type; `Enter` ends typing, `Esc` clears |
 | `gg` `G` | first / last row |
-| `S` `F2` `q` | close the panel (changes stay) |
+| `s` `F2` `q` | close the panel (changes stay) |
 
 Moving in the value column changes the setting at once, and it stays:
 there is no Enter to confirm and no undo. Moving away or closing the
@@ -278,7 +356,7 @@ takes the newer colour), so they stay connected lines.
 
 ## Measurement panel
 
-`M` shows the panel at the right of the plot: every measurement of each
+`m` shows the panel at the right of the plot: every measurement of each
 trace that is on (CH1, CH2, MATH), and a Cursors section when a cursor is
 on. Its layout depends only on the screen size and on which traces and
 cursors are on, never on the values, so it does not jump:
@@ -426,7 +504,7 @@ or `time_s` (seconds since the start). Each gap is one row with the
 time where the data stops and empty value cells, like `8.000,,,,,,`, so
 plotting tools break the line there.
 
-**Settings** (the `[logger]` table of settings.toml):
+**Settings** (the `[logger]` table of config.toml):
 
 | Setting | Meaning |
 |---|---|

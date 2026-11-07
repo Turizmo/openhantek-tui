@@ -23,11 +23,12 @@ struct Args {
     /// Firmware file (Intel HEX) for the scope.
     #[arg(long, value_name = "FILE")]
     firmware: Option<PathBuf>,
-    /// Settings file [default: ~/.config/openhantek-tui/settings.toml].
-    #[arg(long, value_name = "FILE")]
-    settings: Option<PathBuf>,
-    /// Do not load or save the settings file.
-    #[arg(long)]
+    /// Config file with the settings and keys [default:
+    /// ~/.config/openhantek-tui/config.toml].
+    #[arg(long, value_name = "FILE", alias = "settings")]
+    config: Option<PathBuf>,
+    /// Do not load or save the config file (default settings and keys).
+    #[arg(long, alias = "no-config")]
     no_settings: bool,
     /// Folder for exported CSV and JSON files [default: current folder].
     #[arg(long, value_name = "DIR")]
@@ -60,33 +61,48 @@ fn opener(args: &Args) -> Opener {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let settings_path = if args.no_settings {
+    // The config file: --config, or the default one (which takes the
+    // values of the old settings.toml once, when it is new).
+    let loaded = if args.no_settings {
         None
+    } else if let Some(p) = &args.config {
+        Some(config::load(p, None))
     } else {
-        args.settings.clone().or_else(config::settings_path)
+        config::config_path().map(|p| config::load(&p, config::old_settings_path().as_deref()))
     };
-    let (settings, load_error) = match &settings_path {
-        Some(p) => config::load::<Settings>(p),
-        None => (Settings::default(), None),
+    let (settings, keys, warnings, notes, save) = match loaded {
+        Some(l) => (l.settings, l.keys, l.warnings, l.notes, l.save),
+        None => (
+            Settings::default(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ),
     };
-    // Do not overwrite a settings file we could not read: keep the
-    // user's file so they can fix it.
-    let save_path = settings_path.filter(|_| load_error.is_none());
     let acq = Acquisition::spawn(opener(&args));
     let mut app = App::new(settings, Some(acq));
     if let Some(dir) = &args.export_dir {
         app.export_dir = dir.clone();
     }
-    app.settings_path = save_path.clone();
+    app.keys = keys;
+    app.settings_path = save.as_ref().map(|t| t.path.clone());
     app.log_dir_override = args.log_dir.clone();
     if let Some(p) = &args.open_log {
         app.open_log(p);
     }
-    if let Some(e) = &load_error {
-        app.notify(
-            format!("{e}. Using defaults; the file will not be changed"),
-            true,
-        );
+    if !notes.is_empty() {
+        app.notify(notes.join(" · "), false);
+    }
+    if !warnings.is_empty() {
+        let n = warnings.len();
+        let more = if n > 1 {
+            format!(" (and {} more)", n - 1)
+        } else {
+            String::new()
+        };
+        app.notify(format!("Config: {}{more}", warnings[0]), true);
+        app.config_warnings = warnings.clone();
     }
     if args.autoset {
         app.scope.start_autoset();
@@ -106,14 +122,46 @@ fn main() -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    let enhanced = push_keyboard_enhancement();
     let result = run(&mut terminal, &mut app);
+    if enhanced {
+        pop_keyboard_enhancement();
+    }
     ratatui::restore();
-    if let Some(p) = &save_path {
-        if let Err(e) = config::save(p, &app.scope.settings) {
-            eprintln!("Could not save settings to {}: {e:#}", p.display());
+    if let Some(t) = &save {
+        if let Err(e) = config::save(t, &app.scope.settings) {
+            eprintln!("Could not save the settings: {e:#}");
         }
     }
     result.map_err(Into::into)
+}
+
+/// Ask the terminal for unambiguous key codes (the kitty keyboard
+/// protocol), so Ctrl-h is not Backspace and Ctrl-Shift-h is not Ctrl-h.
+/// Only when the terminal says it supports it (kitty, foot, WezTerm,
+/// Ghostty, Alacritty; not VTE terminals like xfce4-terminal or GNOME
+/// Terminal, not tmux). Undone on exit and on a panic.
+fn push_keyboard_enhancement() -> bool {
+    use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    use ratatui::crossterm::{execute, terminal};
+    if !terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        return false;
+    }
+    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+    if execute!(io::stdout(), PushKeyboardEnhancementFlags(flags)).is_err() {
+        return false;
+    }
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        pop_keyboard_enhancement();
+        hook(info);
+    }));
+    true
+}
+
+fn pop_keyboard_enhancement() {
+    use ratatui::crossterm::event::PopKeyboardEnhancementFlags;
+    let _ = ratatui::crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
