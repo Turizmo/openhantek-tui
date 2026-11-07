@@ -1,447 +1,177 @@
 //! openhantek-tui: a terminal oscilloscope for the Hantek DSO-6022BE.
-//!
-//! Step 1: a fake scope. The signals are made up in code, so the screen and
-//! the controls can be built before we talk to the real hardware.
 
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind},
-    layout::{Constraint, Layout},
-    style::{Color, Modifier, Style},
-    symbols::Marker,
-    text::{Line, Span},
-    widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph},
-    DefaultTerminal, Frame,
-};
+use anyhow::{bail, Result};
+use clap::Parser;
+use ratatui::crossterm::event::{self, Event as TermEvent, KeyEventKind};
 
-/// Screen grid: 10 divisions wide, 8 divisions high, like a real scope.
-const H_DIVS: f64 = 10.0;
-const V_DIVS: f64 = 8.0;
-/// Samples per screen.
-const POINTS: usize = 1000;
+use openhantek_tui::acquire::{Acquisition, Opener};
+use openhantek_tui::app::App;
+use openhantek_tui::device::{open_demo, open_hardware};
+use openhantek_tui::settings::Settings;
+use openhantek_tui::{config, ui};
 
-const TIME_DIVS: [f64; 16] = [
-    1e-6, 2e-6, 5e-6, 10e-6, 20e-6, 50e-6, 100e-6, 200e-6, 500e-6, 1e-3, 2e-3, 5e-3, 10e-3, 20e-3,
-    50e-3, 100e-3,
-];
-const VOLT_DIVS: [f64; 9] = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0];
-
-/// A made-up input signal.
-#[derive(Clone, Copy)]
-enum Signal {
-    Sine { freq: f64, amp: f64 },
-    Square { freq: f64, high: f64 },
+#[derive(Parser, Debug)]
+#[command(version, about = "Terminal oscilloscope for the Hantek DSO-6022BE")]
+struct Args {
+    /// Use a fake scope with made-up signals (no hardware needed).
+    #[arg(long)]
+    demo: bool,
+    /// Firmware file (Intel HEX) for the scope.
+    #[arg(long, value_name = "FILE")]
+    firmware: Option<PathBuf>,
+    /// Settings file [default: ~/.config/openhantek-tui/settings.toml].
+    #[arg(long, value_name = "FILE")]
+    settings: Option<PathBuf>,
+    /// Do not load or save the settings file.
+    #[arg(long)]
+    no_settings: bool,
+    /// Folder for exported CSV and JSON files [default: current folder].
+    #[arg(long, value_name = "DIR")]
+    export_dir: Option<PathBuf>,
+    /// Run autoset at start.
+    #[arg(long)]
+    autoset: bool,
+    /// No screen: capture once, print the measurements, then quit.
+    #[arg(long)]
+    measure: bool,
+    /// With --measure: also save the capture to this CSV file.
+    #[arg(long, value_name = "FILE", requires = "measure")]
+    csv: Option<PathBuf>,
 }
 
-impl Signal {
-    fn at(self, t: f64) -> f64 {
-        match self {
-            Signal::Sine { freq, amp } => amp * (std::f64::consts::TAU * freq * t).sin(),
-            Signal::Square { freq, high } => {
-                if (t * freq).rem_euclid(1.0) < 0.5 {
-                    high
-                } else {
-                    0.0
-                }
-            }
-        }
-    }
-
-    /// Trigger level halfway up the signal.
-    fn trigger_level(self) -> f64 {
-        match self {
-            Signal::Sine { .. } => 0.0,
-            Signal::Square { high, .. } => high / 2.0,
-        }
+fn opener(args: &Args) -> Opener {
+    if args.demo {
+        Box::new(|_| Ok(open_demo()))
+    } else {
+        let fw = args.firmware.clone();
+        Box::new(move |status| open_hardware(fw.as_deref(), status))
     }
 }
 
-/// Small xorshift noise source, so we need no `rand` crate.
-struct Noise(u64);
-
-impl Noise {
-    /// Returns a value in -1.0..1.0.
-    fn next(&mut self) -> f64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let settings_path = if args.no_settings {
+        None
+    } else {
+        args.settings.clone().or_else(config::settings_path)
+    };
+    let (settings, load_error) = match &settings_path {
+        Some(p) => config::load::<Settings>(p),
+        None => (Settings::default(), None),
+    };
+    let acq = Acquisition::spawn(opener(&args));
+    let mut app = App::new(settings, Some(acq));
+    if let Some(dir) = &args.export_dir {
+        app.export_dir = dir.clone();
     }
-}
-
-struct Channel {
-    name: &'static str,
-    color: Color,
-    signal: Signal,
-    enabled: bool,
-    volt_idx: usize,
-    /// Vertical position, in divisions.
-    offset: f64,
-    /// Last captured samples, in volts.
-    samples: Vec<f64>,
-}
-
-impl Channel {
-    fn volts_per_div(&self) -> f64 {
-        VOLT_DIVS[self.volt_idx]
+    if let Some(e) = load_error {
+        app.notify(e, true);
+    }
+    if args.autoset {
+        app.scope.start_autoset();
     }
 
-    /// Samples as chart points: x and y in divisions, clipped to the screen.
-    fn screen_points(&self) -> Vec<(f64, f64)> {
-        let vdiv = self.volts_per_div();
-        let limit = V_DIVS / 2.0;
-        self.samples
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let x = i as f64 * H_DIVS / (POINTS - 1) as f64 - H_DIVS / 2.0;
-                let y = (v / vdiv + self.offset).clamp(-limit, limit);
-                (x, y)
-            })
-            .collect()
+    if args.measure {
+        return measure_once(&mut app, args.csv.as_deref());
     }
 
-    /// Peak-to-peak volts and frequency of the last capture.
-    fn measure(&self, dt: f64) -> (f64, Option<f64>) {
-        let min = self.samples.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = self
-            .samples
-            .iter()
-            .cloned()
-            .fold(f64::NEG_INFINITY, f64::max);
-        let vpp = max - min;
-        // Find edges through the middle, with a band so noise does not count.
-        // Rising and falling edges are kept apart, so the duty cycle does not matter.
-        let mid = (max + min) / 2.0;
-        let band = vpp * 0.1;
-        let (mut rising, mut falling) = (Vec::new(), Vec::new());
-        let mut high: Option<bool> = None;
-        for (i, &v) in self.samples.iter().enumerate() {
-            if v > mid + band && high != Some(true) {
-                if high.is_some() {
-                    rising.push(i);
-                }
-                high = Some(true);
-            } else if v < mid - band && high != Some(false) {
-                if high.is_some() {
-                    falling.push(i);
-                }
-                high = Some(false);
-            }
-        }
-        // Mean period from each edge list that has two or more edges.
-        let periods: Vec<f64> = [rising, falling]
-            .iter()
-            .filter(|e| e.len() >= 2)
-            .map(|e| (e[e.len() - 1] - e[0]) as f64 * dt / (e.len() - 1) as f64)
-            .collect();
-        let freq =
-            (!periods.is_empty()).then(|| periods.len() as f64 / periods.iter().sum::<f64>());
-        (vpp, freq)
-    }
-}
-
-struct App {
-    channels: [Channel; 2],
-    selected: usize,
-    time_idx: usize,
-    paused: bool,
-    trigger: bool,
-    clock: Instant,
-    noise: Noise,
-    /// Time between samples in the last capture, in seconds.
-    dt: f64,
-}
-
-impl App {
-    fn new() -> Self {
-        Self {
-            channels: [
-                Channel {
-                    name: "CH1",
-                    color: Color::Yellow,
-                    signal: Signal::Sine {
-                        freq: 1000.0,
-                        amp: 1.5,
-                    },
-                    enabled: true,
-                    volt_idx: 6, // 1 V/div
-                    offset: 1.5,
-                    samples: Vec::new(),
-                },
-                Channel {
-                    name: "CH2",
-                    color: Color::Cyan,
-                    signal: Signal::Square {
-                        freq: 2500.0,
-                        high: 3.3,
-                    },
-                    enabled: true,
-                    volt_idx: 7, // 2 V/div
-                    offset: -3.0,
-                    samples: Vec::new(),
-                },
-            ],
-            selected: 0,
-            time_idx: 7, // 200 µs/div
-            paused: false,
-            trigger: true,
-            clock: Instant::now(),
-            noise: Noise(0x9E37_79B9_7F4A_7C15),
-            dt: 0.0,
+    let mut terminal = ratatui::init();
+    let result = run(&mut terminal, &mut app);
+    ratatui::restore();
+    if let Some(p) = &settings_path {
+        if let Err(e) = config::save(p, &app.scope.settings) {
+            eprintln!("Could not save settings to {}: {e:#}", p.display());
         }
     }
+    result.map_err(Into::into)
+}
 
-    fn time_per_div(&self) -> f64 {
-        TIME_DIVS[self.time_idx]
-    }
-
-    /// Take one screen of samples from the fake signals.
-    fn acquire(&mut self) {
-        let span = self.time_per_div() * H_DIVS;
-        self.dt = span / (POINTS - 1) as f64;
-        let mut start = self.clock.elapsed().as_secs_f64();
-        if self.trigger {
-            let sig = self.channels[self.selected].signal;
-            if let Some(edge) = find_rising_edge(sig, sig.trigger_level(), start, self.dt.max(1e-6))
-            {
-                // Put the trigger point in the middle of the screen.
-                start = edge - span / 2.0;
-            }
+fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
+    let frame_time = Duration::from_millis(33);
+    let mut last_draw = Instant::now() - frame_time;
+    let mut dirty = true;
+    loop {
+        dirty |= app.tick();
+        if dirty || last_draw.elapsed() >= Duration::from_millis(500) {
+            terminal.draw(|f| ui::draw(f, app))?;
+            last_draw = Instant::now();
+            dirty = false;
         }
-        for ch in &mut self.channels {
-            ch.samples.clear();
-            for i in 0..POINTS {
-                let t = start + i as f64 * self.dt;
-                ch.samples.push(ch.signal.at(t) + self.noise.next() * 0.03);
-            }
+        if app.quit {
+            return Ok(());
         }
-    }
-
-    fn run(mut self, mut terminal: DefaultTerminal) -> io::Result<()> {
-        loop {
-            if !self.paused {
-                self.acquire();
-            }
-            terminal.draw(|frame| self.draw(frame))?;
-            if !event::poll(Duration::from_millis(33))? {
-                continue;
-            }
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            let sel = self.selected;
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Char(' ') => self.paused = !self.paused,
-                KeyCode::Char('t') => self.trigger = !self.trigger,
-                KeyCode::Tab => self.selected = (self.selected + 1) % self.channels.len(),
-                KeyCode::Char('1') => self.channels[0].enabled ^= true,
-                KeyCode::Char('2') => self.channels[1].enabled ^= true,
-                KeyCode::Left => self.time_idx = self.time_idx.saturating_sub(1),
-                KeyCode::Right => self.time_idx = (self.time_idx + 1).min(TIME_DIVS.len() - 1),
-                KeyCode::Up => {
-                    self.channels[sel].volt_idx = self.channels[sel].volt_idx.saturating_sub(1)
+        let wait = frame_time.saturating_sub(last_draw.elapsed());
+        if event::poll(wait)? {
+            match event::read()? {
+                TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                    app.handle_key(key);
+                    dirty = true;
                 }
-                KeyCode::Down => {
-                    self.channels[sel].volt_idx =
-                        (self.channels[sel].volt_idx + 1).min(VOLT_DIVS.len() - 1)
-                }
-                KeyCode::Char(']') => {
-                    self.channels[sel].offset = (self.channels[sel].offset + 0.5).min(V_DIVS / 2.0)
-                }
-                KeyCode::Char('[') => {
-                    self.channels[sel].offset = (self.channels[sel].offset - 0.5).max(-V_DIVS / 2.0)
-                }
+                TermEvent::Resize(_, _) => dirty = true,
                 _ => {}
             }
         }
     }
+}
 
-    fn draw(&self, frame: &mut Frame) {
-        let [chart_area, status_area, help_area] = Layout::vertical([
-            Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
-
-        let grid = grid_points();
-        let traces: Vec<Vec<(f64, f64)>> =
-            self.channels.iter().map(Channel::screen_points).collect();
-
-        // Grid first, so the traces draw on top of it.
-        let mut datasets = vec![Dataset::default()
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(Color::DarkGray))
-            .data(&grid)];
-        for (ch, points) in self.channels.iter().zip(&traces) {
-            if ch.enabled {
-                datasets.push(
-                    Dataset::default()
-                        .marker(Marker::Braille)
-                        .graph_type(GraphType::Line)
-                        .style(Style::default().fg(ch.color))
-                        .data(points),
-                );
+/// Capture until a frame comes (triggered if the trigger can), then print
+/// the measurements of the enabled channels.
+fn measure_once(app: &mut App, csv: Option<&std::path::Path>) -> Result<()> {
+    let t0 = Instant::now();
+    let mut frames = 0;
+    loop {
+        if app.tick() && app.scope.frame.is_some() && !app.scope.autoset_running() {
+            frames += 1;
+            let triggered = app.scope.frame.as_ref().is_some_and(|f| f.triggered);
+            // Skip the first frame: it may come from the old settings.
+            if frames >= 2 && (triggered || t0.elapsed() > Duration::from_secs(3)) {
+                break;
             }
         }
-
-        let tdiv = self.time_per_div();
-        let sel = &self.channels[self.selected];
-        let vdiv = sel.volts_per_div();
-        let half_h = H_DIVS / 2.0;
-        let half_v = V_DIVS / 2.0;
-        let y_label = |y: f64| fmt_si((y - sel.offset) * vdiv, "V");
-
-        let state = if self.paused { "STOP" } else { "RUN" };
-        let title = format!(" openhantek-tui · DEMO · {state} ");
-        let chart = Chart::new(datasets)
-            .block(Block::bordered().title(title))
-            .legend_position(None)
-            .x_axis(Axis::default().bounds([-half_h, half_h]).labels([
-                fmt_si(-half_h * tdiv, "s"),
-                "0".into(),
-                fmt_si(half_h * tdiv, "s"),
-            ]))
-            .y_axis(
-                Axis::default()
-                    .bounds([-half_v, half_v])
-                    .style(Style::default().fg(sel.color))
-                    .labels([y_label(-half_v), y_label(0.0), y_label(half_v)]),
-            );
-        frame.render_widget(chart, chart_area);
-
-        // Status line: one block per channel, then time base and trigger.
-        let mut spans = Vec::new();
-        for (i, ch) in self.channels.iter().enumerate() {
-            let mut style = Style::default().fg(ch.color);
-            if i == self.selected {
-                style = style.add_modifier(Modifier::REVERSED);
+        if let Some(m) = app.current_message().filter(|m| m.error) {
+            if !app.connected && t0.elapsed() > Duration::from_secs(25) {
+                bail!("{}", m.text);
             }
-            if !ch.enabled {
-                style = style.add_modifier(Modifier::DIM);
-            }
-            let (vpp, freq) = ch.measure(self.dt);
-            let freq = freq.map_or("--".to_string(), |f| fmt_si(f, "Hz"));
-            spans.push(Span::styled(
-                format!(
-                    " {} {}/div  Vpp {}  f {} ",
-                    ch.name,
-                    fmt_si(ch.volts_per_div(), "V"),
-                    fmt_si(vpp, "V"),
-                    freq
-                ),
-                style,
-            ));
-            spans.push(Span::raw("  "));
         }
-        let trig = if self.trigger {
-            format!(
-                "Trig {} ↑ {}",
-                sel.name,
-                fmt_si(sel.signal.trigger_level(), "V")
-            )
+        if t0.elapsed() > Duration::from_secs(30) {
+            bail!("no data from the scope within 30 s");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let f = app.scope.frame.as_ref().expect("frame");
+    let s = &app.scope.settings;
+    println!(
+        "{} · {}/div · {} · {}",
+        app.device_name,
+        openhantek_tui::si::fmt_si(s.time_per_div(), "s"),
+        openhantek_tui::si::fmt_si(f.rate, "S/s"),
+        if f.triggered {
+            "triggered"
         } else {
-            "Trig off".to_string()
+            "not triggered"
+        }
+    );
+    for t in 0..3 {
+        if !ui::trace_enabled(s, t) {
+            continue;
+        }
+        let Some(m) = app.scope.measure(t) else {
+            continue;
         };
-        spans.push(Span::raw(format!("{}/div  {trig}", fmt_si(tdiv, "s"))));
-        frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
-
-        let help = "q quit · space run/stop · ←/→ time/div · ↑/↓ volts/div · [ ] move · tab channel · 1/2 on/off · t trigger";
-        frame.render_widget(
-            Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
-            help_area,
-        );
+        let unit = if t == 2 { s.math.mode.unit() } else { "V" };
+        let rows = ui::measurement_rows(&m, unit);
+        let text: Vec<String> = rows.iter().map(|(k, v)| format!("{k} {v}")).collect();
+        println!("{}: {}", ["CH1", "CH2", "MATH"][t], text.join(", "));
     }
-}
-
-/// Find the first time after `from` where the signal goes up through `level`.
-fn find_rising_edge(sig: Signal, level: f64, from: f64, step: f64) -> Option<f64> {
-    let mut prev = sig.at(from);
-    for k in 1..=20_000 {
-        let t = from + k as f64 * step;
-        let v = sig.at(t);
-        if prev < level && v >= level {
-            // Narrow the crossing down between the two samples.
-            let (mut lo, mut hi) = (t - step, t);
-            for _ in 0..40 {
-                let mid = (lo + hi) / 2.0;
-                if sig.at(mid) < level {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
-            }
-            return Some(hi);
-        }
-        prev = v;
+    if let Some(path) = csv {
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+        let saved = app.export_to(dir.unwrap_or(std::path::Path::new(".")), false)?;
+        std::fs::rename(&saved, path)?;
+        println!("Saved {}", path.display());
     }
-    None
-}
-
-/// Dotted grid lines at every division.
-fn grid_points() -> Vec<(f64, f64)> {
-    let mut points = Vec::new();
-    let (half_h, half_v) = (H_DIVS / 2.0, V_DIVS / 2.0);
-    for i in 0..=H_DIVS as i32 {
-        let x = i as f64 - half_h;
-        for j in 0..=(V_DIVS * 5.0) as i32 {
-            points.push((x, j as f64 / 5.0 - half_v));
-        }
-    }
-    for j in 0..=V_DIVS as i32 {
-        let y = j as f64 - half_v;
-        for i in 0..=(H_DIVS * 5.0) as i32 {
-            points.push((i as f64 / 5.0 - half_h, y));
-        }
-    }
-    points
-}
-
-/// Format a value with an SI prefix, like `200 µs` or `1.5 kHz`.
-fn fmt_si(value: f64, unit: &str) -> String {
-    const PREFIXES: [(f64, &str); 6] = [
-        (1e6, "M"),
-        (1e3, "k"),
-        (1.0, ""),
-        (1e-3, "m"),
-        (1e-6, "µ"),
-        (1e-9, "n"),
-    ];
-    if value == 0.0 {
-        return format!("0 {unit}");
-    }
-    let (scale, prefix) = PREFIXES
-        .iter()
-        .find(|(scale, _)| value.abs() >= *scale * 0.999)
-        .copied()
-        .unwrap_or((1e-9, "n"));
-    let n = value / scale;
-    let text = if n.abs() >= 100.0 {
-        format!("{n:.0}")
-    } else if n.abs() >= 10.0 {
-        format!("{n:.1}")
-    } else {
-        format!("{n:.2}")
-    };
-    let text = if text.contains('.') {
-        text.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        text
-    };
-    format!("{text} {prefix}{unit}")
-}
-
-fn main() -> io::Result<()> {
-    let terminal = ratatui::init();
-    let result = App::new().run(terminal);
-    ratatui::restore();
-    result
+    Ok(())
 }

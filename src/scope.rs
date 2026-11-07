@@ -418,11 +418,30 @@ impl Scope {
         self.frame = Some(frame);
     }
 
-    /// Measurements of trace `t` on screen.
+    /// Measurements of trace `t` on screen. Timing values need a signal of
+    /// at least a quarter division: smaller ones are mostly noise.
     pub fn measure(&self, t: usize) -> Option<Measurements> {
         let f = self.frame.as_ref()?;
         let v = f.visible_samples(t, &self.settings)?;
-        (v.len() >= 2).then(|| measure(v, f.dt))
+        if v.len() < 2 {
+            return None;
+        }
+        let mut m = measure(v, f.dt);
+        let per_div = if t == MATH {
+            self.settings.math.units_per_div()
+        } else {
+            self.settings.channels[t].volts_per_div()
+        };
+        if m.pk_pk < 0.25 * per_div {
+            m.freq = None;
+            m.period = None;
+            m.duty = None;
+            m.pos_width = None;
+            m.neg_width = None;
+            m.rise = None;
+            m.fall = None;
+        }
+        Some(m)
     }
 
     /// Start autoset: find good volts/div, time/div and trigger settings.
@@ -813,6 +832,19 @@ mod tests {
         s.push(sine_block(s.gen, rate, 20.0, 1.0, 0.0));
         assert!(!s.autoset_running());
         assert!(s.notices.iter().any(|n| n.contains("20 Hz")));
+    }
+
+    #[test]
+    fn tiny_signals_have_no_timing() {
+        let mut s = scope();
+        // 0.2 Vpp at 1 V/div is under a quarter division.
+        s.push(sine_block(1, 1e6, 1000.0, 0.1, 0.0));
+        let m = s.measure(0).unwrap();
+        assert!((m.pk_pk - 0.2).abs() < 0.01);
+        assert_eq!(m.freq, None);
+        s.settings.channels[0].volt_idx = 0; // 20 mV/div
+        s.reprocess();
+        assert!(s.measure(0).unwrap().freq.is_some());
     }
 
     #[test]

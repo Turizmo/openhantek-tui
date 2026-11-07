@@ -214,6 +214,8 @@ pub enum Interpolation {
 pub struct DisplaySettings {
     /// Show the spectrum below the time view.
     pub spectrum: bool,
+    /// Spectrum span is the Nyquist frequency divided by 2^zoom.
+    pub spectrum_zoom: u32,
     pub window: Window,
     /// CH1 on X, CH2 on Y.
     pub xy: bool,
@@ -231,6 +233,7 @@ impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
             spectrum: false,
+            spectrum_zoom: 0,
             window: Window::Hann,
             xy: false,
             interpolation: Interpolation::Sinc,
@@ -241,6 +244,9 @@ impl Default for DisplaySettings {
         }
     }
 }
+
+/// Spectrum zoom steps: up to 1/256 of the Nyquist frequency.
+pub const MAX_SPECTRUM_ZOOM: u32 = 8;
 
 /// Frequencies of the calibration output pin, in Hz (the steps OpenHantek6022 offers).
 pub const CAL_FREQS: [u32; 38] = [
@@ -314,6 +320,7 @@ impl Settings {
         }
         self.display.averaging = self.display.averaging.clamp(1, 128);
         self.display.persistence = self.display.persistence.min(16);
+        self.display.spectrum_zoom = self.display.spectrum_zoom.min(MAX_SPECTRUM_ZOOM);
         if !CAL_FREQS.contains(&self.cal_freq) {
             self.cal_freq = 1_000;
         }
