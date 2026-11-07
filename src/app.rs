@@ -551,7 +551,12 @@ impl App {
             KeyCode::Char('x') => s.display.xy ^= true,
 
             // Cursors.
-            KeyCode::Char('v') => s.cursors.mode = s.cursors.mode.next(),
+            KeyCode::Char('v') => {
+                s.cursors.hidden ^= true;
+                if !s.cursors.hidden && !(0..4).any(|i| s.cursors.get(i).enabled) {
+                    self.notify("No cursor is on: turn them on in Settings › Cursors", false);
+                }
+            }
             KeyCode::Char(c @ ('h' | 'l' | 'H' | 'L' | 'j' | 'k' | 'J' | 'K')) => move_cursor(s, c),
 
             // Calibration output.
@@ -746,23 +751,26 @@ fn move_offset(s: &mut Settings, sel: usize, by: f64) {
 }
 
 /// h/l move time cursor A, H/L cursor B; j/k and J/K the voltage cursors.
+/// Only cursors that are on screen move.
 fn move_cursor(s: &mut Settings, key: char) {
-    let c = &mut s.cursors;
-    let (list, i, by, limit) = match key {
-        'h' => (&mut c.t, 0, -0.1, H_DIVS / 2.0),
-        'l' => (&mut c.t, 0, 0.1, H_DIVS / 2.0),
-        'H' => (&mut c.t, 1, -0.1, H_DIVS / 2.0),
-        'L' => (&mut c.t, 1, 0.1, H_DIVS / 2.0),
-        'j' => (&mut c.v, 0, -0.1, V_DIVS / 2.0),
-        'k' => (&mut c.v, 0, 0.1, V_DIVS / 2.0),
-        'J' => (&mut c.v, 1, -0.1, V_DIVS / 2.0),
-        _ => (&mut c.v, 1, 0.1, V_DIVS / 2.0),
+    let (i, by) = match key {
+        'h' => (0, -0.1),
+        'l' => (0, 0.1),
+        'H' => (1, -0.1),
+        'L' => (1, 0.1),
+        'j' => (2, -0.1),
+        'k' => (2, 0.1),
+        'J' => (3, -0.1),
+        _ => (3, 0.1),
     };
-    list[i] = (((list[i] + by) * 10.0).round() / 10.0).clamp(-limit, limit);
-    // Moving a cursor turns its kind on.
-    c.mode = if matches!(key, 'h' | 'l' | 'H' | 'L') {
-        CursorMode::Time
+    if !s.cursors.shown(i) {
+        return;
+    }
+    let limit = if CursorSettings::is_time(i) {
+        H_DIVS / 2.0
     } else {
-        CursorMode::Volt
+        V_DIVS / 2.0
     };
+    let c = s.cursors.get_mut(i);
+    c.position = (((c.position + by) * 10.0).round() / 10.0).clamp(-limit, limit);
 }

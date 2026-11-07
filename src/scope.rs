@@ -346,9 +346,7 @@ impl Scope {
         let src_samples = ch[src].as_deref().or(ch[1 - src].as_deref());
         let len = src_samples.map_or(0, |v| v.len());
         let vdiv = s.channels[src].volts_per_div();
-        let level = self
-            .effective_trigger_level()
-            .unwrap_or(s.trigger.level);
+        let level = self.effective_trigger_level().unwrap_or(s.trigger.level);
         let trig = src_samples.and_then(|v| {
             find_trigger(
                 v,
@@ -832,9 +830,7 @@ mod tests {
         let rate = cfg.rate.rate;
         let (lo, hi) = range[0];
         let w: Vec<f64> = (0..20_000)
-            .map(|i| {
-                (amp * (std::f64::consts::TAU * 1000.0 * i as f64 / rate).sin()).clamp(lo, hi)
-            })
+            .map(|i| (amp * (std::f64::consts::TAU * 1000.0 * i as f64 / rate).sin()).clamp(lo, hi))
             .collect();
         Block {
             gen,

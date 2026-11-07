@@ -226,18 +226,88 @@ fn xy_view() {
     assert!(!ui::xy_points(&r.app).is_empty());
 }
 
+/// Turn cursors on: 0 time A, 1 time B, 2 voltage A, 3 voltage B.
+fn cursors_on(r: &mut Rig, which: &[usize]) {
+    for &i in which {
+        r.app.scope.settings.cursors.get_mut(i).enabled = true;
+    }
+}
+
+/// The value right of `label` in the measurement panel, like `ΔT 4 ms`.
+fn meas_row(text: &str, label: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let i = l.find(&format!("│{label} "))?;
+        let rest = &l[i + "│".len()..];
+        let end = rest.find('│').unwrap_or(rest.len());
+        Some(rest[..end].split_whitespace().collect::<Vec<_>>().join(" "))
+    })
+}
+
 #[test]
 fn cursor_readout() {
     let mut r = rig();
-    r.char('v');
+    // All cursors are off by default: no Cursors section.
+    let t = r.text(150, 40);
+    assert!(!t.contains("Cursors"), "{t}");
+    cursors_on(&mut r, &[0, 1]);
     let t = r.text(150, 40);
     // Cursors at -2 and +2 div at 1 ms/div.
-    assert!(t.contains("A -2 ms B 2 ms ΔT 4 ms 1/ΔT 250 Hz"), "{t}");
+    assert_eq!(meas_row(&t, "A t").as_deref(), Some("A t -2 ms"), "{t}");
+    assert_eq!(meas_row(&t, "ΔT").as_deref(), Some("ΔT 4 ms"), "{t}");
+    assert_eq!(meas_row(&t, "1/ΔT").as_deref(), Some("1/ΔT 250 Hz"), "{t}");
+    // No cursor text in the status lines any more.
+    let lines: Vec<&str> = t.lines().collect();
+    assert!(lines[lines.len() - 3..].iter().all(|l| !l.contains("ΔT")));
+    // The value of each channel at each time cursor.
+    assert!(meas_row(&t, "V@A").is_some(), "{t}");
     r.char('l');
-    assert!(r.text(150, 40).contains("ΔT 3.9 ms"));
-    r.char('v');
+    assert_eq!(
+        meas_row(&r.text(150, 40), "ΔT").as_deref(),
+        Some("ΔT 3.9 ms")
+    );
+    // Voltage cursors: ΔV only with both on.
+    cursors_on(&mut r, &[3]);
     let t = r.text(150, 40);
-    assert!(t.contains("ΔV"));
+    assert!(
+        meas_row(&t, "B v").is_some() && meas_row(&t, "ΔV").is_none(),
+        "{t}"
+    );
+    cursors_on(&mut r, &[2]);
+    // CH1 at 1 V/div, 0 V line at +2 div: -1 and +1 div are -3 V and -1 V.
+    assert_eq!(meas_row(&r.text(150, 40), "ΔV").as_deref(), Some("ΔV 2 V"));
+    // One time cursor: no ΔT.
+    r.app.scope.settings.cursors.time_b.enabled = false;
+    let t = r.text(150, 40);
+    assert!(meas_row(&t, "ΔT").is_none() && meas_row(&t, "A t").is_some());
+}
+
+#[test]
+fn v_hides_and_shows_the_cursors_and_moves_only_enabled_ones() {
+    let mut r = rig();
+    cursors_on(&mut r, &[0, 3]);
+    let shown = r.text(150, 40);
+    assert!(shown.contains("Cursors"));
+    r.char('v');
+    assert!(r.app.scope.settings.cursors.hidden);
+    let hidden = r.text(150, 40);
+    assert!(!hidden.contains("Cursors"), "{hidden}");
+    // Hidden cursors do not move.
+    r.char('l');
+    assert_eq!(r.app.scope.settings.cursors.time_a.position, -2.0);
+    r.char('v');
+    assert_eq!(r.text(150, 40), shown);
+    // Each cursor keeps its own enabled state.
+    let c = &r.app.scope.settings.cursors;
+    assert!(c.time_a.enabled && !c.time_b.enabled && !c.volt_a.enabled && c.volt_b.enabled);
+    r.char('l');
+    r.char('H');
+    r.char('j');
+    r.char('K');
+    let c = &r.app.scope.settings.cursors;
+    assert!((c.time_a.position + 1.9).abs() < 1e-9);
+    assert_eq!(c.time_b.position, 2.0); // off: does not move
+    assert_eq!(c.volt_a.position, -1.0); // off
+    assert!((c.volt_b.position - 1.1).abs() < 1e-9);
 }
 
 #[test]
@@ -508,8 +578,11 @@ fn margins_are_small_and_nothing_is_cut() {
     let text = r.text(120, 40);
     assert!(text.contains("-90mV"), "{text}");
     // Fine voltage cursors put their names in a second right column.
-    r.app.scope.settings.display.cursor_style = CursorStyle::Fine;
-    r.app.scope.settings.cursors.mode = CursorMode::Volt;
+    for i in [2, 3] {
+        let c = r.app.scope.settings.cursors.get_mut(i);
+        c.style = CursorStyle::Fine;
+        c.enabled = true;
+    }
     let lines = r.screen(120, 40);
     for name in [" A ", " B "] {
         let row = lines
@@ -889,7 +962,8 @@ fn styled_rig(style: TraceStyle) -> Rig {
 fn classic_styles_are_the_default() {
     let s = Settings::default();
     assert_eq!(s.display.trace_style, [TraceStyle::BrailleThin; 3]);
-    assert_eq!(s.display.cursor_style, CursorStyle::Classic);
+    assert!((0..4).all(|i| s.cursors.get(i).style == CursorStyle::Classic));
+    assert!((0..4).all(|i| s.cursors.get(i).color == CursorColor::Grey));
 }
 
 #[test]
@@ -1012,10 +1086,16 @@ fn cursor_name_line(lines: &[String]) -> usize {
         .expect("no cursor name")
 }
 
+fn set_cursor_style(r: &mut Rig, st: CursorStyle) {
+    for i in 0..4 {
+        r.app.scope.settings.cursors.get_mut(i).style = st;
+    }
+}
+
 #[test]
 fn cursor_styles() {
     let mut r = rig();
-    r.char('v');
+    cursors_on(&mut r, &[0, 1]);
     let classic = r.screen(140, 40);
     let marker = classic.iter().position(|l| l.contains('▾')).unwrap();
     // Classic: the names are inside the plot, below the trigger mark row.
@@ -1024,18 +1104,56 @@ fn cursor_styles() {
         "{}",
         classic.join("\n")
     );
-    r.app.scope.settings.display.cursor_style = CursorStyle::Fine;
+    set_cursor_style(&mut r, CursorStyle::Fine);
     let fine = r.screen(140, 40);
     // Fine: in the margin row above the plot, with the trigger mark.
     assert_eq!(cursor_name_line(&fine), marker, "{}", fine.join("\n"));
     assert_ne!(classic, fine);
-    // Voltage cursors draw in both styles.
-    r.char('v');
-    let v_fine = r.text(140, 40);
-    r.app.scope.settings.display.cursor_style = CursorStyle::Classic;
-    let v_classic = r.text(140, 40);
-    assert!(v_fine.contains("ΔV") && v_classic.contains("ΔV"));
-    assert_ne!(v_fine, v_classic);
+    // Solid and dotted look different from both, names inside.
+    set_cursor_style(&mut r, CursorStyle::Solid);
+    let solid = r.screen(140, 40);
+    set_cursor_style(&mut r, CursorStyle::Dotted);
+    let dotted = r.screen(140, 40);
+    for other in [&solid, &dotted] {
+        assert!(cursor_name_line(other) > marker);
+        assert_ne!(other, &classic);
+        assert_ne!(other, &fine);
+    }
+    assert_ne!(solid, dotted);
+    // Voltage cursors draw in every style.
+    r.app.scope.settings.cursors.time_a.enabled = false;
+    r.app.scope.settings.cursors.time_b.enabled = false;
+    cursors_on(&mut r, &[2, 3]);
+    let mut seen = Vec::new();
+    for st in CursorStyle::ALL {
+        set_cursor_style(&mut r, st);
+        let t = r.text(140, 40);
+        assert!(t.contains("ΔV"));
+        assert!(!seen.contains(&t), "{st:?}");
+        seen.push(t);
+    }
+}
+
+#[test]
+fn each_cursor_has_its_own_style_and_colour() {
+    use ratatui::style::Color;
+    let mut r = rig();
+    cursors_on(&mut r, &[0, 1]);
+    r.app.scope.settings.cursors.time_b.color = CursorColor::Green;
+    r.app.scope.settings.cursors.time_b.style = CursorStyle::Solid;
+    let buf = r.buffer(140, 40);
+    // The name B is green, A has the white of the classic grey cursor.
+    let mut colours = std::collections::HashMap::new();
+    for y in 1..30 {
+        for x in 0..100 {
+            let c = &buf[(x, y)];
+            if c.symbol() == "A" || c.symbol() == "B" {
+                colours.entry(c.symbol().to_string()).or_insert(c.fg);
+            }
+        }
+    }
+    assert_eq!(colours.get("B"), Some(&Color::LightGreen), "{colours:?}");
+    assert_eq!(colours.get("A"), Some(&Color::White), "{colours:?}");
 }
 
 #[test]

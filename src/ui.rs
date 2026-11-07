@@ -256,30 +256,50 @@ pub const TRIGGER_OUT_OF_RANGE: Color = Color::Red;
 const CLASSIC_CURSOR: Color = Color::Gray;
 const CLASSIC_CURSOR_NAME: Color = Color::White;
 
-fn draw_cursors(plot: &mut Plot, s: &Settings, pal: &Palette) {
+/// Colours of a cursor: the line and its name. Grey is the look of the
+/// first versions: grey lines with white names in the plot, the palette
+/// cursor colour for fine dashes.
+pub fn cursor_colors(c: &Cursor, pal: &Palette) -> (Color, Color) {
+    let fixed = match c.color {
+        CursorColor::Grey if c.style == CursorStyle::Fine => return (pal.cursor, pal.cursor),
+        CursorColor::Grey => return (CLASSIC_CURSOR, CLASSIC_CURSOR_NAME),
+        CursorColor::White => Color::White,
+        CursorColor::Yellow => Color::LightYellow,
+        CursorColor::Cyan => Color::LightCyan,
+        CursorColor::Magenta => Color::LightMagenta,
+        CursorColor::Green => Color::LightGreen,
+        CursorColor::Red => Color::LightRed,
+        CursorColor::Blue => Color::LightBlue,
+    };
+    (fixed, fixed)
+}
+
+/// One cursor line: vertical at x (`time`) or horizontal at y, in
+/// divisions, in the cursor's style and colour.
+pub fn draw_cursor_line(plot: &mut Plot, c: &Cursor, time: bool, pal: &Palette) {
     let (half_h, half_v) = (H_DIVS / 2.0, V_DIVS / 2.0);
-    let classic = s.display.cursor_style == CursorStyle::Classic;
     let layer = plot::LAYER_CURSOR;
-    match s.cursors.mode {
-        CursorMode::Time => {
-            for &x in &s.cursors.t {
-                if classic {
-                    plot.dashed_classic((x, -half_v), (x, half_v), layer, CLASSIC_CURSOR);
-                } else {
-                    plot.dashed_v(x, layer, pal.cursor);
-                }
-            }
+    let (color, _) = cursor_colors(c, pal);
+    let p = c.position;
+    match (c.style, time) {
+        (CursorStyle::Classic, true) => {
+            plot.dashed_classic((p, -half_v), (p, half_v), layer, color)
         }
-        CursorMode::Volt => {
-            for &y in &s.cursors.v {
-                if classic {
-                    plot.dashed_classic((-half_h, y), (half_h, y), layer, CLASSIC_CURSOR);
-                } else {
-                    plot.dashed_h(y, layer, pal.cursor);
-                }
-            }
+        (CursorStyle::Classic, false) => {
+            plot.dashed_classic((-half_h, p), (half_h, p), layer, color)
         }
-        CursorMode::Off => {}
+        (CursorStyle::Fine, true) => plot.dashed_v(p, layer, color),
+        (CursorStyle::Fine, false) => plot.dashed_h(p, layer, color),
+        (CursorStyle::Solid, true) => plot.pattern_v(p, |_| true, layer, color),
+        (CursorStyle::Solid, false) => plot.pattern_h(p, |_| true, layer, color),
+        (CursorStyle::Dotted, true) => plot.pattern_v(p, |y| y % 4 == 0, layer, color),
+        (CursorStyle::Dotted, false) => plot.pattern_h(p, |x| x % 4 == 0, layer, color),
+    }
+}
+
+fn draw_cursors(plot: &mut Plot, s: &Settings, pal: &Palette) {
+    for i in (0..4).filter(|&i| s.cursors.shown(i)) {
+        draw_cursor_line(plot, s.cursors.get(i), CursorSettings::is_time(i), pal);
     }
 }
 
@@ -426,7 +446,7 @@ fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let volts = time_labels(s);
     // One cell on the right for the trigger mark; two when the fine
     // voltage cursors put their names there.
-    let fine_v = s.display.cursor_style == CursorStyle::Fine && s.cursors.mode == CursorMode::Volt;
+    let fine_v = (2..4).any(|i| s.cursors.shown(i) && s.cursors.get(i).style == CursorStyle::Fine);
     let right = if fine_v { 2 } else { 1 };
     let Some(g) = Geometry::fit(inner, label_width(&volts), right) else {
         return;
@@ -572,46 +592,37 @@ fn time_margins(
             x + 1,
         );
     }
-    let cur = Style::default().fg(pal.cursor);
-    let names = ["A", "B"];
-    if s.display.cursor_style == CursorStyle::Classic {
-        // Names inside the plot: at the top, right of a time line; at the
-        // right, on the row above a voltage line.
-        let cur = Style::default().fg(CLASSIC_CURSOR_NAME);
-        let half_h = H_DIVS / 2.0;
-        match s.cursors.mode {
-            CursorMode::Time => {
+    // Cursor names, only the letter: fine dashes put it in the margin (at
+    // the top for a time line, at the right for a voltage line), the
+    // other styles inside the plot (at the top right of a time line, at
+    // the right on the row above a voltage line).
+    let half_h = H_DIVS / 2.0;
+    for i in (0..4).filter(|&i| s.cursors.shown(i)) {
+        let c = s.cursors.get(i);
+        let name = ["A", "B"][i % 2];
+        let style = Style::default().fg(cursor_colors(c, pal).1);
+        let time = CursorSettings::is_time(i);
+        match (c.style == CursorStyle::Fine, time) {
+            (true, true) if g.margins.top >= 1 => {
+                let cx = g.plot.x + plot.col_of(c.position) as u16 + 1;
+                put(buf, cx, g.plot.y - 1, name, style, right_x);
+            }
+            (true, false) if g.margins.right >= 2 => {
+                let cy = g.plot.y + plot.row_of(c.position) as u16;
+                put(buf, right_x + 1, cy, name, style, right_x + 2);
+            }
+            (true, _) => {}
+            (false, true) => {
                 let y = g.plot.y + plot.row_of(half_v - 0.3) as u16;
-                for (i, &x) in s.cursors.t.iter().enumerate() {
-                    let x = g.plot.x + plot.col_of((x + 0.05).min(half_h - 0.2)) as u16;
-                    put(buf, x, y, names[i], cur, right_x);
-                }
+                let x = g.plot.x + plot.col_of((c.position + 0.05).min(half_h - 0.2)) as u16;
+                put(buf, x, y, name, style, right_x);
             }
-            CursorMode::Volt => {
+            (false, false) => {
                 let x = g.plot.x + plot.col_of(half_h - 0.6) as u16;
-                for (i, &y) in s.cursors.v.iter().enumerate() {
-                    let y = g.plot.y + plot.row_of((y + 0.2).min(half_v)) as u16;
-                    put(buf, x, y, names[i], cur, right_x);
-                }
-            }
-            CursorMode::Off => {}
-        }
-        return;
-    }
-    match s.cursors.mode {
-        CursorMode::Time if g.margins.top >= 1 => {
-            for (i, &x) in s.cursors.t.iter().enumerate() {
-                let cx = g.plot.x + plot.col_of(x) as u16 + 1;
-                put(buf, cx, g.plot.y - 1, names[i], cur, right_x);
+                let y = g.plot.y + plot.row_of((c.position + 0.2).min(half_v)) as u16;
+                put(buf, x, y, name, style, right_x);
             }
         }
-        CursorMode::Volt if g.margins.right >= 2 => {
-            for (i, &y) in s.cursors.v.iter().enumerate() {
-                let cy = g.plot.y + plot.row_of(y) as u16;
-                put(buf, right_x + 1, cy, names[i], cur, right_x + 2);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -873,6 +884,37 @@ fn draw_measurements(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         }
         lines.push(Line::from(spans));
     }
+    let cur = cursor_rows(app);
+    let at: Vec<usize> = (0..2).filter(|&i| s.cursors.shown(i)).collect();
+    if !cur.is_empty() {
+        let w = MEAS_LABEL_W as usize;
+        lines.push(Line::styled(
+            "Cursors",
+            Style::default().fg(pal.label).add_modifier(Modifier::BOLD),
+        ));
+        for (label, value) in &cur {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{label:<w$}"), Style::default().fg(pal.label)),
+                Span::raw(format!("{value:>v$}", v = VALUE_W as usize)),
+            ]));
+        }
+        for &i in &at {
+            let label = ["V@A", "V@B"][i];
+            let mut spans = vec![Span::styled(
+                format!("{label:<w$}"),
+                Style::default().fg(pal.label),
+            )];
+            for &t in &traces {
+                let text = value_at_cursor(app, t, i)
+                    .map_or("--".to_string(), |v| fmt_si(v, trace_unit(s, t)));
+                spans.push(Span::styled(
+                    format!("{text:>v$}", v = VALUE_W as usize),
+                    Style::default().fg(pal.trace[t]),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
     f.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" Measure ")),
         area,
@@ -914,49 +956,65 @@ fn draw_channel_line(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         spans.push(channel_span(app, t, pal));
         spans.push(Span::raw(" "));
     }
-    if let Some(text) = cursor_text(app) {
-        spans.push(Span::styled(text, Style::default().fg(pal.cursor)));
-    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Cursor readout, like `ΔT 1 ms  1/ΔT 1 kHz`.
-pub fn cursor_text(app: &App) -> Option<String> {
+/// The cursor readout for the measurement panel: rows of a label and a
+/// value. Time cursors give their time, ΔT and 1/ΔT when both are on;
+/// voltage cursors their voltage on the main trace, ΔV when both are on.
+pub fn cursor_rows(app: &App) -> Vec<(&'static str, String)> {
     let s = &app.scope.settings;
-    match s.cursors.mode {
-        CursorMode::Off => None,
-        CursorMode::Time => {
-            let tdiv = s.time_per_div();
-            let (a, b) = (s.cursors.t[0] * tdiv, s.cursors.t[1] * tdiv);
-            let d = (b - a).abs();
-            let inv = if d > 0.0 {
-                fmt_si(1.0 / d, "Hz")
-            } else {
-                "--".into()
-            };
-            Some(format!(
-                "│ A {} B {} ΔT {} 1/ΔT {}",
-                fmt_si(a, "s"),
-                fmt_si(b, "s"),
-                fmt_si(d, "s"),
-                inv
-            ))
-        }
-        CursorMode::Volt => {
-            let t = main_trace(app).unwrap_or(0);
-            let (scale, offset) = trace_scale(s, t);
-            let unit = trace_unit(s, t);
-            let v = |y: f64| (y - offset) * scale;
-            let (a, b) = (v(s.cursors.v[0]), v(s.cursors.v[1]));
-            Some(format!(
-                "│ {} A {} B {} ΔV {}",
-                NAMES[t],
-                fmt_si(a, unit),
-                fmt_si(b, unit),
-                fmt_si((b - a).abs(), unit)
-            ))
+    let c = &s.cursors;
+    let mut rows = Vec::new();
+    let tdiv = s.time_per_div();
+    let t = |i: usize| c.get(i).position * tdiv;
+    for (i, label) in [(0, "A t"), (1, "B t")] {
+        if c.shown(i) {
+            rows.push((label, fmt_si(t(i), "s")));
         }
     }
+    if c.shown(0) && c.shown(1) {
+        let d = (t(1) - t(0)).abs();
+        rows.push(("ΔT", fmt_si(d, "s")));
+        let inv = if d > 0.0 {
+            fmt_si(1.0 / d, "Hz")
+        } else {
+            "--".into()
+        };
+        rows.push(("1/ΔT", inv));
+    }
+    let tr = main_trace(app).unwrap_or(0);
+    let (scale, offset) = trace_scale(s, tr);
+    let unit = trace_unit(s, tr);
+    let v = |i: usize| (c.get(i).position - offset) * scale;
+    for (i, label) in [(2, "A v"), (3, "B v")] {
+        if c.shown(i) {
+            rows.push((label, fmt_si(v(i), unit)));
+        }
+    }
+    if c.shown(2) && c.shown(3) {
+        rows.push(("ΔV", fmt_si((v(3) - v(2)).abs(), unit)));
+    }
+    rows
+}
+
+/// Value of trace `t` at time cursor `i` (0 = A, 1 = B), from the frame
+/// on screen, interpolated between samples.
+pub fn value_at_cursor(app: &App, t: usize, i: usize) -> Option<f64> {
+    let s = &app.scope.settings;
+    let f = app.scope.frame.as_ref()?;
+    let tr = f.traces[t].as_ref()?;
+    if tr.is_empty() || f.dt <= 0.0 {
+        return None;
+    }
+    let k = (f.time_at(s.cursors.get(i).position, s) - f.t0) / f.dt;
+    if k < 0.0 || k > (tr.len() - 1) as f64 {
+        return None;
+    }
+    let j = (k.floor() as usize).min(tr.len() - 1);
+    let next = tr[(j + 1).min(tr.len() - 1)];
+    let frac = k - j as f64;
+    Some(tr[j] + (next - tr[j]) * frac)
 }
 
 fn draw_time_line(f: &mut TermFrame, app: &App, area: Rect) {
@@ -1334,11 +1392,11 @@ pub const KEYS: [(&str, &str); 47] = [
     ("w", "FFT window"),
     ("x", "XY mode"),
     ("M", "measurement panel"),
-    ("v", "cursors: off / time / voltage"),
-    ("h l", "move time cursor A"),
-    ("H L", "move time cursor B"),
-    ("j k", "move voltage cursor A"),
-    ("J K", "move voltage cursor B"),
+    ("v", "hide / show the cursors (Settings › Cursors)"),
+    ("h l", "move time cursor A (when on)"),
+    ("H L", "move time cursor B (when on)"),
+    ("j k", "move voltage cursor A (when on)"),
+    ("J K", "move voltage cursor B (when on)"),
     ("A", "averaging: 1 2 4 8 16 32 64"),
     ("P", "persistence: 0 2 4 8 16 traces"),
     ("d", "dots / lines"),

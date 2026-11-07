@@ -17,7 +17,9 @@ Features:
   CH1 or CH2, level and position, with hysteresis against noise
 - Measurements: Vpp, max, min, mean, RMS, AC RMS, amplitude, top, base,
   frequency, period, duty cycle, pulse widths, rise and fall time
-- Time and voltage cursors with ΔT, 1/ΔT and ΔV
+- Four cursors (time A and B, voltage A and B), each with its own on/off,
+  line style and colour; ΔT, 1/ΔT, ΔV and the value of each channel at
+  the time cursors in the measurement panel
 - Spectrum (FFT) view with Rectangular, Hann, Hamming, Blackman and flat top
   windows, in dBV, with peak readout and zoom
 - XY mode
@@ -135,11 +137,11 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `w` | FFT window |
 | `x` | XY mode |
 | `M` | measurement panel |
-| `v` | cursors: off / time / voltage |
-| `h` `l` | move time cursor A |
-| `H` `L` | move time cursor B |
-| `j` `k` | move voltage cursor A |
-| `J` `K` | move voltage cursor B |
+| `v` | hide / show all cursors (each keeps its own on/off) |
+| `h` `l` | move time cursor A (when it is on) |
+| `H` `L` | move time cursor B (when it is on) |
+| `j` `k` | move voltage cursor A (when it is on) |
+| `J` `K` | move voltage cursor B (when it is on) |
 | `A` | averaging: 1 2 4 8 16 32 64 |
 | `P` | persistence: 0 2 4 8 16 traces |
 | `d` | dots / lines |
@@ -169,7 +171,7 @@ The labels on the left are the volts of the selected trace at each
 division line; the labels below are the time from the trigger point.
 The margins are kept small, so the plot gets the room: the left labels
 are only as wide as the longest one, the `1▸` markers sit right next to
-them, and the right side has one column for `◂` (two with the fine
+them, and the right side has one column for `◂` (two with fine dashes
 voltage cursors, whose names go there).
 
 ## Settings panel
@@ -244,9 +246,7 @@ time view and the spectrum:
 | `ascii lines` | no braille, for fonts that draw it badly: one character per cell, `\|` on steep runs, `/` and `\` on slopes, `_` `-` `‾` for flat parts at the bottom, middle or top of the cell; dots mode puts `.` `·` `'` per sample |
 | `box lines` | no braille: one connected line of box-drawing characters, which the terminal joins cell to cell. `─` for flat runs at the level of the cell row, `│` for steep runs and noise, `╭` `╮` `╰` `╯` where the line turns, `╵` `╷` where a run stops in a cell; dots mode puts `•` per sample |
 
-Display › Cursor style (also under Cursors) picks `classic` (grey dashes,
-`A`/`B` inside the plot, the default) or `fine dashes` (short dashes,
-names in the margin). Dots (`d`), persistence (`P`) and interpolation
+Dots (`d`), persistence (`P`) and interpolation
 (`z`) work with every style. Settings files from older versions still
 load: the old style names `Classic` and `Thin` read as `braille thin`,
 `Bold` as `braille bold`.
@@ -275,6 +275,36 @@ the same hue (about 5 steps); in 16 colours the newer half is the normal
 colour and the older half also has the dim attribute. With box lines, old
 traces of different ages still join where they cross (the joined cell
 takes the newer colour), so they stay connected lines.
+
+## Cursors
+
+There are four cursors: time A and B (vertical lines) and voltage A and B
+(horizontal lines, in volts of the selected trace). Each has its own
+setting in Settings › Cursors: on/off with its position (`Time A`: Space
+turns it on or off, `j` `k` or a typed value move it, and typing a
+position turns it on), a line style and a colour. That is 12 settings,
+so the category is no higher than the others. All are off at first.
+
+| Style | Look |
+|---|---|
+| `classic` (default) | dashes of a fixed length, the name inside the plot |
+| `fine dashes` | short dashes on every cell, the name in the margin |
+| `solid` | a solid line, the name inside the plot |
+| `dotted` | one dot per cell (every second cell across), the name inside the plot |
+
+Colours: `grey` (default: the grey line and white name of the first
+versions), white, yellow, cyan, magenta, green, red, blue. The plot shows
+only the letter `A` or `B` next to each line. `v` hides all cursors and
+shows them again, each with its own on/off; `h` `l` `H` `L` `j` `k` `J`
+`K` move only the cursors that are on. The values are in the Cursors
+section of the measurement panel: `A t` `B t` (time from the trigger
+point), `ΔT` and `1/ΔT` when both time cursors are on, `A v` `B v`, and
+`ΔV` when both voltage cursors are on; and `V@A` `V@B`, the value of each
+channel at a time cursor. The log view uses the style and colour of time
+cursors A and B. Settings files from older versions still load: the old
+cursor mode `Time` turns time cursors A and B on, `Volt` the voltage
+cursors, and the old global cursor style becomes the style of each
+cursor.
 
 ## Envelope logger
 

@@ -10,7 +10,7 @@ use ratatui::{
 
 use super::{
     bottom_labels, channel_span, compact, draw_order, grid, label_width, labels, layer_of,
-    left_labels, put, trace_scale, CLASSIC_CURSOR, CLASSIC_CURSOR_NAME, NAMES,
+    left_labels, put, trace_scale, NAMES,
 };
 use crate::app::App;
 use crate::logger::{self as lg, writer::LogState};
@@ -167,8 +167,7 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         }
     }
 
-    // Cursors.
-    let classic = s.display.cursor_style == CursorStyle::Classic;
+    // Cursors: A and B in the style and colour of time cursors A and B.
     let cursor_x: Vec<Option<f64>> = v
         .cur
         .iter()
@@ -177,16 +176,13 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
             (v.cursors && dc >= 0.0 && dc <= w as f64).then(|| x_of(dc))
         })
         .collect();
-    for x in cursor_x.iter().flatten() {
-        if classic {
-            plot.dashed_classic(
-                (*x, -half_v),
-                (*x, half_v),
-                plot::LAYER_CURSOR,
-                CLASSIC_CURSOR,
-            );
-        } else {
-            plot.dashed_v(*x, plot::LAYER_CURSOR, pal.cursor);
+    for (i, x) in cursor_x.iter().enumerate() {
+        if let Some(x) = x {
+            let c = Cursor {
+                position: *x,
+                ..*s.cursors.get(i.min(1))
+            };
+            super::draw_cursor_line(&mut plot, &c, true, pal);
         }
     }
 
@@ -276,27 +272,15 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     for (i, x) in cursor_x.iter().enumerate() {
         let Some(x) = x else { continue };
         let name = ["A", "B"][i];
-        if classic {
+        let c = s.cursors.get(i.min(1));
+        let style = Style::default().fg(super::cursor_colors(c, pal).1);
+        if c.style != CursorStyle::Fine {
             let y = g.plot.y + plot.row_of(half_v - 0.3) as u16;
             let cx = g.plot.x + plot.col_of((x + 0.05).min(H_DIVS / 2.0 - 0.2)) as u16;
-            put(
-                buf,
-                cx,
-                y,
-                name,
-                Style::default().fg(CLASSIC_CURSOR_NAME),
-                right_x,
-            );
+            put(buf, cx, y, name, style, right_x);
         } else if g.margins.top >= 1 {
             let cx = g.plot.x + plot.col_of(*x) as u16 + 1;
-            put(
-                buf,
-                cx,
-                g.plot.y - 1,
-                name,
-                Style::default().fg(pal.cursor),
-                right_x,
-            );
+            put(buf, cx, g.plot.y - 1, name, style, right_x);
         }
     }
 }

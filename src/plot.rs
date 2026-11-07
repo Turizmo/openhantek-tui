@@ -965,24 +965,30 @@ impl Plot {
         }
     }
 
+    /// Vertical line at screen x (divisions): the dots `on` picks, by dot row.
+    pub fn pattern_v(&mut self, x_div: f64, on: impl Fn(i64) -> bool, layer: u8, color: Color) {
+        let x = (self.px(x_div).floor() as i64).min(self.dots_w() as i64 - 1);
+        for y in (0..self.dots_h() as i64).filter(|y| on(*y)) {
+            self.set(x, y, layer, color);
+        }
+    }
+
+    /// Horizontal line at screen y (divisions): the dots `on` picks, by dot column.
+    pub fn pattern_h(&mut self, y_div: f64, on: impl Fn(i64) -> bool, layer: u8, color: Color) {
+        let y = (self.py(y_div).floor() as i64).min(self.dots_h() as i64 - 1);
+        for x in (0..self.dots_w() as i64).filter(|x| on(*x)) {
+            self.set(x, y, layer, color);
+        }
+    }
+
     /// Dashed vertical line at screen x (divisions).
     pub fn dashed_v(&mut self, x_div: f64, layer: u8, color: Color) {
-        let x = self.px(x_div).floor() as i64;
-        for y in 0..self.dots_h() as i64 {
-            if y % 4 < 2 {
-                self.set(x, y, layer, color);
-            }
-        }
+        self.pattern_v(x_div, |y| y % 4 < 2, layer, color);
     }
 
     /// Dashed horizontal line at screen y (divisions).
     pub fn dashed_h(&mut self, y_div: f64, layer: u8, color: Color) {
-        let y = self.py(y_div).floor() as i64;
-        for x in 0..self.dots_w() as i64 {
-            if x % 4 < 2 {
-                self.set(x, y, layer, color);
-            }
-        }
+        self.pattern_h(y_div, |x| x % 4 < 2, layer, color);
     }
 
     /// The classic cursor line from `a` to `b` (in divisions): 81 points

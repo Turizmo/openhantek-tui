@@ -64,16 +64,19 @@ pub enum Field {
     Persistence,
     Xy,
     Colors,
-    CursorLook,
     GridLook,
     GridExtent,
     GridBrightness,
     SpecOn,
     SpecWindow,
     SpecZoom,
-    CursorMode,
-    CursorT(usize),
-    CursorV(usize),
+    /// Cursor `i` (time A, time B, voltage A, voltage B): its position,
+    /// and Space turns it on or off.
+    CursorPos(usize),
+    /// Line style of cursor `i`.
+    CursorLook(usize),
+    /// Colour of cursor `i`.
+    CursorColour(usize),
     MeasPanel,
     CalFreq,
     DevModel,
@@ -203,7 +206,6 @@ pub fn categories() -> Vec<Category> {
                 Persistence,
                 Xy,
                 Colors,
-                CursorLook,
                 GridLook,
                 GridExtent,
                 GridBrightness,
@@ -215,14 +217,9 @@ pub fn categories() -> Vec<Category> {
         },
         Category {
             name: "Cursors",
-            fields: vec![
-                CursorMode,
-                CursorT(0),
-                CursorT(1),
-                CursorV(0),
-                CursorV(1),
-                CursorLook,
-            ],
+            fields: (0..4)
+                .flat_map(|i| [CursorPos(i), CursorLook(i), CursorColour(i)])
+                .collect(),
         },
         Category {
             name: "Measurements",
@@ -340,18 +337,24 @@ impl Field {
             Persistence => "Persistence",
             Xy => "XY mode",
             Colors => "Colours",
-            CursorLook => "Cursor style",
             GridLook => "Grid style",
             GridExtent => "Grid lines",
             GridBrightness => "Grid brightness",
             SpecOn => "Show spectrum",
             SpecWindow => "Window",
             SpecZoom => "Span",
-            CursorMode => "Cursors",
-            CursorT(0) => "Time A",
-            CursorT(_) => "Time B",
-            CursorV(0) => "Voltage A",
-            CursorV(_) => "Voltage B",
+            CursorPos(0) => "Time A",
+            CursorPos(1) => "Time B",
+            CursorPos(2) => "Voltage A",
+            CursorPos(_) => "Voltage B",
+            CursorLook(0) => "Time A style",
+            CursorLook(1) => "Time B style",
+            CursorLook(2) => "Voltage A style",
+            CursorLook(_) => "Voltage B style",
+            CursorColour(0) => "Time A colour",
+            CursorColour(1) => "Time B colour",
+            CursorColour(2) => "Voltage A colour",
+            CursorColour(_) => "Voltage B colour",
             MeasPanel => "Show panel",
             CalFreq => "Frequency",
             DevModel => "Model",
@@ -417,13 +420,13 @@ impl Field {
             GridLook => "Look of the division lines. The center cross is brighter in every style.",
             GridExtent => "points: marks where division lines cross. full: every division line across the whole plot.",
             GridBrightness => "How bright the grid is. Traces are always drawn over it.",
-            CursorLook => "classic: grey dashes, names inside the plot. fine dashes: short dashes, names in the margin.",
+            CursorLook(_) => "classic: dashes, name inside the plot. fine dashes: short dashes, name in the margin. solid, dotted: name inside.",
+            CursorColour(_) => "Colour of the cursor line and its name.",
             SpecOn => "Show the spectrum (FFT) below the trace. Key f.",
             SpecWindow => "Window function for the FFT. Key w.",
             SpecZoom => "Highest frequency on the spectrum screen. Key F.",
-            CursorMode => "Two time lines or two voltage lines, with the difference. Key v.",
-            CursorT(_) => "Time from the screen center, in seconds. Keys h l H L.",
-            CursorV(_) => "Voltage of the selected trace. Keys j k J K.",
+            CursorPos(i) if i < 2 => "Space: on/off. Time from the screen center, in seconds. Keys h l H L; v hides all.",
+            CursorPos(_) => "Space: on/off. Voltage of the selected trace. Keys j k J K; v hides all.",
             MeasPanel => "The measurement panel on the right. Key M.",
             CalFreq => "Frequency of the 2 Vpp square wave on the calibration pins. Keys g G.",
             DevModel | DevSerial | DevFirmware | DevState => "Read from the scope.",
@@ -459,8 +462,9 @@ impl Field {
         use Field::*;
         match self {
             ChEnabled(_) | ChInvert(_) | MathEnabled | Dots | Xy | SpecOn | MeasPanel => Kind::Bool,
-            ChOffset(_) | MathOffset | TrigLevel | TrigPosition | CursorT(_) | CursorV(_)
-            | CalFreq => Kind::Number,
+            ChOffset(_) | MathOffset | TrigLevel | TrigPosition | CursorPos(_) | CalFreq => {
+                Kind::Number
+            }
             Roll | DevModel | DevSerial | DevFirmware | DevState | DevCalibration | DevRate
             | ExportDir | SettingsFile | LogDir | LogFree => Kind::Info,
             Act(_) => Kind::Action,
@@ -522,7 +526,11 @@ impl Field {
                 .iter()
                 .map(|m| m.name().to_string())
                 .collect(),
-            CursorLook => crate::settings::CursorStyle::ALL
+            CursorLook(_) => crate::settings::CursorStyle::ALL
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect(),
+            CursorColour(_) => CursorColor::ALL
                 .iter()
                 .map(|m| m.name().to_string())
                 .collect(),
@@ -542,7 +550,6 @@ impl Field {
                     None => format!("Nyquist / {}", 1u32 << z),
                 })
                 .collect(),
-            CursorMode => list(&["off", "time", "voltage"]),
             LogStep => crate::logger::STEPS
                 .iter()
                 .map(|t| crate::logger::fmt_step(*t))
@@ -629,20 +636,13 @@ impl Field {
             Persistence => index_of(&PERSISTENCE, &s.display.persistence),
             Colors => index_of(&ColorMode::ALL, &s.display.colors),
             Style(t) => index_of(&crate::settings::TraceStyle::ALL, &s.display.trace_style[t]),
-            CursorLook => index_of(&crate::settings::CursorStyle::ALL, &s.display.cursor_style),
+            CursorLook(i) => index_of(&crate::settings::CursorStyle::ALL, &s.cursors.get(i).style),
+            CursorColour(i) => index_of(&CursorColor::ALL, &s.cursors.get(i).color),
             GridLook => index_of(&GridStyle::ALL, &s.display.grid_style),
             GridExtent => index_of(&crate::settings::GridExtent::ALL, &s.display.grid_extent),
             GridBrightness => index_of(&GRID_BRIGHTNESS, &s.display.grid_brightness),
             SpecWindow => index_of(&Window::ALL, &s.display.window),
             SpecZoom => s.display.spectrum_zoom as usize,
-            CursorMode => index_of(
-                &[
-                    crate::settings::CursorMode::Off,
-                    crate::settings::CursorMode::Time,
-                    crate::settings::CursorMode::Volt,
-                ],
-                &s.cursors.mode,
-            ),
             LogStep => s.logger.step_idx(),
             LogLimit => s.logger.limit_idx(),
             LogAxis => index_of(&TimeAxis::ALL, &s.logger.time_axis),
@@ -701,9 +701,12 @@ impl Field {
                 let all = crate::settings::TraceStyle::ALL;
                 s.display.trace_style[t] = all[i.min(all.len() - 1)]
             }
-            CursorLook => {
+            CursorLook(c) => {
                 let all = crate::settings::CursorStyle::ALL;
-                s.display.cursor_style = all[i.min(all.len() - 1)]
+                s.cursors.get_mut(c).style = all[i.min(all.len() - 1)]
+            }
+            CursorColour(c) => {
+                s.cursors.get_mut(c).color = CursorColor::ALL[i.min(CursorColor::ALL.len() - 1)]
             }
             GridLook => s.display.grid_style = GridStyle::ALL[i.min(GridStyle::ALL.len() - 1)],
             GridExtent => {
@@ -715,13 +718,6 @@ impl Field {
             }
             SpecWindow => s.display.window = Window::ALL[i.min(Window::ALL.len() - 1)],
             SpecZoom => s.display.spectrum_zoom = (i as u32).min(MAX_SPECTRUM_ZOOM),
-            CursorMode => {
-                s.cursors.mode = [
-                    crate::settings::CursorMode::Off,
-                    crate::settings::CursorMode::Time,
-                    crate::settings::CursorMode::Volt,
-                ][i.min(2)]
-            }
             LogStep => {
                 let all = &crate::logger::STEPS;
                 s.logger.step = all[i.min(all.len() - 1)]
@@ -741,9 +737,10 @@ impl Field {
         use Field::*;
         match self {
             ChOffset(_) | MathOffset => "div",
-            TrigLevel | CursorV(_) => "V",
+            TrigLevel => "V",
+            CursorPos(i) if i >= 2 => "V",
             TrigPosition => "%",
-            CursorT(_) => "s",
+            CursorPos(_) => "s",
             CalFreq => "Hz",
             _ => "",
         }
@@ -767,10 +764,10 @@ impl Field {
             MathOffset => s.math.offset,
             TrigLevel => s.trigger.level,
             TrigPosition => s.trigger.position * 100.0,
-            CursorT(i) => s.cursors.t[i] * s.time_per_div(),
-            CursorV(i) => {
+            CursorPos(i) if i < 2 => s.cursors.get(i).position * s.time_per_div(),
+            CursorPos(i) => {
                 let (scale, offset) = Self::cursor_scale(s);
-                (s.cursors.v[i] - offset) * scale
+                (s.cursors.get(i).position - offset) * scale
             }
             CalFreq => s.cal_freq as f64,
             _ => 0.0,
@@ -798,10 +795,12 @@ impl Field {
             MathOffset => s.math.offset = v.clamp(-half_v, half_v),
             TrigLevel => s.trigger.level = v,
             TrigPosition => s.trigger.position = (v / 100.0).clamp(0.0, 1.0),
-            CursorT(i) => s.cursors.t[i] = (v / s.time_per_div()).clamp(-half_h, half_h),
-            CursorV(i) => {
+            CursorPos(i) if i < 2 => {
+                s.cursors.get_mut(i).position = (v / s.time_per_div()).clamp(-half_h, half_h)
+            }
+            CursorPos(i) => {
                 let (scale, offset) = Self::cursor_scale(s);
-                s.cursors.v[i] = (v / scale + offset).clamp(-half_v, half_v);
+                s.cursors.get_mut(i).position = (v / scale + offset).clamp(-half_v, half_v);
             }
             // The calibration output has fixed steps: the nearest one.
             CalFreq if v > 0.0 => {
@@ -814,11 +813,11 @@ impl Field {
             CalFreq => return Err("the frequency must be above 0".into()),
             _ => return Err(format!("{} is not a number", self.label())),
         }
-        // Typing a cursor position turns that kind of cursor on.
-        match self {
-            CursorT(_) => s.cursors.mode = crate::settings::CursorMode::Time,
-            CursorV(_) => s.cursors.mode = crate::settings::CursorMode::Volt,
-            _ => {}
+        // Setting a cursor position turns that cursor on, and shows the
+        // cursors.
+        if let CursorPos(i) = self {
+            s.cursors.get_mut(i).enabled = true;
+            s.cursors.hidden = false;
         }
         Ok(())
     }
@@ -842,6 +841,9 @@ impl Field {
             Field::ChOffset(_) | Field::MathOffset => format!("± {:.1} div", self.step(s)),
             Field::TrigPosition => format!("± {:.0} %", self.step(s)),
             Field::CalFreq => "next / previous step".into(),
+            Field::CursorPos(_) => {
+                format!("± {} · space on/off", fmt_si(self.step(s), self.unit()))
+            }
             _ => format!("± {}", fmt_si(self.step(s), self.unit())),
         }
     }
@@ -853,8 +855,8 @@ impl Field {
             ChOffset(_) | MathOffset => 0.1,
             TrigLevel => 0.1 * s.channels[s.trigger.source.min(1)].volts_per_div(),
             TrigPosition => 5.0,
-            CursorT(_) => 0.1 * s.time_per_div(),
-            CursorV(_) => 0.1 * Self::cursor_scale(s).0,
+            CursorPos(i) if i < 2 => 0.1 * s.time_per_div(),
+            CursorPos(_) => 0.1 * Self::cursor_scale(s).0,
             _ => 0.0,
         }
     }
@@ -873,6 +875,9 @@ impl Field {
                 .cloned()
                 .unwrap_or_default(),
             Kind::Number => match self {
+                CursorPos(i) if !s.cursors.get(i).enabled => {
+                    format!("off · {}", fmt_si(self.number(s), self.unit()))
+                }
                 ChOffset(_) | MathOffset => format!("{:.1} div", self.number(s)),
                 TrigPosition => format!("{:.0} %", self.number(s)),
                 _ => fmt_si(self.number(s), self.unit()),
@@ -1187,15 +1192,15 @@ impl Panel {
                 self.focus = Focus::Items;
                 Outcome::None
             }
-            KeyCode::Char(' ') if self.focus == Focus::Items => self.toggle(s, d, 1),
+            KeyCode::Char(' ') if self.focus == Focus::Items => self.toggle(s, d, 1, true),
             KeyCode::Char('+') | KeyCode::Char('=') if self.focus == Focus::Items => {
                 // `=` types a value on number fields; `+` steps them.
                 match (key.code, self.current().map(Field::kind)) {
                     (KeyCode::Char('='), Some(Kind::Number)) => self.open_input(s),
-                    _ => self.toggle(s, d, 1),
+                    _ => self.toggle(s, d, 1, false),
                 }
             }
-            KeyCode::Char('-') if self.focus == Focus::Items => self.toggle(s, d, -1),
+            KeyCode::Char('-') if self.focus == Focus::Items => self.toggle(s, d, -1, false),
             KeyCode::Char('i') if self.focus == Focus::Items => match self.current() {
                 Some(f) if f.kind() == Kind::Number => self.open_input(s),
                 _ => Outcome::None,
@@ -1336,7 +1341,8 @@ impl Panel {
     }
 
     /// Space, + and -: toggle a bool, step a choice or a number.
-    fn toggle(&mut self, s: &mut Settings, d: &DeviceInfo, dir: i64) -> Outcome {
+    /// `space`: the key was Space, which turns a cursor on or off.
+    fn toggle(&mut self, s: &mut Settings, d: &DeviceInfo, dir: i64, space: bool) -> Outcome {
         let Some(f) = self.current() else {
             return Outcome::None;
         };
@@ -1348,7 +1354,16 @@ impl Panel {
                 let i = (f.index(s) as i64 + dir).rem_euclid(n.max(1));
                 f.set_index(s, i as usize);
             }
-            Kind::Number => f.step_number(s, dir),
+            Kind::Number => match f {
+                Field::CursorPos(i) if space => {
+                    let c = s.cursors.get_mut(i);
+                    c.enabled = !c.enabled;
+                    if c.enabled {
+                        s.cursors.hidden = false;
+                    }
+                }
+                _ => f.step_number(s, dir),
+            },
             Kind::Action => {
                 if let Field::Act(a) = f {
                     return Outcome::Action(a);
@@ -1399,6 +1414,17 @@ impl Panel {
         Some(match key.code {
             KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('+') => step(s, 1),
             KeyCode::Char('j') | KeyCode::Down => step(s, -1),
+            KeyCode::Char(' ') if matches!(f, Field::CursorPos(_)) => {
+                let c = s.cursors.get_mut(match f {
+                    Field::CursorPos(i) => i,
+                    _ => 0,
+                });
+                c.enabled = !c.enabled;
+                if c.enabled {
+                    s.cursors.hidden = false;
+                }
+                Outcome::Changed
+            }
             // Digits, a point or a minus start a new value.
             KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
                 self.input = Some(c.to_string());
@@ -1869,14 +1895,48 @@ mod tests {
     fn cursor_values_in_time_and_volts() {
         let mut s = Settings::default();
         // 1 ms/div: 2 ms is 2 divisions.
-        Field::CursorT(1).set_number(&mut s, 2e-3, "s").unwrap();
-        assert!((s.cursors.t[1] - 2.0).abs() < 1e-9);
-        assert_eq!(s.cursors.mode, CursorMode::Time);
-        assert!((Field::CursorT(1).number(&s) - 2e-3).abs() < 1e-12);
+        Field::CursorPos(1).set_number(&mut s, 2e-3, "s").unwrap();
+        assert!((s.cursors.time_b.position - 2.0).abs() < 1e-9);
+        assert!(s.cursors.time_b.enabled && !s.cursors.time_a.enabled);
+        assert!((Field::CursorPos(1).number(&s) - 2e-3).abs() < 1e-12);
         // CH1 at 1 V/div with its 0 V line at +2 div: 1 V is at +3 div.
-        Field::CursorV(0).set_number(&mut s, 1.0, "V").unwrap();
-        assert!((s.cursors.v[0] - 3.0).abs() < 1e-9);
-        assert_eq!(s.cursors.mode, CursorMode::Volt);
+        s.cursors.hidden = true;
+        Field::CursorPos(2).set_number(&mut s, 1.0, "V").unwrap();
+        assert!((s.cursors.volt_a.position - 3.0).abs() < 1e-9);
+        assert!(s.cursors.volt_a.enabled && !s.cursors.hidden);
+    }
+
+    #[test]
+    fn cursors_category_has_on_style_and_colour_per_cursor() {
+        let cats = categories();
+        let c = cats.iter().find(|c| c.name == "Cursors").unwrap();
+        assert_eq!(c.fields.len(), 12);
+        let mut s = Settings::default();
+        let mut p = Panel::new();
+        goto(&mut p, &mut s, "Cursors", "Voltage B");
+        assert_eq!(p.current(), Some(Field::CursorPos(3)));
+        assert!(Field::CursorPos(3)
+            .value(&s, &DeviceInfo::default())
+            .starts_with("off"));
+        // Space turns it on and off; + moves it.
+        assert_eq!(key(&mut p, &mut s, KeyCode::Char(' ')), Outcome::Changed);
+        assert!(s.cursors.volt_b.enabled);
+        key(&mut p, &mut s, KeyCode::Char('+'));
+        assert!((s.cursors.volt_b.position - 1.1).abs() < 1e-9);
+        // Also in the value column.
+        key(&mut p, &mut s, KeyCode::Char('l'));
+        key(&mut p, &mut s, KeyCode::Char(' '));
+        assert!(!s.cursors.volt_b.enabled);
+        key(&mut p, &mut s, KeyCode::Char('h'));
+        // Style and colour of each cursor.
+        key(&mut p, &mut s, KeyCode::Char('j'));
+        assert_eq!(p.current(), Some(Field::CursorLook(3)));
+        key(&mut p, &mut s, KeyCode::Char(' '));
+        assert_eq!(s.cursors.volt_b.style, CursorStyle::Fine);
+        assert_eq!(s.cursors.volt_a.style, CursorStyle::Classic);
+        key(&mut p, &mut s, KeyCode::Char('j'));
+        key(&mut p, &mut s, KeyCode::Char('-'));
+        assert_eq!(s.cursors.volt_b.color, CursorColor::Blue);
     }
 
     #[test]

@@ -161,43 +161,198 @@ impl MathSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// The cursor mode of old settings files (one switch for all cursors).
+/// It only loads: `Time` turns time cursors A and B on, `Volt` the
+/// voltage cursors, `Off` none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Default)]
 pub enum CursorMode {
     #[default]
     Off,
-    /// Two vertical lines: time and frequency between them.
     Time,
-    /// Two horizontal lines: voltage between them.
     Volt,
 }
 
-impl CursorMode {
-    pub fn next(self) -> Self {
+/// Which cursor: time A, time B, voltage A, voltage B.
+pub const CURSOR_NAMES: [&str; 4] = ["Time A", "Time B", "Voltage A", "Voltage B"];
+
+/// Cursor colours: a small palette that also works with 16 colours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CursorColor {
+    /// The grey of the first versions.
+    #[default]
+    Grey,
+    White,
+    Yellow,
+    Cyan,
+    Magenta,
+    Green,
+    Red,
+    Blue,
+}
+
+impl CursorColor {
+    pub const ALL: [CursorColor; 8] = [
+        CursorColor::Grey,
+        CursorColor::White,
+        CursorColor::Yellow,
+        CursorColor::Cyan,
+        CursorColor::Magenta,
+        CursorColor::Green,
+        CursorColor::Red,
+        CursorColor::Blue,
+    ];
+
+    pub fn name(self) -> &'static str {
         match self {
-            CursorMode::Off => CursorMode::Time,
-            CursorMode::Time => CursorMode::Volt,
-            CursorMode::Volt => CursorMode::Off,
+            CursorColor::Grey => "grey",
+            CursorColor::White => "white",
+            CursorColor::Yellow => "yellow",
+            CursorColor::Cyan => "cyan",
+            CursorColor::Magenta => "magenta",
+            CursorColor::Green => "green",
+            CursorColor::Red => "red",
+            CursorColor::Blue => "blue",
         }
     }
 }
 
+/// One cursor line.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cursor {
+    pub enabled: bool,
+    /// Position in divisions from the screen center (x for time cursors,
+    /// y for voltage cursors).
+    pub position: f64,
+    pub style: CursorStyle,
+    pub color: CursorColor,
+}
+
+impl Cursor {
+    fn at(position: f64) -> Self {
+        Self {
+            enabled: false,
+            position,
+            style: CursorStyle::Classic,
+            color: CursorColor::Grey,
+        }
+    }
+}
+
+/// The four cursors. `v` hides all of them and shows them again, each
+/// with its own `enabled`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "CursorFile")]
 pub struct CursorSettings {
-    pub mode: CursorMode,
-    /// Time cursors, in divisions from the screen center.
-    pub t: [f64; 2],
-    /// Voltage cursors, in divisions from the screen center.
-    pub v: [f64; 2],
+    /// All cursors hidden (key `v`); `enabled` of each stays.
+    pub hidden: bool,
+    pub time_a: Cursor,
+    pub time_b: Cursor,
+    pub volt_a: Cursor,
+    pub volt_b: Cursor,
+    /// Loaded from a file of the old format: the old global cursor style
+    /// (`display.cursor_style`) still has to be applied.
+    #[serde(skip)]
+    pub legacy: bool,
 }
 
 impl Default for CursorSettings {
     fn default() -> Self {
         Self {
-            mode: CursorMode::Off,
-            t: [-2.0, 2.0],
-            v: [-1.0, 1.0],
+            hidden: false,
+            time_a: Cursor::at(-2.0),
+            time_b: Cursor::at(2.0),
+            volt_a: Cursor::at(-1.0),
+            volt_b: Cursor::at(1.0),
+            legacy: false,
         }
+    }
+}
+
+impl CursorSettings {
+    /// Cursor `i`: 0 time A, 1 time B, 2 voltage A, 3 voltage B.
+    pub fn get(&self, i: usize) -> &Cursor {
+        match i {
+            0 => &self.time_a,
+            1 => &self.time_b,
+            2 => &self.volt_a,
+            _ => &self.volt_b,
+        }
+    }
+
+    pub fn get_mut(&mut self, i: usize) -> &mut Cursor {
+        match i {
+            0 => &mut self.time_a,
+            1 => &mut self.time_b,
+            2 => &mut self.volt_a,
+            _ => &mut self.volt_b,
+        }
+    }
+
+    /// True when cursor `i` is on screen: enabled and not hidden.
+    pub fn shown(&self, i: usize) -> bool {
+        !self.hidden && self.get(i).enabled
+    }
+
+    /// True when cursor `i` is a time cursor (a vertical line).
+    pub fn is_time(i: usize) -> bool {
+        i < 2
+    }
+}
+
+/// One cursor as a file has it: every field may be missing.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default)]
+struct CursorEntry {
+    enabled: Option<bool>,
+    position: Option<f64>,
+    style: Option<CursorStyle>,
+    color: Option<CursorColor>,
+}
+
+/// The `[cursors]` table of a file, new or old format.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct CursorFile {
+    hidden: bool,
+    time_a: Option<CursorEntry>,
+    time_b: Option<CursorEntry>,
+    volt_a: Option<CursorEntry>,
+    volt_b: Option<CursorEntry>,
+    /// Old format: one mode for all, positions in two pairs.
+    mode: Option<CursorMode>,
+    t: Option<[f64; 2]>,
+    v: Option<[f64; 2]>,
+}
+
+impl From<CursorFile> for CursorSettings {
+    fn from(f: CursorFile) -> Self {
+        let mut c = CursorSettings {
+            hidden: f.hidden,
+            ..CursorSettings::default()
+        };
+        let entries = [f.time_a, f.time_b, f.volt_a, f.volt_b];
+        c.legacy = entries.iter().all(|e| e.is_none());
+        let mode = f.mode.unwrap_or_default();
+        for (i, e) in entries.iter().enumerate() {
+            let time = CursorSettings::is_time(i);
+            let cur = c.get_mut(i);
+            // Old files: positions from `t` and `v`, on from `mode`.
+            if let Some(p) = if time { f.t } else { f.v } {
+                cur.position = p[i % 2];
+            }
+            cur.enabled = if time {
+                mode == CursorMode::Time
+            } else {
+                mode == CursorMode::Volt
+            };
+            if let Some(e) = e {
+                cur.enabled = e.enabled.unwrap_or(cur.enabled);
+                cur.position = e.position.unwrap_or(cur.position);
+                cur.style = e.style.unwrap_or(cur.style);
+                cur.color = e.color.unwrap_or(cur.color);
+            }
+        }
+        c
     }
 }
 
@@ -251,23 +406,34 @@ impl TraceStyle {
     }
 }
 
-/// How the cursor lines are drawn.
+/// How a cursor line is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CursorStyle {
-    /// Grey dashes of a fixed length, names inside the plot.
+    /// Dashes of a fixed length, name inside the plot.
     #[default]
     Classic,
-    /// Short dashes on every cell, names in the margin.
+    /// Short dashes on every cell, name in the margin.
     Fine,
+    /// A solid line, name inside the plot.
+    Solid,
+    /// One dot per cell (every second cell across), name inside the plot.
+    Dotted,
 }
 
 impl CursorStyle {
-    pub const ALL: [CursorStyle; 2] = [CursorStyle::Classic, CursorStyle::Fine];
+    pub const ALL: [CursorStyle; 4] = [
+        CursorStyle::Classic,
+        CursorStyle::Fine,
+        CursorStyle::Solid,
+        CursorStyle::Dotted,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             CursorStyle::Classic => "classic",
             CursorStyle::Fine => "fine dashes",
+            CursorStyle::Solid => "solid",
+            CursorStyle::Dotted => "dotted",
         }
     }
 }
@@ -356,7 +522,10 @@ pub struct DisplaySettings {
     pub colors: ColorMode,
     /// How CH1, CH2 and MATH are drawn (also in the spectrum).
     pub trace_style: [TraceStyle; 3],
-    pub cursor_style: CursorStyle,
+    /// The one cursor style of old files. It only loads: it becomes the
+    /// style of each cursor (see [`Settings::sanitize`]).
+    #[serde(skip_serializing)]
+    pub cursor_style: Option<CursorStyle>,
     pub grid_style: GridStyle,
     pub grid_extent: GridExtent,
     /// Grid brightness in percent, one of [`GRID_BRIGHTNESS`].
@@ -377,7 +546,7 @@ impl Default for DisplaySettings {
             measurements: true,
             colors: ColorMode::Auto,
             trace_style: [TraceStyle::BrailleThin; 3],
-            cursor_style: CursorStyle::Classic,
+            cursor_style: None,
             grid_style: GridStyle::Dots,
             grid_extent: GridExtent::Points,
             grid_brightness: GRID_BRIGHTNESS_DEFAULT,
@@ -551,11 +720,23 @@ impl Settings {
         self.trigger.level = finite_or(self.trigger.level, 0.0);
         self.trigger.position = finite_or(self.trigger.position, 0.5).clamp(0.0, 1.0);
         let half_h = H_DIVS / 2.0;
-        for t in &mut self.cursors.t {
-            *t = finite_or(*t, 0.0).clamp(-half_h, half_h);
+        // An old file: its one cursor style is now the style of each cursor.
+        if let Some(st) = self.display.cursor_style.take() {
+            if self.cursors.legacy {
+                for i in 0..4 {
+                    self.cursors.get_mut(i).style = st;
+                }
+            }
         }
-        for v in &mut self.cursors.v {
-            *v = finite_or(*v, 0.0).clamp(-half_v, half_v);
+        self.cursors.legacy = false;
+        for i in 0..4 {
+            let half = if CursorSettings::is_time(i) {
+                half_h
+            } else {
+                half_v
+            };
+            let c = self.cursors.get_mut(i);
+            c.position = finite_or(c.position, 0.0).clamp(-half, half);
         }
         self.display.averaging = self.display.averaging.clamp(1, 128);
         self.display.persistence = self.display.persistence.min(16);
@@ -665,7 +846,10 @@ mod tests {
         s.display.window = Window::FlatTop;
         s.math.mode = MathMode::Mul;
         s.display.trace_style = [TraceStyle::BrailleBold, TraceStyle::Box, TraceStyle::Line];
-        s.display.cursor_style = CursorStyle::Fine;
+        s.cursors.time_b.style = CursorStyle::Fine;
+        s.cursors.volt_a.color = CursorColor::Cyan;
+        s.cursors.volt_a.enabled = true;
+        s.cursors.hidden = true;
         s.display.grid_style = GridStyle::Solid;
         s.display.grid_extent = GridExtent::Full;
         s.display.grid_brightness = 70;
@@ -682,7 +866,7 @@ mod tests {
         let s: Settings = toml::from_str(text).unwrap();
         assert!(s.display.dots);
         assert_eq!(s.display.trace_style, [TraceStyle::BrailleThin; 3]);
-        assert_eq!(s.display.cursor_style, CursorStyle::Classic);
+        assert_eq!(s.cursors.time_a.style, CursorStyle::Classic);
         // And the grid of the first versions.
         assert_eq!(s.display.grid_style, GridStyle::Dots);
         assert_eq!(s.display.grid_extent, GridExtent::Points);
@@ -695,6 +879,48 @@ mod tests {
         let text: String = text.split_whitespace().collect();
         assert!(
             text.contains(r#"trace_style=["BrailleThin","BrailleBold","Box",]"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn old_cursor_settings_load() {
+        let old = |mode: &str| {
+            let text = format!(
+                "[cursors]\nmode = \"{mode}\"\nt = [-3.0, 1.5]\nv = [0.5, 2.0]\n\n\
+                 [display]\ncursor_style = \"Fine\"\n"
+            );
+            let mut s: Settings = toml::from_str(&text).unwrap();
+            s.sanitize();
+            s
+        };
+        let s = old("Time");
+        let c = &s.cursors;
+        assert!(c.time_a.enabled && c.time_b.enabled);
+        assert!(!c.volt_a.enabled && !c.volt_b.enabled);
+        assert_eq!((c.time_a.position, c.time_b.position), (-3.0, 1.5));
+        assert_eq!((c.volt_a.position, c.volt_b.position), (0.5, 2.0));
+        // The old global style is the style of each cursor.
+        assert!((0..4).all(|i| c.get(i).style == CursorStyle::Fine));
+        assert!((0..4).all(|i| c.get(i).color == CursorColor::Grey));
+        assert_eq!(s.display.cursor_style, None);
+        let c = old("Volt").cursors;
+        assert!(!c.time_a.enabled && c.volt_a.enabled && c.volt_b.enabled);
+        let c = old("Off").cursors;
+        assert!((0..4).all(|i| !c.get(i).enabled));
+        // The new format: each cursor on its own, missing fields default.
+        let text = "[cursors]\n[cursors.volt_b]\nenabled = true\nstyle = \"Dotted\"\n";
+        let mut s: Settings = toml::from_str(text).unwrap();
+        s.sanitize();
+        assert!(s.cursors.volt_b.enabled);
+        assert_eq!(s.cursors.volt_b.style, CursorStyle::Dotted);
+        assert_eq!(s.cursors.volt_b.position, 1.0);
+        assert!(!s.cursors.time_a.enabled);
+        // The old cursor_style is never written.
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert!(!text.contains("cursor_style"), "{text}");
+        assert!(
+            text.contains("[cursors.volt_b]") && !text.contains("\nt = "),
             "{text}"
         );
     }
