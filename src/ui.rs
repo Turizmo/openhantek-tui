@@ -72,11 +72,12 @@ pub fn draw(f: &mut TermFrame, app: &App) {
     }
 
     // Measurement panel on the right, if there is room.
-    let panel_w = measurement_width(app, main.width);
+    let layout = meas_layout(app, main.width, main.height);
+    let panel_w = layout.as_ref().map_or(0, |l| l.width());
     let [view, meas] =
         Layout::horizontal([Constraint::Min(20), Constraint::Length(panel_w)]).areas(main);
-    if panel_w > 0 {
-        draw_measurements(f, app, meas, &pal);
+    if let Some(l) = &layout {
+        draw_measurements(f, app, l, meas, &pal);
     }
     if s.display.spectrum && !s.display.xy {
         let time_h = split_height(view.height);
@@ -819,102 +820,228 @@ pub fn measurement_rows(m: &Measurements, unit: &str) -> Vec<(&'static str, Stri
 const MEAS_LABEL_W: u16 = 7;
 const VALUE_W: u16 = 11;
 
-/// Traces shown in the panel. Narrow screens show only the main trace.
-fn panel_traces(app: &App, width: u16) -> Vec<usize> {
-    let s = &app.scope.settings;
-    let all: Vec<usize> = (0..3).filter(|&t| trace_enabled(s, t)).collect();
-    let full = MEAS_LABEL_W + VALUE_W * all.len() as u16 + 2;
-    if width >= full + 60 {
-        all
-    } else {
-        main_trace(app).into_iter().collect()
+/// Plot columns the measurement panel leaves at least, when it shows
+/// more than one value column.
+pub const MEAS_PLOT_MIN_W: u16 = 80;
+/// Plot columns the panel leaves with one value column.
+const MEAS_PLOT_MIN_W1: u16 = 40;
+
+/// Layout of the measurement panel: bands from top to bottom. A band is
+/// a heading row with the trace names and the measurement rows, with one
+/// value column per trace of the band (the labels are shared). One trace
+/// per band is the stacked layout, all traces in one band the column
+/// layout, and CH1+CH2 over MATH is a mix. The Cursors section (one value
+/// column) comes after band `cursors_at - 1`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeasLayout {
+    pub bands: Vec<Vec<usize>>,
+    /// Number of bands before the Cursors section.
+    pub cursors_at: usize,
+    /// Value columns: the most traces in a band.
+    pub columns: usize,
+    /// Everything fits: no rows are cut.
+    pub fits: bool,
+}
+
+impl MeasLayout {
+    /// Width of the panel with its border.
+    pub fn width(&self) -> u16 {
+        meas_width(self.columns)
     }
 }
 
-fn measurement_width(app: &App, width: u16) -> u16 {
-    if !app.scope.settings.display.measurements || app.scope.settings.display.xy {
-        return 0;
-    }
-    let n = panel_traces(app, width).len() as u16;
-    let w = MEAS_LABEL_W + VALUE_W * n + 2;
-    if n == 0 || width < w + 40 {
+fn meas_width(columns: usize) -> u16 {
+    MEAS_LABEL_W + VALUE_W * columns as u16 + 2
+}
+
+/// Rows of one trace in the panel: the measurements, and its value at each
+/// time cursor that is on.
+fn meas_trace_rows(s: &Settings) -> usize {
+    measurement_rows(&Measurements::default(), "V").len()
+        + (0..2).filter(|&i| s.cursors.shown(i)).count()
+}
+
+/// Rows of the Cursors section (its heading and rows), 0 when no cursor
+/// is on. Depends only on which cursors are on, not on the values.
+fn meas_cursor_rows(app: &App) -> usize {
+    let n = cursor_rows(app).len();
+    if n == 0 {
         0
     } else {
-        w
+        n + 1
     }
 }
 
-fn draw_measurements(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
+/// The measurement panel layout for a main area of `w` x `h` cells, or
+/// `None` for no panel. The layout depends only on the size, the traces
+/// that are on and the cursors that are on, never on the values, so it
+/// does not jump while the signal changes.
+///
+/// The narrowest layout that shows every row of every trace wins: stacked
+/// (one value column) if it fits in the height, else two columns (CH1 and
+/// CH2 side by side, MATH below), else three, as long as the plot keeps
+/// [`MEAS_PLOT_MIN_W`] columns. When nothing fits, the widest allowed
+/// layout is used, and the rows are given in this order: the selected
+/// trace (with the traces beside it in its band), the Cursors section,
+/// then the other traces in the order CH1, CH2, MATH; what does not fit
+/// is cut at the bottom.
+pub fn meas_layout(app: &App, w: u16, h: u16) -> Option<MeasLayout> {
     let s = &app.scope.settings;
-    let traces = panel_traces(app, area.width + 60);
-    let measured: Vec<Option<Measurements>> =
-        traces.iter().map(|&t| app.scope.measure(t)).collect();
-    let mut lines = Vec::new();
-    let mut head = vec![Span::raw(format!("{:<w$}", "", w = MEAS_LABEL_W as usize))];
-    for &t in &traces {
-        head.push(Span::styled(
-            format!("{:>w$}", NAMES[t], w = VALUE_W as usize),
-            Style::default()
-                .fg(pal.trace[t])
-                .add_modifier(Modifier::BOLD),
-        ));
+    if !s.display.measurements || s.display.xy {
+        return None;
     }
-    lines.push(Line::from(head));
-    let rows: Vec<Vec<(&str, String)>> = traces
+    let traces: Vec<usize> = (0..3).filter(|&t| trace_enabled(s, t)).collect();
+    let n = traces.len();
+    if n == 0 {
+        return None;
+    }
+    let inner_h = h.saturating_sub(2) as usize;
+    let band_h = 1 + meas_trace_rows(s);
+    let cur_h = meas_cursor_rows(app);
+    let allowed = |k: usize| {
+        let pw = meas_width(k);
+        if k == 1 {
+            w >= pw + MEAS_PLOT_MIN_W1
+        } else {
+            w >= pw + MEAS_PLOT_MIN_W
+        }
+    };
+    if !allowed(1) {
+        return None;
+    }
+    for k in 1..=n {
+        if !allowed(k) {
+            break;
+        }
+        let bands: Vec<Vec<usize>> = traces.chunks(k).map(|c| c.to_vec()).collect();
+        if bands.len() * band_h + cur_h <= inner_h {
+            let cursors_at = bands.len();
+            return Some(MeasLayout {
+                bands,
+                cursors_at,
+                columns: k,
+                fits: true,
+            });
+        }
+    }
+    // Nothing fits: the selected trace first, then the cursors, then the
+    // others.
+    let k = (1..=n).rev().find(|&k| allowed(k)).unwrap_or(1);
+    let sel = if traces.contains(&s.selected) {
+        s.selected
+    } else {
+        traces[0]
+    };
+    let mut order = vec![sel];
+    order.extend(traces.iter().copied().filter(|&t| t != sel));
+    let mut first: Vec<usize> = order[..k].to_vec();
+    // Keep CH1, CH2, MATH order inside the first band.
+    first.sort_unstable();
+    let rest: Vec<usize> = traces
         .iter()
-        .zip(&measured)
-        .map(|(&t, m)| {
-            m.as_ref()
-                .map(|m| measurement_rows(m, trace_unit(s, t)))
-                .unwrap_or_default()
-        })
+        .copied()
+        .filter(|t| !first.contains(t))
         .collect();
-    let labels = measurement_rows(&Measurements::default(), "V");
-    for (r, (label, _)) in labels.iter().enumerate() {
-        let mut spans = vec![Span::styled(
-            format!("{label:<w$}", w = MEAS_LABEL_W as usize),
-            Style::default().fg(pal.label),
-        )];
-        for (k, &t) in traces.iter().enumerate() {
-            let text = rows[k].get(r).map_or("--".to_string(), |(_, v)| v.clone());
-            spans.push(Span::styled(
-                format!("{text:>w$}", w = VALUE_W as usize),
-                Style::default().fg(pal.trace[t]),
+    let mut bands = vec![first];
+    bands.extend(rest.chunks(k).map(|c| c.to_vec()));
+    Some(MeasLayout {
+        bands,
+        cursors_at: 1,
+        columns: k,
+        fits: false,
+    })
+}
+
+fn draw_measurements(f: &mut TermFrame, app: &App, layout: &MeasLayout, area: Rect, pal: &Palette) {
+    let s = &app.scope.settings;
+    let lw = MEAS_LABEL_W as usize;
+    let vw = VALUE_W as usize;
+    let label_style = Style::default().fg(pal.label);
+    let labels: Vec<&str> = measurement_rows(&Measurements::default(), "V")
+        .iter()
+        .map(|(l, _)| *l)
+        .collect();
+    let at: Vec<usize> = (0..2).filter(|&i| s.cursors.shown(i)).collect();
+    let band_lines = |band: &[usize]| -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let mut head = vec![Span::raw(format!("{:<lw$}", ""))];
+        for &t in band {
+            head.push(Span::styled(
+                format!("{:>vw$}", NAMES[t]),
+                Style::default()
+                    .fg(pal.trace[t])
+                    .add_modifier(Modifier::BOLD),
             ));
         }
-        lines.push(Line::from(spans));
-    }
-    let cur = cursor_rows(app);
-    let at: Vec<usize> = (0..2).filter(|&i| s.cursors.shown(i)).collect();
-    if !cur.is_empty() {
-        let w = MEAS_LABEL_W as usize;
-        lines.push(Line::styled(
-            "Cursors",
-            Style::default().fg(pal.label).add_modifier(Modifier::BOLD),
-        ));
-        for (label, value) in &cur {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{label:<w$}"), Style::default().fg(pal.label)),
-                Span::raw(format!("{value:>v$}", v = VALUE_W as usize)),
-            ]));
-        }
-        for &i in &at {
-            let label = ["V@A", "V@B"][i];
-            let mut spans = vec![Span::styled(
-                format!("{label:<w$}"),
-                Style::default().fg(pal.label),
-            )];
-            for &t in &traces {
-                let text = value_at_cursor(app, t, i)
-                    .map_or("--".to_string(), |v| fmt_si(v, trace_unit(s, t)));
+        lines.push(Line::from(head));
+        let rows: Vec<Vec<String>> = band
+            .iter()
+            .map(|&t| {
+                let mut v: Vec<String> = app
+                    .scope
+                    .measure(t)
+                    .map(|m| {
+                        measurement_rows(&m, trace_unit(s, t))
+                            .into_iter()
+                            .map(|(_, v)| v)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                v.resize(labels.len(), "--".into());
+                for &i in &at {
+                    v.push(
+                        value_at_cursor(app, t, i)
+                            .map_or("--".to_string(), |x| fmt_si(x, trace_unit(s, t))),
+                    );
+                }
+                v
+            })
+            .collect();
+        let all_labels = labels
+            .iter()
+            .copied()
+            .chain(at.iter().map(|&i| ["V@A", "V@B"][i]));
+        for (r, label) in all_labels.enumerate() {
+            let mut spans = vec![Span::styled(format!("{label:<lw$}"), label_style)];
+            for (k, &t) in band.iter().enumerate() {
                 spans.push(Span::styled(
-                    format!("{text:>v$}", v = VALUE_W as usize),
+                    format!("{:>vw$}", rows[k][r]),
                     Style::default().fg(pal.trace[t]),
                 ));
             }
             lines.push(Line::from(spans));
         }
+        lines
+    };
+    let cursor_lines = || -> Vec<Line<'static>> {
+        let cur = cursor_rows(app);
+        if cur.is_empty() {
+            return Vec::new();
+        }
+        let mut head = "Cursors".to_string();
+        if s.cursors.shown(2) || s.cursors.shown(3) {
+            head.push_str(&format!(" · {}", NAMES[main_trace(app).unwrap_or(0)]));
+        }
+        let mut lines = vec![Line::styled(head, label_style.add_modifier(Modifier::BOLD))];
+        for (label, value) in cur {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{label:<lw$}"), label_style),
+                Span::raw(format!("{value:>vw$}")),
+            ]));
+        }
+        lines
+    };
+    let mut lines = Vec::new();
+    for (b, band) in layout.bands.iter().enumerate() {
+        if b == layout.cursors_at {
+            lines.extend(cursor_lines());
+        }
+        lines.extend(band_lines(band));
     }
+    if layout.cursors_at >= layout.bands.len() {
+        lines.extend(cursor_lines());
+    }
+    lines.truncate(area.height.saturating_sub(2) as usize);
     f.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" Measure ")),
         area,

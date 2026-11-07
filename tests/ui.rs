@@ -1185,3 +1185,128 @@ fn settings_panel_changes_trace_style_live() {
     );
     assert_ne!(r.screen(140, 40), before);
 }
+
+/// The measurement panel layout on a `w` x `h` screen (the main area is
+/// the screen without the 3 status lines).
+fn layout(r: &Rig, w: u16, h: u16) -> ui::MeasLayout {
+    ui::meas_layout(&r.app, w, h - 3).expect("a measure panel")
+}
+
+/// The text of the measure panel: the cells right of its left border.
+fn meas_text(r: &Rig, w: u16, h: u16) -> String {
+    let l = layout(r, w, h);
+    let x0 = (w - l.width()) as usize;
+    r.screen(w, h)
+        .iter()
+        .map(|line| line.chars().skip(x0).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn measure_panel_picks_the_narrowest_layout_that_fits() {
+    let mut r = rig();
+    // 120x40, CH1 and CH2: stacked, one value column.
+    let l = layout(&r, 120, 40);
+    assert_eq!(
+        (l.bands.clone(), l.columns, l.fits),
+        (vec![vec![0], vec![1]], 1, true)
+    );
+    let t = meas_text(&r, 120, 40);
+    let ch1 = t.find("CH1").unwrap();
+    let ch2 = t.find("CH2").unwrap();
+    assert!(ch1 < ch2, "{t}");
+    assert_eq!(t.matches("Vpp").count(), 2, "{t}");
+    assert_eq!(t.matches("Fall").count(), 2, "{t}");
+    // The panel is one column wide, so the plot gets the rest.
+    assert_eq!(l.width(), 20);
+    // With MATH: CH1 and CH2 side by side, MATH below.
+    r.char('3');
+    r.feed();
+    let l = layout(&r, 120, 40);
+    assert_eq!(l.bands, vec![vec![0, 1], vec![2]]);
+    assert!(l.fits);
+    let t = meas_text(&r, 120, 40);
+    assert_eq!(t.matches("Fall").count(), 2, "{t}");
+    assert!(t.contains("MATH"), "{t}");
+    // 160x40 with the time cursors: all three as columns.
+    cursors_on(&mut r, &[0, 1]);
+    let l = layout(&r, 160, 40);
+    assert_eq!(
+        (l.bands.clone(), l.columns, l.fits),
+        (vec![vec![0, 1, 2]], 3, true)
+    );
+    let t = meas_text(&r, 160, 40);
+    assert!(
+        t.contains("V@A") && t.contains("V@B") && t.contains("1/ΔT"),
+        "{t}"
+    );
+    // Without cursors 160x40 needs only two columns.
+    r.app.scope.settings.cursors.hidden = true;
+    assert_eq!(layout(&r, 160, 40).bands, vec![vec![0, 1], vec![2]]);
+    // 200x60: three stacked sections fit in the height.
+    let l = layout(&r, 200, 60);
+    assert_eq!(
+        (l.bands.clone(), l.fits),
+        (vec![vec![0], vec![1], vec![2]], true)
+    );
+    // Tall and narrow, 100x60: stacked too.
+    assert_eq!(layout(&r, 100, 60).bands, vec![vec![0], vec![1], vec![2]]);
+    // With cursors 100x60 is too low for three stacked sections and too
+    // narrow for columns: the selected trace and the cursors come first.
+    r.app.scope.settings.cursors.hidden = false;
+    let l = layout(&r, 100, 60);
+    assert_eq!(
+        (l.bands.clone(), l.cursors_at, l.fits),
+        (vec![vec![0], vec![1], vec![2]], 1, false)
+    );
+    // The layout does not depend on the values.
+    let before = layout(&r, 120, 40);
+    r.app.scope.settings.channels[0].volt_idx = 0;
+    r.feed();
+    assert_eq!(layout(&r, 120, 40), before);
+}
+
+#[test]
+fn measure_panel_shows_the_selected_trace_first_when_short() {
+    let mut r = rig();
+    r.char('3');
+    r.feed();
+    // 80x24: too low for every section, too narrow for columns.
+    let l = layout(&r, 80, 24);
+    assert!(!l.fits);
+    assert_eq!(l.columns, 1);
+    assert_eq!(l.bands, vec![vec![0], vec![1], vec![2]]);
+    let t = meas_text(&r, 80, 24);
+    assert!(t.contains("CH1") && !t.contains("MATH"), "{t}");
+    // Select MATH: its section comes first, in full.
+    r.key(KeyCode::Tab);
+    r.key(KeyCode::Tab);
+    assert_eq!(r.app.scope.settings.selected, 2);
+    let l = layout(&r, 80, 24);
+    assert_eq!(l.bands, vec![vec![2], vec![0], vec![1]]);
+    let t = meas_text(&r, 80, 24);
+    assert!(t.contains("MATH"), "{t}");
+    assert!(t.contains("Fall"), "{t}");
+    // Select CH2.
+    r.key(KeyCode::BackTab);
+    let t = meas_text(&r, 80, 24);
+    let first = t.lines().find(|l| l.contains("CH")).unwrap();
+    assert!(first.contains("CH2"), "{t}");
+}
+
+#[test]
+fn measure_panel_shows_cursors_before_the_other_traces_when_short() {
+    let mut r = rig();
+    cursors_on(&mut r, &[0, 1]);
+    r.key(KeyCode::Tab); // CH2 selected
+    let t = meas_text(&r, 80, 30);
+    let ch2 = t.find("CH2").expect("CH2");
+    let cur = t.find("Cursors").expect("Cursors section");
+    assert!(ch2 < cur, "{t}");
+    // CH1 is after the cursors, or cut.
+    if let Some(ch1) = t.find("CH1") {
+        assert!(ch1 > cur, "{t}");
+    }
+    assert!(t.contains("ΔT"), "{t}");
+}

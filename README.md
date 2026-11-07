@@ -276,6 +276,29 @@ colour and the older half also has the dim attribute. With box lines, old
 traces of different ages still join where they cross (the joined cell
 takes the newer colour), so they stay connected lines.
 
+## Measurement panel
+
+`M` shows the panel at the right of the plot: every measurement of each
+trace that is on (CH1, CH2, MATH), and a Cursors section when a cursor is
+on. Its layout depends only on the screen size and on which traces and
+cursors are on, never on the values, so it does not jump:
+
+- The narrowest layout that shows every row of every trace wins, so the
+  plot keeps the most width. First stacked: one value column, a section
+  per trace under each other (heading in the trace colour). If that is
+  too high, two value columns (CH1 and CH2 side by side, MATH below
+  them), then three, but only while the plot keeps at least 80 columns.
+- When nothing fits, the panel uses the widest layout it may, and fills
+  its rows in this order: the selected trace (`Tab`) in full, the Cursors
+  section, then the other traces in the order CH1, CH2, MATH. What does
+  not fit is cut at the bottom.
+
+For example, with CH1 and CH2 on, 120x40 is stacked and 80x24 shows the
+selected channel and as much of the other one as fits; with MATH on too,
+120x40 puts CH1 and CH2 side by side with MATH below. The panel is 20
+columns wide with one value column (11 more per column), and needs 40
+columns of plot next to it, or it is not shown.
+
 ## Cursors
 
 There are four cursors: time A and B (vertical lines) and voltage A and B
