@@ -128,20 +128,50 @@ fn records_single_samples_at_2_5_us() {
     let path = dir.join("b.ohlog");
     let fake = realtime_fake([SINE_1K, Wave::Dc(-0.5)]);
     let acq = Acquisition::spawn(opener(fake.clone()));
-    let (req, _sh) = request(&path, 2.5e-6, [true, true], 0);
-    let took = record(&acq, req, 2.0);
+    let (req, sh) = request(&path, 2.5e-6, [true, true], 0);
+    // Measure against the fake's own sample clock, not the wall clock:
+    // on a busy machine (tests run in parallel) the fake makes fewer
+    // than 400 kS/s, and that is not a logger fault. Count the frames
+    // (two bytes each) it gave while the log recorded.
+    let frames = || fake.lock().bulk_bytes as f64 / 2.0;
+    acq.send(Command::StartLog(req));
+    wait_state(&acq, &sh, 10.0, |s| *s == LogState::Recording);
+    let f0 = frames();
+    let t0 = Instant::now();
+    while t0.elapsed().as_secs_f64() < 2.0 {
+        drain(&acq);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    acq.send(Command::StopLog);
+    let took = t0.elapsed().as_secs_f64();
+    let f_stop = frames();
+    wait_state(&acq, &sh, 10.0, |s| matches!(s, LogState::Done(_)));
+    let f_done = frames();
     let f = LogFile::open(&path).unwrap();
     assert!(f.header.single());
     assert_eq!(f.header.adc_rate, 400e3);
     assert!(f.gaps().is_empty(), "{:?}", f.gaps());
     let got = f.end() as f64;
-    let want = took * 400e3;
     println!(
-        "2.5 µs: {got} samples in {took:.3} s = {:.1} kS/s, file {} bytes",
+        "2.5 µs: {got} samples in {took:.3} s = {:.1} kS/s (fake gave {:.0}..{:.0}), file {} bytes",
         got / took / 1e3,
+        f_stop - f0,
+        f_done - f0,
         std::fs::metadata(&path).unwrap().len()
     );
-    assert!((got - want).abs() < 0.12 * 400e3, "{got} for {want}");
+    // Every sample the fake gave while recording is in the file, give
+    // or take one bulk read at each end: the writer flips to Recording
+    // a little after the stream starts, and one read is about 0.1 s.
+    let slack = 0.15 * 400e3;
+    assert!(
+        got > f_stop - f0 - slack && got < f_done - f0 + slack,
+        "{got} samples, fake gave {}..{}",
+        f_stop - f0,
+        f_done - f0
+    );
+    // And it is not far off real time (loose: only catches a logger
+    // that drops most of the stream).
+    assert!(got > 0.25 * took * 400e3, "{got} in {took} s");
     // The sine shows: 400 samples per period.
     let r = f.read(10_000..10_400).unwrap();
     let max = r.iter().map(|x| x.1[0][1]).fold(f32::MIN, f32::max);
