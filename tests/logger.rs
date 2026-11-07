@@ -117,7 +117,8 @@ fn records_without_gaps_at_1_ms() {
             break;
         }
     }
-    let _ = block; // no Configure was sent, so there may be none
+    // No Configure was sent after the log, so there may be none.
+    let _ = block;
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -284,5 +285,48 @@ fn pyramid_of_a_recorded_log() {
     assert_eq!((all[0].min, all[0].max), (lo, hi));
     assert_eq!(all[0].n as u64, f.end());
     assert!((all[1].mean - 1.0).abs() < 0.05);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_r_key_records_and_the_log_view_follows() {
+    use openhantek_tui::settings::Settings;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    let dir = temp_dir("app");
+    let fake = realtime_fake([SINE_1K, Wave::CalOut]);
+    let acq = Acquisition::spawn(opener(fake.clone()));
+    let mut app = openhantek_tui::app::App::new(Settings::default(), Some(acq));
+    app.log_dir_override = Some(dir.clone());
+    app.scope.settings.logger.step = 10e-3;
+    tick_until(&mut app, 10.0, |a| a.connected);
+    app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+    assert!(app.recording());
+    assert!(app.show_log);
+    tick_until(&mut app, 10.0, |a| {
+        a.log_view.as_ref().is_some_and(|v| v.live && v.end() > 100)
+    });
+    // The view follows the growing file.
+    let n = app.log_view.as_ref().unwrap().end();
+    tick_until(&mut app, 10.0, |a| {
+        a.log_view.as_ref().unwrap().end() > n + 20
+    });
+    app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+    tick_until(&mut app, 10.0, |a| !a.recording() && a.rec.is_none());
+    let msg = app.current_message().unwrap().text.clone();
+    assert!(msg.starts_with("Log saved: "), "{msg}");
+    let logs = lg::recent_logs(&dir, 5);
+    assert_eq!(logs.len(), 1);
+    let f = LogFile::open(&logs[0]).unwrap();
+    assert!(f.gaps().is_empty());
+    assert_eq!(f.header.logged(), vec![0, 1]);
+    // CH2 is the calibration output: 0 V to 2 V in each 10 ms step.
+    let r = f.read(10..11).unwrap();
+    assert!(r[0].1[1][0] < 0.1 && r[0].1[1][1] > 1.9, "{:?}", r[0]);
+    // After the log, the scope view gets blocks again.
+    app.handle_key(KeyEvent::from(KeyCode::Char('V')));
+    assert!(!app.show_log);
+    app.scope.frame = None;
+    tick_until(&mut app, 10.0, |a| a.scope.frame.is_some());
+    drop(app);
     std::fs::remove_dir_all(&dir).unwrap();
 }

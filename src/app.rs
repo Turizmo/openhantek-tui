@@ -5,8 +5,12 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::acquire::{Acquisition, Command, Event};
+use crate::acquire::{Acquisition, Command, Event, LogRequest};
 use crate::export;
+use crate::keys::{self, LogKey};
+use crate::logger::view::LogView;
+use crate::logger::writer::{self as log_writer, LogState, Shared, StopReason};
+use crate::logger::{self, csv as log_csv};
 use crate::panel::{Action, DeviceInfo, Outcome, Panel};
 use crate::scope::{Scope, MATH};
 use crate::settings::*;
@@ -18,6 +22,9 @@ pub struct Message {
     pub error: bool,
     pub at: Instant,
 }
+
+/// Recent logs in the panel (few, so the panel keeps its height).
+pub const RECENT_LOGS: usize = 10;
 
 /// How long a message stays on screen.
 pub const MESSAGE_TIME: Duration = Duration::from_secs(6);
@@ -40,6 +47,17 @@ pub struct App {
     pub panel: Panel,
     pub panel_open: bool,
     sent_running: Option<bool>,
+    /// The log being recorded, if any.
+    pub rec: Option<Shared>,
+    /// The log open in the log view.
+    pub log_view: Option<LogView>,
+    /// Show the log view (not the scope).
+    pub show_log: bool,
+    /// Log folder from the command line (it wins over the setting).
+    pub log_dir_override: Option<PathBuf>,
+    /// Free bytes in the log folder, checked about once a second.
+    pub log_free: Option<u64>,
+    free_at: Option<Instant>,
 }
 
 fn next_in<T: PartialEq + Copy>(list: &[T], v: T) -> T {
@@ -64,6 +82,12 @@ impl App {
             panel: Panel::new(),
             panel_open: false,
             sent_running: None,
+            rec: None,
+            log_view: None,
+            show_log: false,
+            log_dir_override: None,
+            log_free: None,
+            free_at: None,
         };
         app.sync();
         app
@@ -99,7 +123,244 @@ impl App {
         while let Some(ev) = self.acq.as_ref().and_then(|a| a.try_recv()) {
             changed |= self.handle_event(ev);
         }
+        changed |= self.log_tick();
         changed | self.sync()
+    }
+
+    /// Folder for new logs.
+    pub fn log_dir(&self) -> PathBuf {
+        self.log_dir_override
+            .clone()
+            .unwrap_or_else(|| self.scope.settings.logger.dir())
+    }
+
+    /// True while a log is being recorded (or waits for the scope).
+    pub fn recording(&self) -> bool {
+        self.rec
+            .as_ref()
+            .is_some_and(|r| !matches!(r.lock().unwrap().state, LogState::Done(_)))
+    }
+
+    /// Logger upkeep: the end of a log, the free space, the log view.
+    fn log_tick(&mut self) -> bool {
+        let mut changed = false;
+        if self
+            .free_at
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            self.log_free = logger::free_space(&self.log_dir());
+            self.free_at = Some(Instant::now());
+            changed |= self.rec.is_some();
+        }
+        if let Some(r) = &self.rec {
+            let st = r.lock().unwrap().clone();
+            match st.state {
+                LogState::Done(why) => {
+                    let p = st.path.display();
+                    let size = logger::fmt_bytes(st.bytes);
+                    match why {
+                        StopReason::User => self.notify(format!("Log saved: {p} ({size})"), false),
+                        StopReason::Limit => self.notify(
+                            format!("Size limit reached, log stopped: {p} ({size})"),
+                            true,
+                        ),
+                        StopReason::Error(e) => {
+                            self.notify(format!("Log stopped, cannot write {p}: {e}"), true)
+                        }
+                    }
+                    self.rec = None;
+                    if let Some(v) = &mut self.log_view {
+                        v.live = false;
+                    }
+                    changed = true;
+                }
+                LogState::Recording => {
+                    let open = self
+                        .log_view
+                        .as_ref()
+                        .is_some_and(|v| v.file.path == st.path);
+                    if !open {
+                        match LogView::open(&st.path, true) {
+                            Ok(v) => self.log_view = Some(v),
+                            Err(e) => self.notify(format!("{e:#}"), true),
+                        }
+                    }
+                    changed = true;
+                }
+                LogState::Waiting => changed = true,
+            }
+        }
+        if let Some(v) = &mut self.log_view {
+            match v.tick() {
+                Ok(c) => changed |= c && self.show_log,
+                Err(e) => {
+                    self.notify(format!("Reading the log failed: {e:#}"), true);
+                    self.log_view = None;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Start recording, or stop the running log.
+    pub fn toggle_record(&mut self) {
+        if self.recording() {
+            if let Some(a) = &self.acq {
+                a.send(Command::StopLog);
+            }
+            return;
+        }
+        let s = &self.scope.settings;
+        let channels = [s.channels[0].enabled, s.channels[1].enabled];
+        if !channels.iter().any(|c| *c) {
+            self.notify("Turn on CH1 or CH2 to record a log", true);
+            return;
+        }
+        let dir = self.log_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.notify(
+                format!("Cannot make the log folder {}: {e}", dir.display()),
+                true,
+            );
+            return;
+        }
+        let path = logger::new_log_path(&dir, std::time::SystemTime::now());
+        let limit = s.logger.log_limit;
+        let hw = self.scope.hw_config();
+        let shared = log_writer::shared(path.clone(), limit);
+        let req = LogRequest {
+            shared: shared.clone(),
+            step_ns: logger::step_ns(s.logger.step),
+            channels,
+            probe: [0, 1].map(|c| s.channels[c].probe),
+            invert: [0, 1].map(|c| s.channels[c].invert),
+            volts_per_div: [0, 1].map(|c| s.channels[c].volts_per_div()),
+            gains: hw.gains,
+            dc: hw.dc,
+            cal_freq: hw.cal_freq,
+        };
+        let free = logger::free_space(&dir);
+        let warn = free.is_some_and(|f| limit == 0 || f < limit);
+        let text = match free {
+            Some(f) if warn => format!(
+                "Recording to {} · only {} free on the disk",
+                path.display(),
+                logger::fmt_bytes(f)
+            ),
+            _ => format!("Recording to {}", path.display()),
+        };
+        match &self.acq {
+            Some(a) => a.send(Command::StartLog(req)),
+            None => {
+                self.notify("No scope: cannot record", true);
+                return;
+            }
+        }
+        self.notify(text, warn && limit > 0);
+        self.rec = Some(shared);
+        self.show_log = true;
+    }
+
+    /// Open a log file in the log view.
+    pub fn open_log(&mut self, path: &std::path::Path) -> bool {
+        let live = self
+            .rec
+            .as_ref()
+            .is_some_and(|r| r.lock().unwrap().path == path);
+        match LogView::open(path, live) {
+            Ok(v) => {
+                self.log_view = Some(v);
+                self.show_log = true;
+                true
+            }
+            Err(e) => {
+                self.notify(format!("{e:#}"), true);
+                false
+            }
+        }
+    }
+
+    /// Logs in the log folder, newest first, for the panel.
+    pub fn recent_logs(&self) -> Vec<PathBuf> {
+        logger::recent_logs(&self.log_dir(), RECENT_LOGS)
+    }
+
+    /// Export the open log as CSV: the whole log, or with `range` only
+    /// between the cursors.
+    pub fn export_log(&mut self, range: bool) {
+        let Some(v) = &self.log_view else {
+            self.notify(
+                "No log open: press V or pick one in Logger › Open log",
+                true,
+            );
+            return;
+        };
+        let r = if range && v.cursors {
+            v.cursor_range()
+        } else if range {
+            self.notify(
+                "Cursors are off: press v in the log view to set A and B",
+                true,
+            );
+            return;
+        } else {
+            v.file.first()..v.end()
+        };
+        let time = self.scope.settings.logger.csv_time;
+        match log_csv::save_log_csv(&self.export_dir, &v.file, r, time) {
+            Ok(p) => self.notify(format!("Saved {}", p.display()), false),
+            Err(e) => self.notify(format!("Export failed: {e:#}"), true),
+        }
+    }
+
+    /// A logger key (see [`crate::keys`]).
+    fn log_key(&mut self, k: LogKey) {
+        let w = self
+            .log_view
+            .as_ref()
+            .map_or(200, |v| v.width.get())
+            .max(10);
+        let div = w / 10;
+        match k {
+            LogKey::Record => self.toggle_record(),
+            LogKey::ToggleView => {
+                self.show_log = !self.show_log;
+                if self.show_log && self.log_view.is_none() {
+                    if let Some(p) = self.recent_logs().first() {
+                        let p = p.clone();
+                        self.open_log(&p);
+                    } else {
+                        self.notify("No logs yet: press r to record one", false);
+                    }
+                }
+            }
+            LogKey::Go(m) => {
+                if let Some(v) = &mut self.log_view {
+                    v.go(m, w, div);
+                }
+            }
+            LogKey::Cursors => {
+                if let Some(v) = &mut self.log_view {
+                    v.toggle_cursors(w);
+                }
+            }
+            LogKey::Cursor(i, by) => {
+                if let Some(v) = &mut self.log_view {
+                    v.move_cursor(i, by, w);
+                }
+            }
+            LogKey::Axis => {
+                let a = &mut self.scope.settings.logger.time_axis;
+                *a = match a {
+                    TimeAxis::Clock => TimeAxis::Seconds,
+                    TimeAxis::Seconds => TimeAxis::Clock,
+                };
+            }
+            LogKey::Export => {
+                let range = self.log_view.as_ref().is_some_and(|v| v.cursors);
+                self.export_log(range);
+            }
+        }
     }
 
     /// Handle one event from the acquisition thread.
@@ -187,6 +448,10 @@ impl App {
             } else {
                 self.panel_key(key);
             }
+            return;
+        }
+        if let Some(k) = keys::log_key(&key, self.show_log) {
+            self.log_key(k);
             return;
         }
         let sel = self.scope.settings.selected;
@@ -345,6 +610,17 @@ impl App {
             Action::TriggerToMiddle => self.trigger_to_middle(),
             Action::ExportCsv => self.export(false),
             Action::ExportJson => self.export(true),
+            Action::Record => self.toggle_record(),
+            Action::LogView => self.log_key(LogKey::ToggleView),
+            Action::ExportLog => self.export_log(false),
+            Action::ExportLogRange => self.export_log(true),
+            Action::OpenLog(i) => {
+                if let Some(p) = self.recent_logs().get(i).cloned() {
+                    if self.open_log(&p) {
+                        self.panel_open = false;
+                    }
+                }
+            }
             Action::Reset => {
                 let keep = self.scope.settings.selected;
                 self.scope.settings = Settings::default();
@@ -364,6 +640,17 @@ impl App {
             rate: self.scope.hw.as_ref().map(|h| h.rate.rate),
             running: self.scope.running,
             export_dir: self.export_dir.display().to_string(),
+            recording: self.recording(),
+            log_dir: self.log_dir().display().to_string(),
+            log_free: self.log_free,
+            recent_logs: self
+                .recent_logs()
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                })
+                .collect(),
             settings_file: self
                 .settings_path
                 .as_ref()

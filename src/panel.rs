@@ -23,6 +23,16 @@ pub enum Action {
     ExportCsv,
     ExportJson,
     Reset,
+    /// Start / stop the envelope logger.
+    Record,
+    /// Log view on / off.
+    LogView,
+    /// Export the open log as CSV.
+    ExportLog,
+    /// Export the open log between the cursors.
+    ExportLogRange,
+    /// Open recent log number `i` (newest first).
+    OpenLog(usize),
 }
 
 /// One setting in the panel.
@@ -74,6 +84,14 @@ pub enum Field {
     DevRate,
     ExportDir,
     SettingsFile,
+    LogStep,
+    LogLimit,
+    LogDir,
+    LogFree,
+    LogAxis,
+    LogCsvTime,
+    /// Pick one of the recent logs to open.
+    LogOpen,
     Act(Action),
 }
 
@@ -105,6 +123,13 @@ pub struct DeviceInfo {
     pub running: bool,
     pub export_dir: String,
     pub settings_file: String,
+    /// A log is being recorded.
+    pub recording: bool,
+    pub log_dir: String,
+    /// Free bytes in the log folder.
+    pub log_free: Option<u64>,
+    /// File names of the recent logs, newest first.
+    pub recent_logs: Vec<String>,
 }
 
 impl DeviceInfo {
@@ -225,13 +250,45 @@ pub fn categories() -> Vec<Category> {
                 SettingsFile,
                 Act(Action::ExportCsv),
                 Act(Action::ExportJson),
+                LogOpen,
                 Act(Action::Reset),
+            ],
+        },
+        Category {
+            name: "Logger",
+            fields: vec![
+                Act(Action::Record),
+                LogStep,
+                LogLimit,
+                LogFree,
+                LogDir,
+                LogAxis,
+                LogCsvTime,
+                Act(Action::LogView),
+                LogOpen,
+                Act(Action::ExportLog),
+                Act(Action::ExportLogRange),
             ],
         },
     ]
 }
 
 const OFF_ON: [&str; 2] = ["off", "on"];
+
+/// Channels a log would record now (at least 1, for the estimates).
+fn logged_channels(s: &Settings) -> usize {
+    s.channels.iter().filter(|c| c.enabled).count().max(1)
+}
+
+/// A size limit with how long it lasts: `1 GB ≈ 11 h 34 min`.
+fn limit_text(l: u64, s: &Settings) -> String {
+    use crate::logger as lg;
+    if l == 0 {
+        return "off".into();
+    }
+    let secs = l as f64 / lg::bytes_per_second(s.logger.step, logged_channels(s));
+    format!("{} ≈ {}", lg::fmt_bytes(l), lg::fmt_span(secs))
+}
 const NAMES: [&str; 3] = ["CH1", "CH2", "MATH"];
 
 fn slope_name(s: Slope) -> &'static str {
@@ -295,6 +352,13 @@ impl Field {
             DevRate => "Sample rate",
             ExportDir => "Export folder",
             SettingsFile => "Settings file",
+            LogStep => "Step",
+            LogLimit => "Size limit",
+            LogDir => "Log folder",
+            LogFree => "Free space",
+            LogAxis => "Time labels",
+            LogCsvTime => "CSV time",
+            LogOpen => "Open log",
             Act(a) => match a {
                 Action::RunStop => "Run / stop",
                 Action::Single => "Single shot",
@@ -303,6 +367,11 @@ impl Field {
                 Action::ExportCsv => "Export CSV",
                 Action::ExportJson => "Export JSON",
                 Action::Reset => "Reset all settings",
+                Action::Record => "Record",
+                Action::LogView => "Log view",
+                Action::ExportLog => "Export log CSV",
+                Action::ExportLogRange => "Export A–B CSV",
+                Action::OpenLog(_) => "Open log",
             },
         }
     }
@@ -352,6 +421,13 @@ impl Field {
             DevRate => "Sample rate the ADC runs at now.",
             ExportDir => "Exports go here. Set it with --export-dir.",
             SettingsFile => "Settings are saved here on quit. Set it with --settings.",
+            LogStep => "Time per log step: min, max and mean of each channel are saved per step.",
+            LogLimit => "The log stops when the file reaches this size.",
+            LogDir => "New logs go here. Set it with --log-dir or log_dir in the settings file.",
+            LogFree => "Free space on the disk of the log folder.",
+            LogAxis => "Time labels of the log view: wall clock (UTC) or seconds since the start. Key t.",
+            LogCsvTime => "Time column of the log CSV export.",
+            LogOpen => "Open a recent log in the log view (Enter). Also: --open-log FILE.",
             Act(a) => match a {
                 Action::RunStop => "Start or stop the capture. Key space.",
                 Action::Single => "Arm the trigger for one capture. Key o.",
@@ -360,6 +436,11 @@ impl Field {
                 Action::ExportCsv => "Save the traces on screen as CSV. Key E.",
                 Action::ExportJson => "Save the traces and settings as JSON. Key W.",
                 Action::Reset => "All settings back to the defaults. Key R.",
+                Action::Record => "Start or stop the envelope logger. Uses the volts/div, probe and channels of the scope. Key r.",
+                Action::LogView => "Show the log as a strip chart. Key V.",
+                Action::ExportLog => "Save the whole open log as CSV in the export folder.",
+                Action::ExportLogRange => "Save the open log between cursors A and B as CSV. Key E in the log view.",
+                Action::OpenLog(_) => "Open a log.",
             },
         }
     }
@@ -371,7 +452,7 @@ impl Field {
             ChOffset(_) | MathOffset | TrigLevel | TrigPosition | CursorT(_) | CursorV(_)
             | CalFreq => Kind::Number,
             Roll | DevModel | DevSerial | DevFirmware | DevState | DevCalibration | DevRate
-            | ExportDir | SettingsFile => Kind::Info,
+            | ExportDir | SettingsFile | LogDir | LogFree => Kind::Info,
             Act(_) => Kind::Action,
             _ => Kind::Choice,
         }
@@ -452,7 +533,55 @@ impl Field {
                 })
                 .collect(),
             CursorMode => list(&["off", "time", "voltage"]),
+            LogStep => crate::logger::STEPS
+                .iter()
+                .map(|t| crate::logger::fmt_step(*t))
+                .collect(),
+            LogLimit => crate::logger::LIMITS
+                .iter()
+                .map(|l| limit_text(*l, s))
+                .collect(),
+            LogAxis => TimeAxis::ALL.iter().map(|m| m.name().to_string()).collect(),
+            LogCsvTime => CsvTime::ALL.iter().map(|m| m.name().to_string()).collect(),
+            LogOpen => d.recent_logs.clone(),
             _ => Vec::new(),
+        }
+    }
+
+    /// The help line text: the fixed help, or for some settings a text
+    /// from the values (like the size limit estimate).
+    pub fn help_text(self, s: &Settings, d: &DeviceInfo) -> String {
+        use crate::logger as lg;
+        let ch = logged_channels(s);
+        match self {
+            Field::LogLimit => {
+                let l = s.logger.log_limit;
+                let mut t = lg::limit_estimate(l, s.logger.step, ch);
+                if let Some(f) = d.log_free {
+                    if l == 0 || f < l {
+                        t.push_str(&format!(
+                            " · only {} free (≈ {})",
+                            lg::fmt_bytes(f),
+                            lg::fmt_span(f as f64 / lg::bytes_per_second(s.logger.step, ch))
+                        ));
+                    }
+                }
+                t
+            }
+            Field::LogStep => {
+                let (r, n) = lg::adc_for_step(lg::step_ns(s.logger.step));
+                format!(
+                    "{} ADC at {}, {} sample{} per step, {}/h for {} channel{}.",
+                    self.help(),
+                    fmt_si(r.raw, "S/s"),
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    lg::fmt_bytes((lg::bytes_per_second(s.logger.step, ch) * 3600.0) as u64),
+                    ch,
+                    if ch == 1 { "" } else { "s" }
+                )
+            }
+            _ => self.help().to_string(),
         }
     }
 
@@ -503,6 +632,10 @@ impl Field {
                 ],
                 &s.cursors.mode,
             ),
+            LogStep => s.logger.step_idx(),
+            LogLimit => s.logger.limit_idx(),
+            LogAxis => index_of(&TimeAxis::ALL, &s.logger.time_axis),
+            LogCsvTime => index_of(&CsvTime::ALL, &s.logger.csv_time),
             _ => 0,
         }
     }
@@ -578,6 +711,16 @@ impl Field {
                     crate::settings::CursorMode::Volt,
                 ][i.min(2)]
             }
+            LogStep => {
+                let all = &crate::logger::STEPS;
+                s.logger.step = all[i.min(all.len() - 1)]
+            }
+            LogLimit => {
+                let all = &crate::logger::LIMITS;
+                s.logger.log_limit = all[i.min(all.len() - 1)]
+            }
+            LogAxis => s.logger.time_axis = TimeAxis::ALL[i.min(1)],
+            LogCsvTime => s.logger.csv_time = CsvTime::ALL[i.min(1)],
             _ => {}
         }
     }
@@ -709,6 +852,10 @@ impl Field {
     pub fn value(self, s: &Settings, d: &DeviceInfo) -> String {
         use Field::*;
         match self.kind() {
+            Kind::Choice if self == LogOpen => d
+                .recent_logs
+                .first()
+                .map_or("none".into(), |_| format!("{} logs", d.recent_logs.len())),
             Kind::Choice | Kind::Bool => self
                 .options(s, d)
                 .get(self.index(s))
@@ -747,11 +894,14 @@ impl Field {
                     DevRate => d.rate.map_or("--".into(), |r| fmt_si(r, "S/s")),
                     ExportDir => d.export_dir.clone(),
                     SettingsFile => d.settings_file.clone(),
+                    LogDir => d.log_dir.clone(),
+                    LogFree => d.log_free.map_or("--".into(), crate::logger::fmt_bytes),
                     _ => String::new(),
                 }
             }
             Kind::Action => match self {
                 Act(Action::RunStop) => if d.running { "RUN" } else { "STOP" }.into(),
+                Act(Action::Record) => if d.recording { "● REC" } else { "off" }.into(),
                 _ => "⏎".into(),
             },
         }
@@ -1159,6 +1309,13 @@ impl Panel {
                     }
                 }
             }
+            Focus::Values if self.current() == Some(Field::LogOpen) => {
+                if d.recent_logs.is_empty() {
+                    return Outcome::None;
+                }
+                self.focus = Focus::Items;
+                Outcome::Action(Action::OpenLog(self.value))
+            }
             Focus::Values => {
                 // The value is already applied: go back to the settings.
                 self.focus = Focus::Items;
@@ -1409,6 +1566,8 @@ mod tests {
             for f in c.fields {
                 assert!(!f.label().is_empty() && !f.help().is_empty(), "{f:?}");
                 match f.kind() {
+                    // Its options are the log files on the disk.
+                    _ if f == Field::LogOpen => assert_eq!(f.value(&s, &d), "none"),
                     Kind::Choice | Kind::Bool => {
                         let o = f.options(&s, &d);
                         assert!(f.index(&s) < o.len(), "{f:?}");
@@ -1439,6 +1598,52 @@ mod tests {
     }
 
     #[test]
+    fn logger_category_and_estimate() {
+        let mut s = Settings::default();
+        let mut d = DeviceInfo {
+            recent_logs: vec!["log-b.ohlog".into(), "log-a.ohlog".into()],
+            log_free: Some(500_000_000),
+            ..Default::default()
+        };
+        let cats = categories();
+        let lg = cats.iter().find(|c| c.name == "Logger").unwrap();
+        assert!(lg.fields.len() <= 11);
+        assert_eq!(Field::LogLimit.value(&s, &d), "1 GB ≈ 11 h 34 min");
+        assert_eq!(
+            Field::LogLimit.help_text(&s, &d),
+            "Limit 1 GB ≈ 11 h 34 min at 1 ms step · only 500 MB free (≈ 5 h 47 min)"
+        );
+        d.log_free = Some(5_000_000_000);
+        assert_eq!(
+            Field::LogLimit.help_text(&s, &d),
+            "Limit 1 GB ≈ 11 h 34 min at 1 ms step"
+        );
+        s.channels[1].enabled = false;
+        s.logger.step = 2.5e-6;
+        assert_eq!(Field::LogLimit.value(&s, &d), "1 GB ≈ 10 min");
+        assert!(Field::LogStep
+            .help_text(&s, &d)
+            .contains("ADC at 400 kS/s, 1 sample per step"));
+        assert_eq!(Field::LogOpen.value(&s, &d), "2 logs");
+        // Enter on a recent log opens it.
+        let mut p = Panel::new();
+        p.cat = cats.iter().position(|c| c.name == "Logger").unwrap();
+        p.focus = Focus::Items;
+        p.item = lg.fields.iter().position(|f| *f == Field::LogOpen).unwrap();
+        let k = |p: &mut Panel, s: &mut Settings, c| p.handle_key(KeyEvent::from(c), s, &d);
+        k(&mut p, &mut s, KeyCode::Enter);
+        assert_eq!(p.focus, Focus::Values);
+        k(&mut p, &mut s, KeyCode::Char('j'));
+        assert_eq!(
+            k(&mut p, &mut s, KeyCode::Enter),
+            Outcome::Action(Action::OpenLog(1))
+        );
+        // The 13 categories are still the most rows (the size limit list
+        // has 13 too).
+        assert_eq!(Panel::new().column_rows(&s, &d), 13);
+    }
+
+    #[test]
     fn hjkl_moves_between_columns() {
         let mut p = Panel::new();
         let mut s = Settings::default();
@@ -1457,7 +1662,7 @@ mod tests {
         key(&mut p, &mut s, KeyCode::Char('h'));
         assert_eq!(p.focus, Focus::Categories);
         key(&mut p, &mut s, KeyCode::Char('G'));
-        assert_eq!(p.groups()[p.cat].name, "Files");
+        assert_eq!(p.groups()[p.cat].name, "Logger");
         assert_eq!(key(&mut p, &mut s, KeyCode::Esc), Outcome::Close);
     }
 

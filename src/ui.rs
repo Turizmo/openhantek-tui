@@ -20,6 +20,8 @@ use crate::settings::*;
 use crate::si::{fmt_opt, fmt_percent, fmt_si};
 use crate::theme::Palette;
 
+mod log;
+
 const NAMES: [&str; 3] = ["CH1", "CH2", "MATH"];
 
 /// Spectrum scale: top line and dB per division.
@@ -57,6 +59,18 @@ pub fn draw(f: &mut TermFrame, app: &App) {
     .areas(area);
     let s = &app.scope.settings;
 
+    if app.show_log {
+        log::draw_log(f, app, main, &pal);
+        if app.panel_open {
+            draw_panel(f, app, panel, &pal);
+        }
+        log::draw_log_status(f, app, [status1, status2, status3], &pal);
+        if app.help {
+            draw_help(f, area, &log_help_rows());
+        }
+        return;
+    }
+
     // Measurement panel on the right, if there is room.
     let panel_w = measurement_width(app, main.width);
     let [view, meas] =
@@ -79,11 +93,35 @@ pub fn draw(f: &mut TermFrame, app: &App) {
         draw_panel(f, app, panel, &pal);
     }
     draw_channel_line(f, app, status1, &pal);
-    draw_time_line(f, app, status2);
+    match log::rec_status(app) {
+        Some(line) => f.render_widget(Paragraph::new(line), status2),
+        None => draw_time_line(f, app, status2),
+    }
     draw_message_line(f, app, status3);
     if app.help {
-        draw_help(f, area);
+        draw_help(f, area, &KEYS);
     }
+}
+
+/// The help rows of the log view: its keys, then the scope keys.
+fn log_help_rows() -> Vec<(&'static str, &'static str)> {
+    let mut rows: Vec<(&str, &str)> = crate::keys::LOG_HELP.to_vec();
+    rows.push(("", ""));
+    rows.extend(KEYS.iter().filter(|(k, _)| {
+        [
+            "q Esc",
+            "? F1",
+            "S F2",
+            "Tab S-Tab",
+            "1 2 3",
+            "↑ ↓",
+            "[ ]",
+            "{ }",
+            "0",
+        ]
+        .contains(k)
+    }));
+    rows
 }
 
 /// Rows for the settings panel on a screen `h` rows high, when its
@@ -281,6 +319,12 @@ fn title(app: &App) -> Line<'static> {
     }
     if sc.autoset_running() {
         spans.push(Span::styled(" AUTOSET", Style::default().fg(Color::Yellow)));
+    }
+    if app.recording() {
+        spans.push(Span::styled(
+            " ● REC: live view paused, V shows the log ",
+            Style::default().fg(Color::White).bg(Color::Red),
+        ));
     }
     spans.push(Span::raw(" "));
     Line::from(spans)
@@ -1127,7 +1171,7 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
 
     // Help for the field, in the colour of the heading, so it does not
     // look like one more setting row.
-    let help_text = current.map_or("", |f| f.help());
+    let help_text = current.map_or(String::new(), |f| f.help_text(s, &d));
     f.render_widget(
         Paragraph::new(Line::styled(format!(" {help_text}"), panel_heading(pal))),
         help,
@@ -1234,7 +1278,7 @@ fn panel_foot(
 }
 
 /// Every key, for the help screen and the README.
-pub const KEYS: [(&str, &str); 45] = [
+pub const KEYS: [(&str, &str); 47] = [
     ("q Esc", "quit (saves settings)"),
     ("? F1", "this help"),
     ("S F2", "settings panel (h j k l, / search, type numbers)"),
@@ -1276,14 +1320,16 @@ pub const KEYS: [(&str, &str); 45] = [
     ("E", "export the screen as CSV"),
     ("W", "export the screen as JSON"),
     ("R", "reset all settings"),
+    ("r", "start / stop the envelope logger"),
+    ("V", "log view (strip chart of the log)"),
     ("Ctrl-C", "quit"),
     ("", ""),
     ("", "The calibration output pins give a"),
     ("", "2 Vpp square wave at this frequency."),
 ];
 
-fn draw_help(f: &mut TermFrame, area: Rect) {
-    let rows: Vec<Line> = KEYS
+fn draw_help(f: &mut TermFrame, area: Rect, keys: &[(&str, &str)]) {
+    let rows: Vec<Line> = keys
         .iter()
         .map(|(k, d)| {
             Line::from(vec![

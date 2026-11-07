@@ -30,8 +30,9 @@ pub const STEPS: [f64; 24] = [
 /// The default step: 1 ms.
 pub const STEP_DEFAULT: f64 = 1e-3;
 
-/// Size limits in bytes; 0 means no limit.
-pub const LIMITS: [u64; 14] = [
+/// Size limits in bytes; 0 means no limit. 13 entries, no more than the
+/// panel categories, so the list does not make the settings panel higher.
+pub const LIMITS: [u64; 13] = [
     10_000_000,
     20_000_000,
     50_000_000,
@@ -44,7 +45,6 @@ pub const LIMITS: [u64; 14] = [
     10_000_000_000,
     20_000_000_000,
     50_000_000_000,
-    100_000_000_000,
     0,
 ];
 /// The default limit: 1 GB.

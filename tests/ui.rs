@@ -736,8 +736,9 @@ fn settings_panel_height_is_fixed_and_fits_its_content() {
     let mut r = rig();
     r.char('S');
     let first = panel_rows(&r.screen(120, 40));
-    // Smaller than the old 40 % of the screen (16 rows at 120x40).
-    assert!(first < 16, "{first}");
+    // Not more than the old 40 % of the screen (16 rows at 120x40): 13
+    // categories (with the Logger) and 3 rows around them.
+    assert!(first <= 16, "{first}");
     let cats = r.app.panel.groups().len();
     let mut seen = 0;
     for c in 0..cats {

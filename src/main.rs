@@ -32,6 +32,12 @@ struct Args {
     /// Folder for exported CSV and JSON files [default: current folder].
     #[arg(long, value_name = "DIR")]
     export_dir: Option<PathBuf>,
+    /// Folder for envelope logs [default: ~/.local/share/openhantek-tui/logs].
+    #[arg(long, value_name = "DIR")]
+    log_dir: Option<PathBuf>,
+    /// Open this log file in the log view.
+    #[arg(long, value_name = "FILE")]
+    open_log: Option<PathBuf>,
     /// Run autoset at start.
     #[arg(long)]
     autoset: bool,
@@ -72,6 +78,10 @@ fn main() -> Result<()> {
         app.export_dir = dir.clone();
     }
     app.settings_path = save_path.clone();
+    app.log_dir_override = args.log_dir.clone();
+    if let Some(p) = &args.open_log {
+        app.open_log(p);
+    }
     if let Some(e) = &load_error {
         app.notify(
             format!("{e}. Using defaults; the file will not be changed"),
