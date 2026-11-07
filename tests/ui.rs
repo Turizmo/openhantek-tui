@@ -13,6 +13,7 @@ use openhantek_tui::scope::{time_index, TrigState};
 use openhantek_tui::settings::*;
 use openhantek_tui::ui;
 use ratatui::backend::TestBackend;
+use ratatui::style::Modifier;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 
@@ -805,35 +806,45 @@ fn settings_panel_runs_actions_and_shows_device() {
 }
 
 #[test]
-fn panel_help_line_has_the_heading_colour() {
+fn panel_help_line_stands_apart_from_rows_and_title() {
     use openhantek_tui::theme::{ColorMode, Palette};
-    let mut r = rig();
-    r.app.scope.settings.display.colors = ColorMode::TrueColor;
-    r.char('s');
-    r.char('l');
-    let buf = r.buffer(120, 40);
-    let lines = r.screen(120, 40);
-    // Cell (column, row) where `needle` starts.
-    let find = |needle: &str| -> (u16, u16) {
-        let y = lines.iter().position(|l| l.contains(needle)).unwrap();
-        let col = lines[y]
-            .char_indices()
-            .position(|(i, _)| lines[y][i..].starts_with(needle))
-            .unwrap();
-        (col as u16, y as u16)
-    };
-    let (tx, ty) = find("Settings · Channel 1");
-    let (hx, hy) = find("Show this channel");
-    let (rx, ry) = find("Volts/div");
-    let title = buf[(tx, ty)].style();
-    let help = buf[(hx, hy)].style();
-    let row = buf[(rx, ry)].style();
-    assert_eq!(title.fg, help.fg);
-    assert_eq!(title.add_modifier, help.add_modifier);
-    let want = ui::panel_heading(&Palette::new(ColorMode::TrueColor));
-    assert_eq!((help.fg, help.add_modifier), (want.fg, want.add_modifier));
-    // A setting row does not look like it.
-    assert_ne!((row.fg, row.add_modifier), (help.fg, help.add_modifier));
+    for mode in [ColorMode::TrueColor, ColorMode::Ansi256, ColorMode::Ansi16] {
+        let mut r = rig();
+        r.app.scope.settings.display.colors = mode;
+        r.char('s');
+        r.char('l');
+        let buf = r.buffer(120, 40);
+        let lines = r.screen(120, 40);
+        // Cell (column, row) where `needle` starts.
+        let find = |needle: &str| -> (u16, u16) {
+            let y = lines.iter().position(|l| l.contains(needle)).unwrap();
+            let col = lines[y]
+                .char_indices()
+                .position(|(i, _)| lines[y][i..].starts_with(needle))
+                .unwrap();
+            (col as u16, y as u16)
+        };
+        let (tx, ty) = find("Settings · Channel 1");
+        let (hx, hy) = find("Show this channel");
+        let (rx, ry) = find("Volts/div");
+        let (sx, sy) = find("Probe");
+        let title = buf[(tx, ty)].style();
+        let help = buf[(hx, hy)].style();
+        let row = buf[(rx, ry)].style();
+        let selected = buf[(sx, sy)].style();
+        let want = ui::panel_help(&Palette::new(mode));
+        assert_eq!((help.fg, help.add_modifier), (want.fg, want.add_modifier));
+        assert!(help.add_modifier.contains(Modifier::ITALIC), "{mode:?}");
+        // Not like a setting row, the selected row or the title.
+        for other in [title, row, selected] {
+            assert_ne!(other.fg, help.fg, "{mode:?}");
+            assert_ne!(other.add_modifier, help.add_modifier, "{mode:?}");
+        }
+        // A thin rule on the help row sets it apart.
+        let line = &lines[hy as usize];
+        assert!(line.starts_with("├── Show this channel"), "{line}");
+        assert!(line.ends_with("─┤"), "{line}");
+    }
 }
 
 /// Rows of the open settings panel on the screen, borders included.

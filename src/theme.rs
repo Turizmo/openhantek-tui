@@ -192,6 +192,10 @@ pub struct Palette {
     pub trigger: Color,
     /// Labels in the plot margins.
     pub label: Color,
+    /// The help line of the settings panel: a blue gray that is neither
+    /// the gray of the labels and the panel title nor the plain text of
+    /// the setting rows.
+    pub help: Color,
 }
 
 impl Palette {
@@ -212,6 +216,7 @@ impl Palette {
                 xy: Color::Rgb(80, 250, 120),
                 trigger: Color::Rgb(255, 95, 95),
                 label: Color::Rgb(150, 150, 150),
+                help: Color::Rgb(120, 165, 205),
             },
             ColorMode::Ansi256 => Self {
                 trace: [Color::Indexed(220), Color::Indexed(45), Color::Indexed(171)],
@@ -224,6 +229,7 @@ impl Palette {
                 xy: Color::Indexed(84),
                 trigger: Color::Indexed(203),
                 label: Color::Indexed(246),
+                help: Color::Indexed(110),
             },
             ColorMode::Ansi16 => Self {
                 trace: [Color::LightYellow, Color::LightCyan, Color::LightMagenta],
@@ -236,6 +242,7 @@ impl Palette {
                 xy: Color::LightGreen,
                 trigger: Color::LightRed,
                 label: Color::Gray,
+                help: Color::Cyan,
             },
         }
     }

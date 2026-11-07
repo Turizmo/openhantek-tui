@@ -1393,18 +1393,41 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     }
     f.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), val_area);
 
-    // Help for the field, in the colour of the heading, so it does not
-    // look like one more setting row.
+    // Help for the field on a thin rule, in italic blue gray, so it does
+    // not look like one more setting row or like the title.
     let help_text = current.map_or(String::new(), |f| f.help_text(s, &d));
-    f.render_widget(
-        Paragraph::new(Line::styled(format!(" {help_text}"), panel_heading(pal))),
-        help,
-    );
+    // The rule runs into the side borders as ├ ┤.
+    let row = Rect {
+        x: help.x.saturating_sub(1),
+        width: help.width + 2,
+        ..help
+    };
+    f.render_widget(Paragraph::new(help_line(&help_text, row.width, pal)), row);
 }
 
-/// Style of the panel heading and of the help line of the setting.
+/// Style of the panel heading.
 pub fn panel_heading(pal: &Palette) -> Style {
     Style::default().fg(pal.label).add_modifier(Modifier::BOLD)
+}
+
+/// Style of the help text of the selected setting.
+pub fn panel_help(pal: &Palette) -> Style {
+    Style::default().fg(pal.help).add_modifier(Modifier::ITALIC)
+}
+
+/// The help line of the panel, `├── text ───┤` across the whole panel
+/// width: the rule in the border colour and the text in [`panel_help`].
+/// The rule sits on the help row itself, so the panel does not grow.
+fn help_line(text: &str, width: u16, pal: &Palette) -> Line<'static> {
+    let rule = Style::default().fg(pal.axis);
+    let text: String = text.chars().take((width as usize).saturating_sub(7)).collect();
+    let used = 6 + text.chars().count();
+    let rest = (width as usize).saturating_sub(used);
+    Line::from(vec![
+        Span::styled("├── ", rule),
+        Span::styled(text, panel_help(pal)),
+        Span::styled(format!(" {}┤", "─".repeat(rest)), rule),
+    ])
 }
 
 /// The value column of a number setting: the value in a box, the step and
