@@ -518,12 +518,22 @@ channels on/off work as in the scope view (`↑` `↓` `[` `]` `{` `}`
 | `←` `→` | scroll one division |
 | `PgUp` `PgDn` | scroll one screen |
 | `Home` `End` | start of the log / the newest data (and follow it) |
-| `+` `-` | zoom in / out (1-2-5 steps per dot column) |
+| `+` `-` | zoom in / out (1-2-5 steps per dot column, then 2 5 10 20 ... dot columns per step) |
 | `F` `n` | the whole log / one step per dot column |
 | `v` | time cursors A and B on / off |
-| `h` `l`, `H` `L` | move cursor A, cursor B |
+| `h` `l`, `H` `L` | move cursor A, cursor B (`Alt`: a tenth, at least one step) |
 | `t` | time labels: clock (UTC, with the date when the screen spans two days) or seconds since the start |
 | `E` | export CSV: between A and B when the cursors are on, else the whole log |
+
+Past one step per dot column `+` goes on: each step is drawn over 2,
+5, 10, 20 ... dot columns, until about 10 steps fill the screen. Each
+step is then a flat band from its min to its max, and the mean is a
+line through the middles of the steps; logs of single samples (2.5 µs
+to 10 µs steps) have no band, the line joins the samples. Time labels
+and the `/div` in the status line follow (like `1.1 ms/div`, with an
+extra decimal so the labels keep even steps), cursors sit in the middle
+of their step, and every cursor key (`Alt` too) moves at least one
+step, so a cursor can be put on each sample.
 
 With the cursors on, the first status line shows A, B, ΔT, and the min,
 max and mean of each channel between them. Zoomed out, each dot column

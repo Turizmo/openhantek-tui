@@ -13,6 +13,15 @@ pub fn zoom_steps() -> impl Iterator<Item = u64> {
     (0..13).flat_map(|e| [1u64, 2, 5].map(|m| m * 10u64.pow(e)))
 }
 
+/// Dot columns per step the zoom keys go through past one step per dot
+/// column (1-2-5), up to [`LogView::max_stretch`].
+pub fn stretch_steps() -> impl Iterator<Item = u64> {
+    zoom_steps().skip(1)
+}
+
+/// Steps the screen shows at the most zoom (about).
+pub const MIN_STEPS_ON_SCREEN: u64 = 10;
+
 /// Steps summed up per tick while the summary is built.
 pub const SUMMARY_BUDGET: u64 = 4 << 20;
 /// Save the summary next to the log when it took at least this many
@@ -46,6 +55,9 @@ pub struct LogView {
     pub pyr: Pyramid,
     /// Steps per dot column; `None`: the whole log fits.
     pub zoom: Option<u64>,
+    /// Dot columns per step, when zoomed in past one step per dot
+    /// column (`zoom` is then `Some(1)`); 1 otherwise.
+    pub stretch: u64,
     /// Step at the left edge, when not following.
     pub start: u64,
     /// Keep the newest data at the right edge.
@@ -70,6 +82,7 @@ impl LogView {
             file,
             pyr,
             zoom: None,
+            stretch: 1,
             start: 0,
             follow: true,
             cursors: false,
@@ -123,10 +136,53 @@ impl LogView {
         }
     }
 
+    /// Dot columns per step: more than 1 only when zoomed in past one
+    /// step per dot column.
+    pub fn k(&self) -> u64 {
+        if self.zoom == Some(1) {
+            self.stretch.max(1)
+        } else {
+            1
+        }
+    }
+
+    /// The most dot columns per step for a plot `w` dot columns wide: the
+    /// screen keeps about [`MIN_STEPS_ON_SCREEN`] steps.
+    pub fn max_stretch(w: usize) -> u64 {
+        (w as u64 / MIN_STEPS_ON_SCREEN).max(1)
+    }
+
+    /// Steps on the screen (the last one may be cut at the right edge).
+    pub fn span(&self, w: usize) -> u64 {
+        let k = self.k();
+        if k > 1 {
+            (w as u64).div_ceil(k)
+        } else {
+            self.z(w) * w as u64
+        }
+    }
+
+    /// Steps per dot column, below 1 when zoomed in past one step per
+    /// dot column.
+    pub fn steps_per_col(&self, w: usize) -> f64 {
+        self.z(w) as f64 / self.k() as f64
+    }
+
+    /// Dot column (from the left edge) of step `i`; steps can be
+    /// fractional (`i + 0.5` is the middle of step `i`).
+    pub fn col_of(&self, w: usize, i: f64) -> f64 {
+        (i - self.left(w) as f64) / self.steps_per_col(w)
+    }
+
+    /// Step (fractional) at dot column `dc` from the left edge.
+    pub fn step_at(&self, w: usize, dc: f64) -> f64 {
+        self.left(w) as f64 + dc * self.steps_per_col(w)
+    }
+
     /// Step at the left edge, for a plot `w` dot columns wide.
     pub fn left(&self, w: usize) -> u64 {
         let z = self.z(w);
-        let span = z * w as u64;
+        let span = self.span(w);
         let s = if self.zoom.is_none() {
             0
         } else if self.follow {
@@ -137,17 +193,37 @@ impl LogView {
         s / z * z
     }
 
-    /// The columns to draw: `w` columns from [`LogView::left`].
+    /// Step of the first entry of [`LogView::columns`]: the left edge,
+    /// or when zoomed in past one step per dot column the step before it
+    /// (so the mean line runs to the edges).
+    pub fn first_entry(&self, w: usize) -> u64 {
+        let left = self.left(w);
+        if self.k() > 1 {
+            left.saturating_sub(1)
+        } else {
+            left
+        }
+    }
+
+    /// The columns to draw: `w` dot columns from [`LogView::left`]; when
+    /// zoomed in past one step per dot column ([`LogView::k`] > 1), one
+    /// entry per step instead, from [`LogView::first_entry`] to one step
+    /// past the right edge.
     pub fn columns(&self, w: usize) -> Result<Vec<Aggs>> {
         let z = self.z(w);
-        let start = self.left(w);
-        let key = (start, z, w, self.end(), self.pyr.covered);
+        let start = self.first_entry(w);
+        let n = if self.k() > 1 {
+            (self.left(w) - start + self.span(w) + 1) as usize
+        } else {
+            w
+        };
+        let key = (start, z, n, self.end(), self.pyr.covered);
         if let Some((k, cols)) = &*self.cache.borrow() {
             if *k == key {
                 return Ok(cols.clone());
             }
         }
-        let cols = self.pyr.columns(&self.file, start, z, w)?;
+        let cols = self.pyr.columns(&self.file, start, z, n)?;
         *self.cache.borrow_mut() = Some((key, cols.clone()));
         Ok(cols)
     }
@@ -156,8 +232,9 @@ impl LogView {
     /// dot columns per division.
     pub fn go(&mut self, m: Move, w: usize, div: usize) {
         let z = self.z(w);
+        let k = self.k();
         let left = self.left(w);
-        let span = z * w as u64;
+        let span = self.span(w);
         let end = self.end();
         let set_start = |v: &mut LogView, s: i64| {
             v.start = s.clamp(0, end as i64) as u64;
@@ -166,7 +243,8 @@ impl LogView {
         match m {
             Move::Divs(n) => {
                 self.zoom.get_or_insert(z);
-                set_start(self, left as i64 + n * (div as u64 * z) as i64);
+                let by = (div as u64 * z / k).max(1);
+                set_start(self, left as i64 + n * by as i64);
             }
             Move::Pages(n) => {
                 self.zoom.get_or_insert(z);
@@ -180,13 +258,29 @@ impl LogView {
             Move::End => self.follow = true,
             Move::Fit => {
                 self.zoom = None;
+                self.stretch = 1;
                 self.follow = true;
             }
             Move::ZoomIn | Move::ZoomOut | Move::Native => {
-                let new = match m {
-                    Move::ZoomIn => zoom_steps().filter(|s| *s < z).last().unwrap_or(1),
-                    Move::ZoomOut => zoom_steps().find(|s| *s > z).unwrap_or(z),
-                    _ => 1,
+                // Past one step per dot column the zoom goes on in dot
+                // columns per step.
+                let (new, stretch) = match m {
+                    Move::ZoomIn if z == 1 => {
+                        let max = Self::max_stretch(w);
+                        let s = stretch_steps().find(|s| *s > k).unwrap_or(k);
+                        (1, if s <= max { s } else { k })
+                    }
+                    Move::ZoomIn => (zoom_steps().filter(|s| *s < z).last().unwrap_or(1), 1),
+                    Move::ZoomOut if k > 1 => {
+                        (1, stretch_steps().filter(|s| *s < k).last().unwrap_or(1))
+                    }
+                    Move::ZoomOut => (zoom_steps().find(|s| *s > z).unwrap_or(z), 1),
+                    _ => (1, 1),
+                };
+                let new_span = if stretch > 1 {
+                    (w as u64).div_ceil(stretch)
+                } else {
+                    new * w as u64
                 };
                 // Keep the middle of the screen; the right edge when
                 // following, the left edge at the start of the log.
@@ -197,14 +291,16 @@ impl LogView {
                 };
                 if new as u128 * w as u128 >= end as u128 && m == Move::ZoomOut {
                     self.zoom = None;
+                    self.stretch = 1;
                     self.follow = true;
                     return;
                 }
                 self.zoom = Some(new);
+                self.stretch = stretch;
                 if !self.follow {
-                    let half = if mid == 0 { 0 } else { new * w as u64 / 2 };
+                    let half = if mid == 0 { 0 } else { new_span / 2 };
                     self.start = mid.saturating_sub(half);
-                    self.follow = self.start + new * w as u64 >= end;
+                    self.follow = self.start + new_span >= end;
                 }
             }
         }
@@ -214,26 +310,22 @@ impl LogView {
     pub fn toggle_cursors(&mut self, w: usize) {
         self.cursors = !self.cursors;
         if self.cursors {
-            let z = self.z(w);
             let left = self.left(w);
-            let span = (z * w as u64).min(self.end().saturating_sub(left));
+            let span = self.span(w).min(self.end().saturating_sub(left));
             self.cur = [left + span / 4, left + span * 3 / 4];
         }
     }
 
-    /// Move cursor `i` by `cols` dot columns.
     /// Move cursor `i` by `tenths` tenths of a dot column: 10 is one dot
-    /// column, 1 is a tenth of one (at least one log step).
+    /// column, 1 is a tenth of one; at least one log step, so when zoomed
+    /// in past one step per dot column each key lands on the next step.
     pub fn move_cursor(&mut self, i: usize, tenths: i64, w: usize) {
         if !self.cursors {
             self.toggle_cursors(w);
         }
         let z = self.z(w) as i64;
-        let steps = if tenths.abs() >= 10 {
-            tenths / 10 * z
-        } else {
-            ((tenths.abs() * z) / 10).max(1) * tenths.signum()
-        };
+        let k = self.k() as i64;
+        let steps = ((tenths.abs() * z) / (10 * k)).max(1) * tenths.signum();
         let v = self.cur[i] as i64 + steps;
         self.cur[i] = v.clamp(0, self.end() as i64) as u64;
     }
@@ -318,6 +410,82 @@ mod tests {
         assert_eq!(v.cur[1], 6_500);
         let a = v.cursor_aggs().unwrap();
         assert_eq!((a[0].min, a[0].max, a[0].n), (2_500.0, 6_500.0, 4_000));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn zoom_in_past_one_step_per_dot_column() {
+        // Its own log (the other test uses 10 000 steps).
+        let (mut v, dir) = view(10_001);
+        let w = 200;
+        v.go(Move::Native, w, 20);
+        v.go(Move::Divs(-10), w, 20);
+        assert_eq!((v.z(w), v.k()), (1, 1));
+        let left = v.left(w);
+        let mid = left + v.span(w) / 2;
+        // + goes on in dot columns per step, 1-2-5, up to about 10 steps
+        // on the screen (20 dot columns per step here).
+        let mut ks = Vec::new();
+        for _ in 0..8 {
+            v.go(Move::ZoomIn, w, 20);
+            ks.push(v.k());
+        }
+        assert_eq!(ks, [2, 5, 10, 20, 20, 20, 20, 20]);
+        assert_eq!(LogView::max_stretch(w), 20);
+        assert_eq!(v.zoom, Some(1));
+        assert_eq!(v.span(w), 10);
+        // The middle of the screen stays.
+        let l = v.left(w);
+        assert!(l <= mid && mid <= l + v.span(w), "{l} {mid}");
+        // One entry per step, from the step before the left edge to one
+        // past the right edge.
+        let cols = v.columns(w).unwrap();
+        assert_eq!(v.first_entry(w), l - 1);
+        assert_eq!(cols.len(), 12);
+        for (j, c) in cols.iter().enumerate() {
+            let i = (l - 1 + j as u64) as f32;
+            assert_eq!((c[0].min, c[0].max, c[0].n), (i, i + 1.0, 1), "{j}");
+        }
+        // Steps and dot columns map both ways, with fractions.
+        assert_eq!(v.col_of(w, l as f64 + 1.5), 30.0);
+        assert_eq!(v.step_at(w, 30.0), l as f64 + 1.5);
+        assert_eq!(v.steps_per_col(w), 0.05);
+        // Cursors: fine (a tenth) and normal both land on the next step.
+        v.toggle_cursors(w);
+        let a = v.cur[0];
+        v.move_cursor(0, 1, w);
+        assert_eq!(v.cur[0], a + 1);
+        v.move_cursor(0, -1, w);
+        v.move_cursor(0, -10, w);
+        assert_eq!(v.cur[0], a - 1);
+        // Scrolling a division moves one step (a division is 20 dot
+        // columns = one step).
+        let l = v.left(w);
+        v.go(Move::Divs(1), w, 20);
+        assert_eq!(v.left(w), l + 1);
+        // - goes back the same way, then to whole steps per column.
+        let mut back = Vec::new();
+        for _ in 0..5 {
+            v.go(Move::ZoomOut, w, 20);
+            back.push((v.z(w), v.k()));
+        }
+        assert_eq!(back, [(1, 10), (1, 5), (1, 2), (1, 1), (2, 1)]);
+        // n and F reset the stretch.
+        v.go(Move::ZoomIn, w, 20);
+        v.go(Move::ZoomIn, w, 20);
+        assert_eq!(v.k(), 2);
+        v.go(Move::Native, w, 20);
+        assert_eq!((v.z(w), v.k()), (1, 1));
+        v.go(Move::ZoomIn, w, 20);
+        v.go(Move::Fit, w, 20);
+        assert_eq!((v.zoom, v.k()), (None, 1));
+        // Following the newest data at the most zoom: the last step is
+        // on the screen.
+        for _ in 0..30 {
+            v.go(Move::ZoomIn, w, 20);
+        }
+        assert!(v.follow);
+        assert_eq!(v.left(w) + v.span(w), 10_001);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

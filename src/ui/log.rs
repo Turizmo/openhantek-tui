@@ -54,24 +54,33 @@ pub fn clock_text(secs: f64, digits: usize, date: bool) -> String {
     }
 }
 
-/// Decimals that show a time step of `div` seconds.
+/// Decimals that show a time step of `div` seconds. A step that is not
+/// a round number (zoomed in past one log step per dot column, like
+/// 1.1 ms or 2.75 µs) gets up to two more, so the labels keep even
+/// steps.
 fn digits_for(div: f64) -> usize {
-    match div {
+    let d = match div {
         d if d >= 0.999 => 0,
         d if d >= 0.0999 => 1,
         d if d >= 0.00999 => 2,
         d if d >= 0.000999 => 3,
         _ => 6,
-    }
+    };
+    (d..=d + 2)
+        .find(|&n| {
+            let x = div * 10f64.powi(n as i32);
+            (x - x.round()).abs() < 0.01 * x.max(1.0)
+        })
+        .unwrap_or(d + 2)
 }
 
 /// A time on the time axis: step `i` of the open log.
-fn time_label(app: &App, i: u64, div: f64, date: bool) -> String {
+fn time_label(app: &App, i: f64, div: f64, date: bool) -> String {
     let Some(v) = &app.log_view else {
         return String::new();
     };
     let h = &v.file.header;
-    let t = v.file.time_of(i as f64);
+    let t = v.file.time_of(i);
     match app.scope.settings.logger.time_axis {
         TimeAxis::Clock => clock_text(h.start_secs() + t, digits_for(div), date),
         TimeAxis::Seconds => format!("{:.*}s", digits_for(div), t),
@@ -135,25 +144,24 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     grid(&mut plot, s, pal);
     let w = plot.dots_w();
     v.width.set(w);
-    let z = v.z(w);
     let start = v.left(w);
+    // Dot columns per step: above 1 the log is zoomed in past one step
+    // per dot column, and `cols` has one entry per step.
+    let k = v.k() as usize;
     let cols = v.columns(w).unwrap_or_default();
+    let first = v.first_entry(w);
     let per_div = 2 * g.cx;
     let x_of = |dc: f64| dc / per_div as f64 - H_DIVS / 2.0;
     let half_v = V_DIVS / 2.0;
 
     // Gaps: a dashed red line in each column with lost data.
-    let end = start + z * w as u64;
+    let end = start + v.span(w);
     for (a, b) in v.file.gaps() {
         if b < start || a >= end {
             continue;
         }
-        let c0 = (a.max(start) - start) / z;
-        let c1 = if b > a {
-            (b - 1).max(start) - start
-        } else {
-            a - start
-        } / z;
+        let c0 = v.col_of(w, a.max(start) as f64).floor() as u64;
+        let c1 = (v.col_of(w, b.max(a + 1) as f64).ceil() as u64).saturating_sub(1);
         let mut last = usize::MAX;
         for dc in c0..=c1.min(w as u64 - 1) {
             let cell = dc as usize / 2;
@@ -172,7 +180,10 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         .cur
         .iter()
         .map(|&c| {
-            let dc = (c as f64 - start as f64) / z as f64;
+            // Zoomed in past one step per dot column: the middle of the
+            // step, where its mean point is.
+            let at = if k > 1 { c as f64 + 0.5 } else { c as f64 };
+            let dc = v.col_of(w, at);
             (v.cursors && dc >= 0.0 && dc <= w as f64).then(|| x_of(dc))
         })
         .collect();
@@ -200,35 +211,61 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         if dim {
             plot.dim_upto(fill_layer);
         }
+        // The mean: a point per dot column, or (zoomed in past one step
+        // per dot column) a point in the middle of each step, joined.
         let pts: Vec<(f64, f64)> = cols
             .iter()
             .enumerate()
-            .map(|(dc, a)| {
+            .map(|(j, a)| {
                 let a = a[t];
-                let x = x_of(dc as f64);
-                (x, if a.is_empty() { f64::NAN } else { yd(a.mean) })
+                let dc = if k > 1 {
+                    v.col_of(w, (first + j as u64) as f64 + 0.5)
+                } else {
+                    j as f64
+                };
+                (x_of(dc), if a.is_empty() { f64::NAN } else { yd(a.mean) })
             })
             .collect();
+        // Single samples have no band: the line joins the samples.
+        let band = !(k > 1 && h.single());
         let braille = matches!(style, TraceStyle::BrailleThin | TraceStyle::BrailleBold);
         if braille {
             // The mean first: the fill on the same layer joins its cells
             // (one colour per braille cell), so the band has no holes.
             plot.styled(&pts, style, false, layer, pal.trace[t]);
         }
-        for (dc, a) in cols.iter().enumerate() {
+        for (j, a) in cols.iter().enumerate() {
             let a = a[t];
-            if a.is_empty() {
+            if a.is_empty() || !band {
                 continue;
             }
+            // The dot columns of this entry: one, or a whole step as a
+            // flat band.
+            let dcs = if k > 1 {
+                let c0 = v.col_of(w, (first + j as u64) as f64).max(0.0) as usize;
+                let c1 = (v.col_of(w, (first + j as u64 + 1) as f64).max(0.0) as usize).min(w);
+                c0..c1
+            } else {
+                j..j + 1
+            };
             if braille {
                 let y0 = plot.py(yd(a.max)).floor() as i64;
                 let y1 = plot.py(yd(a.min)).floor() as i64;
-                plot.vrun(dc as i64, y0, y1, layer, fill);
+                for dc in dcs {
+                    plot.vrun(dc as i64, y0, y1, layer, fill);
+                }
             } else {
                 let r0 = plot.row_of(yd(a.max));
                 let r1 = plot.row_of(yd(a.min));
-                for row in r0..=r1 {
-                    plot.put_glyph(dc / 2, row, fill_char(style), fill_layer, fill);
+                let mut last = usize::MAX;
+                for dc in dcs {
+                    if dc / 2 == last {
+                        continue;
+                    }
+                    last = dc / 2;
+                    for row in r0..=r1 {
+                        plot.put_glyph(dc / 2, row, fill_char(style), fill_layer, fill);
+                    }
                 }
             }
         }
@@ -242,13 +279,13 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let sel = s.selected.min(1);
     left_labels(buf, &g, &volts, Style::default().fg(pal.trace[sel]));
     // Time labels; the date too when the screen spans two days.
-    let div = (per_div as u64 * z) as f64 * h.step();
+    let div = per_div as f64 * v.steps_per_col(w) * h.step();
     let day = |i: u64| ((h.start_secs() + v.file.time_of(i as f64)) / 86_400.0).floor();
     let date = day(start) != day(end);
     bottom_labels(
         buf,
         &g,
-        |k| time_label(app, start + (k * per_div) as u64 * z, div, date),
+        |n| time_label(app, v.step_at(w, (n * per_div) as f64), div, date),
         Style::default().fg(pal.label),
     );
     if g.margins.left >= MARKER_W {
@@ -367,12 +404,12 @@ pub fn log_cursor_text(app: &App) -> Option<String> {
     let v = app.log_view.as_ref().filter(|v| v.cursors)?;
     let r = v.cursor_range();
     let step = v.file.header.step();
-    let div = step * (v.z(v.width.get()) * 20) as f64;
+    let div = step * v.steps_per_col(v.width.get()) * 20.0;
     let [a, b] = v.cur;
     let mut t = format!(
         "│ A {} B {} ΔT {}",
-        time_label(app, a, div, false),
-        time_label(app, b, div, false),
+        time_label(app, a as f64, div, false),
+        time_label(app, b as f64, div, false),
         fmt_si((r.end - r.start) as f64 * step, "s")
     );
     if let Ok(aggs) = v.cursor_aggs() {
@@ -410,7 +447,7 @@ pub fn draw_log_status(f: &mut TermFrame, app: &App, areas: [Rect; 3], pal: &Pal
         Some(v) => {
             let h = &v.file.header;
             let w = v.width.get();
-            let div = (v.z(w) * (w as u64 / 10).max(1)) as f64 * h.step();
+            let div = v.steps_per_col(w) * (w as u64 / 10).max(1) as f64 * h.step();
             let size = std::fs::metadata(&v.file.path).map_or(0, |m| m.len());
             let gaps = v.file.gaps().len();
             Line::styled(

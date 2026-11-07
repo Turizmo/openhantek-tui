@@ -382,3 +382,89 @@ fn delete_key_is_in_the_key_table() {
     assert_eq!(KeyMap::default().first(Act::PanelDeleteLog), "d");
     assert!(openhantek_tui::config::generate(&Settings::default()).contains("delete_log = \"d\""));
 }
+
+#[test]
+fn log_view_zooms_in_past_one_step_per_dot_column() {
+    let (mut app, dir) = app_with_log("stretch");
+    app.scope.settings.logger.time_axis = TimeAxis::Seconds;
+    app.scope.settings.channels[1].enabled = false;
+    screen(&app, 120, 40);
+    key(&mut app, KeyCode::Char('n'));
+    // Scroll into the sine, away from the gap and the newest data.
+    key(&mut app, KeyCode::Home);
+    for _ in 0..10 {
+        key(&mut app, KeyCode::PageDown);
+    }
+    for _ in 0..12 {
+        key(&mut app, KeyCode::Char('+'));
+        screen(&app, 120, 40);
+    }
+    let v = app.log_view.as_ref().unwrap();
+    let w = v.width.get();
+    let k = v.k() as usize;
+    // The biggest 1-2-5 stretch that keeps about 10 steps on screen.
+    let max = openhantek_tui::logger::view::LogView::max_stretch(w);
+    assert!(k as u64 <= max && k as u64 * 5 / 2 > max, "{k} {max}");
+    assert!(k >= 10, "{k}");
+    assert!(v.span(w) >= 10 && v.span(w) <= 12, "{}", v.span(w));
+    let left = v.left(w);
+    let lines = screen(&app, 120, 40);
+    // Time labels: seconds with sub-step spacing, starting at the left
+    // edge, in even steps.
+    let bottom = lines.iter().position(|l| l.starts_with('└')).unwrap();
+    let labels: Vec<f64> = lines[bottom - 1]
+        .split(|c: char| c == '│' || c.is_whitespace())
+        .filter_map(|t| t.strip_suffix('s')?.parse().ok())
+        .collect();
+    assert!(labels.len() >= 4, "{labels:?}");
+    assert!((labels[0] - left as f64 * 1e-3).abs() < 1e-5, "{labels:?} at {left}");
+    let d = labels[1] - labels[0];
+    assert!(d > 0.0 && d < 4e-3, "{labels:?}");
+    for p in labels.windows(2) {
+        assert!(((p[1] - p[0]) - d).abs() < 2e-5, "{labels:?}");
+    }
+    // The status line gives the time per division below one step.
+    let status = lines.iter().find(|l| l.contains(" step · ")).unwrap();
+    assert!(status.contains("µs/div") || status.contains("1.1 ms/div"), "{status}");
+    // Each step is a flat band: within the middle cells of a step all
+    // rows look the same, and the band changes between steps.
+    let plot: Vec<Vec<char>> = lines[1..lines.len() - 5]
+        .iter()
+        .map(|l| l.chars().collect())
+        .collect();
+    let column = |cell: usize| -> String {
+        plot.iter()
+            .map(|r| r.get(cell).copied().unwrap_or(' '))
+            .map(|c| if ('\u{2800}'..='\u{28ff}').contains(&c) { c } else { ' ' })
+            .collect()
+    };
+    // Plot cells start after the label margin; a step is k/2 cells.
+    let first_plot_cell = lines[2].chars().position(|c| c == '·' || c == '┼').unwrap();
+    let mut flat = 0;
+    let mut changes = 0;
+    for j in 1..v.span(w) as usize - 1 {
+        let c0 = v.col_of(w, (left + j as u64) as f64) as usize / 2 + first_plot_cell;
+        let a = column(c0 + 1);
+        let b = column(c0 + k / 2 - 2);
+        if a == b && a.trim() != "" {
+            flat += 1;
+        }
+        if column(c0 + 1) != column(c0 + 1 + k / 2) {
+            changes += 1;
+        }
+    }
+    assert!(flat >= 6, "flat {flat}\n{}", lines.join("\n"));
+    // The slow sine of the test log moves the band now and then.
+    assert!(changes >= 1, "changes {changes}\n{}", lines.join("\n"));
+    // Fine cursor keys land on single steps.
+    key(&mut app, KeyCode::Char('v'));
+    let a = app.log_view.as_ref().unwrap().cur[0];
+    app.handle_key(KeyEvent::new(
+        KeyCode::Char('l'),
+        ratatui::crossterm::event::KeyModifiers::ALT,
+    ));
+    assert_eq!(app.log_view.as_ref().unwrap().cur[0], a + 1);
+    let t = screen(&app, 120, 40).join("\n");
+    assert!(t.contains("ΔT"), "{t}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
