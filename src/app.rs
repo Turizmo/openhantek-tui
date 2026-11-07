@@ -64,6 +64,14 @@ impl App {
     }
 
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
+        // A fresh error stays a little while: a notice does not hide it.
+        if !error {
+            if let Some(m) = &self.message {
+                if m.error && m.at.elapsed() < Duration::from_secs(4) {
+                    return;
+                }
+            }
+        }
         self.message = Some(Message {
             text: text.into(),
             error,

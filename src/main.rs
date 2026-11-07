@@ -1,6 +1,6 @@
 //! openhantek-tui: a terminal oscilloscope for the Hantek DSO-6022BE.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -63,26 +63,41 @@ fn main() -> Result<()> {
         Some(p) => config::load::<Settings>(p),
         None => (Settings::default(), None),
     };
+    // Do not overwrite a settings file we could not read: keep the
+    // user's file so they can fix it.
+    let save_path = settings_path.filter(|_| load_error.is_none());
     let acq = Acquisition::spawn(opener(&args));
     let mut app = App::new(settings, Some(acq));
     if let Some(dir) = &args.export_dir {
         app.export_dir = dir.clone();
     }
-    if let Some(e) = load_error {
-        app.notify(e, true);
+    if let Some(e) = &load_error {
+        app.notify(
+            format!("{e}. Using defaults; the file will not be changed"),
+            true,
+        );
     }
     if args.autoset {
         app.scope.start_autoset();
     }
 
     if args.measure {
-        return measure_once(&mut app, args.csv.as_deref());
+        return match measure_once(&mut app, args.csv.as_deref()) {
+            // A closed pipe (like `| head`) is not an error.
+            Err(e)
+                if e.downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe) =>
+            {
+                Ok(())
+            }
+            r => r,
+        };
     }
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
-    if let Some(p) = &settings_path {
+    if let Some(p) = &save_path {
         if let Err(e) = config::save(p, &app.scope.settings) {
             eprintln!("Could not save settings to {}: {e:#}", p.display());
         }
@@ -133,7 +148,8 @@ fn measure_once(app: &mut App, csv: Option<&std::path::Path>) -> Result<()> {
             }
         }
         if let Some(m) = app.current_message().filter(|m| m.error) {
-            if !app.connected && t0.elapsed() > Duration::from_secs(25) {
+            // Opening failed (no scope, no permission): stop soon.
+            if !app.connected && t0.elapsed() > Duration::from_secs(2) {
                 bail!("{}", m.text);
             }
         }
@@ -144,7 +160,9 @@ fn measure_once(app: &mut App, csv: Option<&std::path::Path>) -> Result<()> {
     }
     let f = app.scope.frame.as_ref().expect("frame");
     let s = &app.scope.settings;
-    println!(
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
         "{} · {}/div · {} · {}",
         app.device_name,
         openhantek_tui::si::fmt_si(s.time_per_div(), "s"),
@@ -154,7 +172,7 @@ fn measure_once(app: &mut App, csv: Option<&std::path::Path>) -> Result<()> {
         } else {
             "not triggered"
         }
-    );
+    )?;
     for t in 0..3 {
         if !ui::trace_enabled(s, t) {
             continue;
@@ -165,13 +183,13 @@ fn measure_once(app: &mut App, csv: Option<&std::path::Path>) -> Result<()> {
         let unit = if t == 2 { s.math.mode.unit() } else { "V" };
         let rows = ui::measurement_rows(&m, unit);
         let text: Vec<String> = rows.iter().map(|(k, v)| format!("{k} {v}")).collect();
-        println!("{}: {}", ["CH1", "CH2", "MATH"][t], text.join(", "));
+        writeln!(out, "{}: {}", ["CH1", "CH2", "MATH"][t], text.join(", "))?;
     }
     if let Some(path) = csv {
         let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
         let saved = app.export_to(dir.unwrap_or(std::path::Path::new(".")), false)?;
         std::fs::rename(&saved, path)?;
-        println!("Saved {}", path.display());
+        writeln!(out, "Saved {}", path.display())?;
     }
     Ok(())
 }
