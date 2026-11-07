@@ -249,7 +249,7 @@ fn rec_status_line() {
 fn panel_shows_the_limit_estimate() {
     let mut app = App::new(Settings::default(), None);
     app.log_free = Some(500_000_000_000);
-    key(&mut app, KeyCode::Char('S'));
+    key(&mut app, KeyCode::Char('s'));
     for _ in 0..30 {
         if app.panel.groups()[app.panel.cat].name == "Logger" {
             break;

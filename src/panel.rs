@@ -5,7 +5,9 @@
 //! This is the model only: no drawing and no terminal. The drawing is in
 //! `ui.rs`.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::keys::{Act, KeyMap, View};
 
 use crate::dsp::fft::Window;
 use crate::dsp::trigger::Slope;
@@ -87,6 +89,7 @@ pub enum Field {
     DevRate,
     ExportDir,
     SettingsFile,
+    ConfigWarnings,
     LogStep,
     LogLimit,
     LogDir,
@@ -126,6 +129,8 @@ pub struct DeviceInfo {
     pub running: bool,
     pub export_dir: String,
     pub settings_file: String,
+    /// Problems found in the config file.
+    pub config_warnings: Vec<String>,
     /// A log is being recorded.
     pub recording: bool,
     pub log_dir: String,
@@ -245,6 +250,7 @@ pub fn categories() -> Vec<Category> {
             fields: vec![
                 ExportDir,
                 SettingsFile,
+                ConfigWarnings,
                 Act(Action::ExportCsv),
                 Act(Action::ExportJson),
                 LogOpen,
@@ -364,7 +370,8 @@ impl Field {
             DevCalibration => "Calibration",
             DevRate => "Sample rate",
             ExportDir => "Export folder",
-            SettingsFile => "Settings file",
+            SettingsFile => "Config file",
+            ConfigWarnings => "Config warnings",
             LogStep => "Step",
             LogLimit => "Size limit",
             LogDir => "Log folder",
@@ -433,7 +440,8 @@ impl Field {
             DevCalibration => "Where the calibration values came from.",
             DevRate => "Sample rate the ADC runs at now.",
             ExportDir => "Exports go here. Set it with --export-dir.",
-            SettingsFile => "Settings are saved here on quit. Set it with --settings.",
+            SettingsFile => "Settings and keys. Changes are saved here on quit, in place. Set it with --config.",
+            ConfigWarnings => "Problems in the config file; those entries use their defaults.",
             LogStep => "Time per log step: min, max and mean of each channel are saved per step.",
             LogLimit => "The log stops when the file reaches this size.",
             LogDir => "New logs go here. Set it with --log-dir or log_dir in the settings file.",
@@ -466,7 +474,7 @@ impl Field {
                 Kind::Number
             }
             Roll | DevModel | DevSerial | DevFirmware | DevState | DevCalibration | DevRate
-            | ExportDir | SettingsFile | LogDir | LogFree => Kind::Info,
+            | ExportDir | SettingsFile | ConfigWarnings | LogDir | LogFree => Kind::Info,
             Act(_) => Kind::Action,
             _ => Kind::Choice,
         }
@@ -599,6 +607,7 @@ impl Field {
                 )
             }
             Field::LogDir => format!("{} · {}", d.log_dir, self.help()),
+            Field::ConfigWarnings if !d.config_warnings.is_empty() => d.config_warnings.join(" · "),
             _ => self.help().to_string(),
         }
     }
@@ -910,6 +919,10 @@ impl Field {
                     DevRate => d.rate.map_or("--".into(), |r| fmt_si(r, "S/s")),
                     ExportDir => d.export_dir.clone(),
                     SettingsFile => d.settings_file.clone(),
+                    ConfigWarnings => match d.config_warnings.len() {
+                        0 => "none".into(),
+                        n => format!("{n}"),
+                    },
                     LogDir => tail(&d.log_dir, 24),
                     LogFree => d.log_free.map_or("--".into(), crate::logger::fmt_bytes),
                     _ => String::new(),
@@ -1142,33 +1155,46 @@ impl Panel {
         self.focus == Focus::Values && self.current().is_some_and(|f| f.kind() == Kind::Number)
     }
 
-    /// Handle one key. `s` is changed live; `d` gives read-only facts.
-    pub fn handle_key(&mut self, key: KeyEvent, s: &mut Settings, d: &DeviceInfo) -> Outcome {
+    /// Handle one key. `s` is changed live; `d` gives read-only facts;
+    /// `keys` has the bindings. Typing a value or a search uses fixed
+    /// keys (characters, Enter, Esc, Backspace, arrows).
+    pub fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        s: &mut Settings,
+        d: &DeviceInfo,
+        keys: &KeyMap,
+    ) -> Outcome {
         if self.input.is_some() {
-            return self.input_key(key, s);
+            return self.input_key(key, s, keys);
         }
         if self.searching {
             return self.search_key(key, s, d);
         }
+        let act = keys.action(&[View::Panel], &key);
         if self.on_number() {
-            if let Some(out) = self.number_key(key, s) {
+            if let Some(out) = self.number_key(key, act, s) {
                 self.pending_g = false;
                 return out;
             }
         }
         let g_was = std::mem::take(&mut self.pending_g);
-        match key.code {
-            KeyCode::Char('g') if g_was => self.jump(0, s, d),
-            KeyCode::Char('g') => {
+        let Some(act) = act else {
+            return Outcome::None;
+        };
+        let items = self.focus == Focus::Items;
+        match act {
+            Act::PanelTop if g_was => self.jump(0, s, d),
+            Act::PanelTop => {
                 self.pending_g = true;
                 Outcome::None
             }
-            KeyCode::Char('G') => self.jump(usize::MAX, s, d),
-            KeyCode::Char('j') | KeyCode::Down => self.step(1, s, d),
-            KeyCode::Char('k') | KeyCode::Up => self.step(-1, s, d),
-            KeyCode::Char('h') | KeyCode::Left => self.back(),
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.enter(s, d),
-            KeyCode::Esc => match self.focus {
+            Act::PanelBottom => self.jump(usize::MAX, s, d),
+            Act::PanelDown => self.step(1, s, d),
+            Act::PanelUp => self.step(-1, s, d),
+            Act::PanelBack => self.back(),
+            Act::PanelEnter => self.enter(s, d),
+            Act::PanelEscape => match self.focus {
                 Focus::Categories if !self.filter.is_empty() => {
                     self.filter.clear();
                     self.cat = 0;
@@ -1178,13 +1204,13 @@ impl Panel {
                 Focus::Categories => Outcome::Close,
                 _ => self.back(),
             },
-            KeyCode::Char('q') | KeyCode::Char('S') | KeyCode::F(2) => {
+            Act::PanelClose => {
                 if self.focus == Focus::Values {
                     self.focus = Focus::Items;
                 }
                 Outcome::Close
             }
-            KeyCode::Char('/') => {
+            Act::PanelSearch => {
                 self.searching = true;
                 self.filter.clear();
                 self.cat = 0;
@@ -1192,18 +1218,13 @@ impl Panel {
                 self.focus = Focus::Items;
                 Outcome::None
             }
-            KeyCode::Char(' ') if self.focus == Focus::Items => self.toggle(s, d, 1, true),
-            KeyCode::Char('+') | KeyCode::Char('=') if self.focus == Focus::Items => {
-                // `=` types a value on number fields; `+` steps them.
-                match (key.code, self.current().map(Field::kind)) {
-                    (KeyCode::Char('='), Some(Kind::Number)) => self.open_input(s),
-                    _ => self.toggle(s, d, 1, false),
-                }
-            }
-            KeyCode::Char('-') if self.focus == Focus::Items => self.toggle(s, d, -1, false),
-            KeyCode::Char('i') if self.focus == Focus::Items => match self.current() {
-                Some(f) if f.kind() == Kind::Number => self.open_input(s),
-                _ => Outcome::None,
+            Act::PanelToggle if items => self.toggle(s, d, 1, true),
+            Act::PanelNext if items => self.toggle(s, d, 1, false),
+            Act::PanelPrevious if items => self.toggle(s, d, -1, false),
+            // Types a value on number fields; the next value on others.
+            Act::PanelType if items => match self.current().map(Field::kind) {
+                Some(Kind::Number) => self.open_input(s),
+                _ => self.toggle(s, d, 1, false),
             },
             _ => Outcome::None,
         }
@@ -1400,7 +1421,7 @@ impl Panel {
 
     /// A key in the value column of a number setting, when not typing.
     /// `None`: the key does what it does in any column.
-    fn number_key(&mut self, key: KeyEvent, s: &mut Settings) -> Option<Outcome> {
+    fn number_key(&mut self, key: KeyEvent, act: Option<Act>, s: &mut Settings) -> Option<Outcome> {
         let f = self.current()?;
         let step = |s: &mut Settings, dir: i64| {
             let before = s.clone();
@@ -1411,35 +1432,39 @@ impl Panel {
                 Outcome::Changed
             }
         };
-        Some(match key.code {
-            KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('+') => step(s, 1),
-            KeyCode::Char('j') | KeyCode::Down => step(s, -1),
-            KeyCode::Char(' ') if matches!(f, Field::CursorPos(_)) => {
-                let c = s.cursors.get_mut(match f {
-                    Field::CursorPos(i) => i,
-                    _ => 0,
-                });
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        Some(match (act, key.code) {
+            // Digits, a point or a minus start a new value (before any
+            // binding: `-` types a minus here).
+            (_, KeyCode::Char(c)) if plain && (c.is_ascii_digit() || c == '.' || c == '-') => {
+                self.input = Some(c.to_string());
+                self.error = None;
+                Outcome::None
+            }
+            (Some(Act::PanelUp | Act::PanelNext), _) => step(s, 1),
+            (Some(Act::PanelDown | Act::PanelPrevious), _) => step(s, -1),
+            (Some(Act::PanelToggle), _) if matches!(f, Field::CursorPos(_)) => {
+                let Field::CursorPos(i) = f else {
+                    return None;
+                };
+                let c = s.cursors.get_mut(i);
                 c.enabled = !c.enabled;
                 if c.enabled {
                     s.cursors.hidden = false;
                 }
                 Outcome::Changed
             }
-            // Digits, a point or a minus start a new value.
-            KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
-                self.input = Some(c.to_string());
-                self.error = None;
-                Outcome::None
-            }
-            KeyCode::Char('=') | KeyCode::Char('i') => self.open_input(s),
-            KeyCode::Backspace => {
+            (Some(Act::PanelType), _) => self.open_input(s),
+            (_, KeyCode::Backspace) => {
                 self.open_input(s);
                 if let Some(t) = self.input.as_mut() {
                     t.pop();
                 }
                 Outcome::None
             }
-            KeyCode::Char('g') | KeyCode::Char('G') => Outcome::None,
+            (Some(Act::PanelTop | Act::PanelBottom), _) => Outcome::None,
             _ => return None,
         })
     }
@@ -1471,7 +1496,10 @@ impl Panel {
 
     /// A key while typing a number. Enter applies it; moving away (←, h,
     /// ↑ ↓, closing) applies it too; Esc drops only the typed text.
-    fn input_key(&mut self, key: KeyEvent, s: &mut Settings) -> Outcome {
+    fn input_key(&mut self, key: KeyEvent, s: &mut Settings, keys: &KeyMap) -> Outcome {
+        // Close keys that are not plain characters (like F2) close while
+        // typing too; characters are typed.
+        let close = keys.is(Act::PanelClose, &key) && !matches!(key.code, KeyCode::Char(_));
         match key.code {
             KeyCode::Esc => {
                 self.input = None;
@@ -1507,7 +1535,7 @@ impl Panel {
                 }
                 Err(()) => Outcome::None,
             },
-            KeyCode::F(2) => {
+            _ if close => {
                 // Close; a value that does not parse is dropped.
                 let _ = self.apply_input(s);
                 self.input = None;
@@ -1570,6 +1598,7 @@ mod tests {
             KeyEvent::new(code, KeyModifiers::NONE),
             s,
             &DeviceInfo::default(),
+            &KeyMap::default(),
         )
     }
 
@@ -1672,7 +1701,9 @@ mod tests {
         p.cat = cats.iter().position(|c| c.name == "Logger").unwrap();
         p.focus = Focus::Items;
         p.item = lg.fields.iter().position(|f| *f == Field::LogOpen).unwrap();
-        let k = |p: &mut Panel, s: &mut Settings, c| p.handle_key(KeyEvent::from(c), s, &d);
+        let k = |p: &mut Panel, s: &mut Settings, c| {
+            p.handle_key(KeyEvent::from(c), s, &d, &KeyMap::default())
+        };
         k(&mut p, &mut s, KeyCode::Enter);
         assert_eq!(p.focus, Focus::Values);
         k(&mut p, &mut s, KeyCode::Char('j'));
@@ -2018,7 +2049,7 @@ mod tests {
 
     #[test]
     fn close_keys() {
-        for code in [KeyCode::Char('q'), KeyCode::Char('S'), KeyCode::F(2)] {
+        for code in [KeyCode::Char('q'), KeyCode::Char('s'), KeyCode::F(2)] {
             let mut p = Panel::new();
             let mut s = Settings::default();
             goto(&mut p, &mut s, "Channel 1", "Volts/div");

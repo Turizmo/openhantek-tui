@@ -13,6 +13,7 @@ use crate::app::App;
 use crate::dsp::fft::{spectrum, Spectrum};
 use crate::dsp::measure::Measurements;
 use crate::dsp::sinc_interpolate;
+use crate::keys::{self, Act};
 use crate::panel::{Focus, Kind};
 use crate::plot::{self, Geometry, Plot, LABEL_W, MARKER_W};
 use crate::scope::{Frame, TrigState, MATH};
@@ -66,7 +67,7 @@ pub fn draw(f: &mut TermFrame, app: &App) {
         }
         log::draw_log_status(f, app, [status1, status2, status3], &pal);
         if app.help {
-            draw_help(f, area, &log_help_rows());
+            draw_help(f, area, &log_help_rows(app));
         }
         return;
     }
@@ -100,28 +101,26 @@ pub fn draw(f: &mut TermFrame, app: &App) {
     }
     draw_message_line(f, app, status3);
     if app.help {
-        draw_help(f, area, &KEYS);
+        draw_help(f, area, &scope_help_rows(app));
     }
 }
 
-/// The help rows of the log view: its keys, then the scope keys.
-fn log_help_rows() -> Vec<(&'static str, &'static str)> {
-    let mut rows: Vec<(&str, &str)> = crate::keys::LOG_HELP.to_vec();
-    rows.push(("", ""));
-    rows.extend(KEYS.iter().filter(|(k, _)| {
-        [
-            "q Esc",
-            "? F1",
-            "S F2",
-            "Tab S-Tab",
-            "1 2 3",
-            "↑ ↓",
-            "[ ]",
-            "{ }",
-            "0",
-        ]
-        .contains(k)
-    }));
+/// The help rows of the log view: its keys, then the scope keys that
+/// work there, with the user's bindings.
+fn log_help_rows(app: &App) -> Vec<(String, String)> {
+    let mut rows = keys::help_rows(&app.keys, keys::LOG_HELP);
+    rows.push((String::new(), String::new()));
+    rows.extend(keys::help_rows(&app.keys, keys::LOG_SCOPE_HELP));
+    rows
+}
+
+/// The help rows of the scope view, with the user's bindings.
+pub fn scope_help_rows(app: &App) -> Vec<(String, String)> {
+    let mut rows = keys::help_rows(&app.keys, keys::SCOPE_HELP);
+    rows.push(("Ctrl-C".into(), "quit".into()));
+    rows.push((String::new(), String::new()));
+    rows.push((String::new(), "The calibration output pins give a".into()));
+    rows.push((String::new(), "2 Vpp square wave at this frequency.".into()));
     rows
 }
 
@@ -1209,10 +1208,23 @@ fn draw_message_line(f: &mut TermFrame, app: &App, area: Rect) {
             }),
         ),
         (None, Some(st)) => Line::styled(format!(" {st}"), Style::default().fg(Color::Yellow)),
-        _ => Line::styled(
-            " ? help · S settings · q quit · space run/stop · a autoset · ←→ time · ↑↓ volts · tab channel",
-            Style::default().fg(Color::DarkGray),
-        ),
+        _ => {
+            let k = &app.keys;
+            Line::styled(
+                format!(
+                    " {} help · {} settings · {} quit · {} run/stop · {} autoset · {} time · {} volts · {} channel",
+                    k.first(Act::Help),
+                    k.first(Act::Settings),
+                    k.first(Act::Quit),
+                    k.first(Act::RunStop),
+                    k.first(Act::Autoset),
+                    k.label(&[Act::TimeSmaller, Act::TimeBigger]).replace(' ', ""),
+                    k.label(&[Act::VoltsSmaller, Act::VoltsBigger]).replace(' ', ""),
+                    k.first(Act::NextTrace).to_lowercase(),
+                ),
+                Style::default().fg(Color::DarkGray),
+            )
+        }
     };
     f.render_widget(Paragraph::new(line), area);
 }
@@ -1451,7 +1463,10 @@ fn panel_foot(
     pal: &Palette,
 ) -> Line<'static> {
     let p = &app.panel;
+    let k = &app.keys;
     let hint = Style::default().fg(Color::DarkGray);
+    let one = |a: Act| k.first(a);
+    let two = |a: Act, b: Act| format!("{}/{}", k.first(a), k.first(b));
     let foot_line = if p.input.is_some() {
         let label = current.map_or("", |f| f.label());
         Line::styled(
@@ -1460,11 +1475,28 @@ fn panel_foot(
         )
     } else if p.on_number() && width >= 90 {
         Line::styled(
-            " j/k ↑/↓ step · digits . - type a value (500m 2k 1.5u) · ⌫ edit · esc/h back · S close",
+            format!(
+                " {} step · digits . - type a value (500m 2k 1.5u) · ⌫ edit · {} back · {} close",
+                [Act::PanelDown, Act::PanelUp]
+                    .map(|a| {
+                        let ks: Vec<String> = k.keys(a).iter().map(keys::key_label).collect();
+                        ks.join("/")
+                    })
+                    .join(" "),
+                two(Act::PanelEscape, Act::PanelBack),
+                one(Act::PanelClose),
+            ),
             hint,
         )
     } else if p.on_number() {
-        Line::styled(" j/k step · type a value · ⌫ edit · esc back", hint)
+        Line::styled(
+            format!(
+                " {} step · type a value · ⌫ edit · {} back",
+                two(Act::PanelDown, Act::PanelUp),
+                one(Act::PanelEscape)
+            ),
+            hint,
+        )
     } else if p.searching {
         Line::from(vec![
             Span::styled(
@@ -1477,76 +1509,57 @@ fn panel_foot(
         ])
     } else if width >= 108 {
         Line::styled(
-            " j/k move · h/l out/in · esc back · space toggle · +/- step · / search · gg/G · S close",
+            format!(
+                " {} move · {} out/in · {} back · {} toggle · {} step · {} search · {}{}/{} · {} close",
+                two(Act::PanelDown, Act::PanelUp),
+                two(Act::PanelBack, Act::PanelEnter),
+                one(Act::PanelEscape),
+                one(Act::PanelToggle),
+                two(Act::PanelNext, Act::PanelPrevious),
+                one(Act::PanelSearch),
+                one(Act::PanelTop),
+                one(Act::PanelTop),
+                one(Act::PanelBottom),
+                one(Act::PanelClose),
+            ),
             hint,
         )
     } else {
         Line::styled(
-            " hjkl move · esc back · space toggle · +/- step · / find · S close",
+            format!(
+                " {}{}{}{} move · {} back · {} toggle · {} step · {} find · {} close",
+                one(Act::PanelBack),
+                one(Act::PanelDown),
+                one(Act::PanelUp),
+                one(Act::PanelEnter),
+                one(Act::PanelEscape),
+                one(Act::PanelToggle),
+                two(Act::PanelNext, Act::PanelPrevious),
+                one(Act::PanelSearch),
+                one(Act::PanelClose),
+            ),
             hint,
         )
     };
     foot_line
 }
 
-/// Every key, for the help screen and the README.
-pub const KEYS: [(&str, &str); 47] = [
-    ("q Esc", "quit (saves settings)"),
-    ("? F1", "this help"),
-    ("S F2", "settings panel (h j k l, / search, type numbers)"),
-    ("space", "run / stop"),
-    ("o", "single shot: arm the trigger once"),
-    ("a", "autoset"),
-    ("Tab S-Tab", "select CH1 / CH2 / MATH"),
-    ("1 2 3", "CH1 / CH2 / MATH on or off"),
-    ("↑ ↓", "volts/div of the selected trace"),
-    ("[ ]", "move the selected trace down / up"),
-    ("{ }", "move the selected trace a little"),
-    ("0", "selected trace to the center"),
-    ("c", "coupling DC / AC"),
-    ("p", "probe x1 / x10"),
-    ("i", "invert"),
-    ("m", "next math function (turns MATH on)"),
-    ("← →", "time/div"),
-    ("t", "trigger mode: Auto / Normal / Single"),
-    ("s", "trigger source CH1 / CH2"),
-    ("e", "trigger edge: rising / falling / both"),
-    ("+ -", "trigger level"),
-    ("T", "trigger level to the middle of the signal"),
-    (", .", "trigger position left / right"),
-    ("f", "spectrum (FFT) view"),
-    ("F", "spectrum zoom (span / 2)"),
-    ("w", "FFT window"),
-    ("x", "XY mode"),
-    ("M", "measurement panel"),
-    ("v", "hide / show the cursors (Settings › Cursors)"),
-    ("h l", "move time cursor A (when on)"),
-    ("H L", "move time cursor B (when on)"),
-    ("j k", "move voltage cursor A (when on)"),
-    ("J K", "move voltage cursor B (when on)"),
-    ("A", "averaging: 1 2 4 8 16 32 64"),
-    ("P", "persistence: 0 2 4 8 16 traces"),
-    ("d", "dots / lines"),
-    ("z", "sin(x)/x / linear interpolation"),
-    ("g G", "calibration output frequency up / down"),
-    ("E", "export the screen as CSV"),
-    ("W", "export the screen as JSON"),
-    ("R", "reset all settings"),
-    ("r", "start / stop the envelope logger"),
-    ("V", "log view (strip chart of the log)"),
-    ("Ctrl-C", "quit"),
-    ("", ""),
-    ("", "The calibration output pins give a"),
-    ("", "2 Vpp square wave at this frequency."),
-];
-
-fn draw_help(f: &mut TermFrame, area: Rect, keys: &[(&str, &str)]) {
+fn draw_help(f: &mut TermFrame, area: Rect, keys: &[(String, String)]) {
+    let w = keys
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(10);
     let rows: Vec<Line> = keys
         .iter()
         .map(|(k, d)| {
             Line::from(vec![
-                Span::styled(format!(" {k:<10}"), Style::default().fg(Color::LightYellow)),
-                Span::raw(*d),
+                Span::styled(
+                    format!(" {k:<w$} "),
+                    Style::default().fg(Color::LightYellow),
+                ),
+                Span::raw(d.clone()),
             ])
         })
         .collect();

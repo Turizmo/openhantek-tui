@@ -222,12 +222,19 @@ impl LogView {
     }
 
     /// Move cursor `i` by `cols` dot columns.
-    pub fn move_cursor(&mut self, i: usize, cols: i64, w: usize) {
+    /// Move cursor `i` by `tenths` tenths of a dot column: 10 is one dot
+    /// column, 1 is a tenth of one (at least one log step).
+    pub fn move_cursor(&mut self, i: usize, tenths: i64, w: usize) {
         if !self.cursors {
             self.toggle_cursors(w);
         }
         let z = self.z(w) as i64;
-        let v = self.cur[i] as i64 + cols * z;
+        let steps = if tenths.abs() >= 10 {
+            tenths / 10 * z
+        } else {
+            ((tenths.abs() * z) / 10).max(1) * tenths.signum()
+        };
+        let v = self.cur[i] as i64 + steps;
         self.cur[i] = v.clamp(0, self.end() as i64) as u64;
     }
 
@@ -302,7 +309,12 @@ mod tests {
         assert_eq!(cols[3][0].max, 400.0);
         v.toggle_cursors(w);
         assert_eq!(v.cur, [2_500, 7_500]);
-        v.move_cursor(1, -10, w);
+        v.move_cursor(1, -100, w);
+        assert_eq!(v.cur[1], 6_500);
+        // Fine: a tenth of a dot column.
+        v.move_cursor(1, -1, w);
+        assert_eq!(v.cur[1], 6_500 - v.z(w) / 10);
+        v.move_cursor(1, 1, w);
         assert_eq!(v.cur[1], 6_500);
         let a = v.cursor_aggs().unwrap();
         assert_eq!((a[0].min, a[0].max, a[0].n), (2_500.0, 6_500.0, 4_000));

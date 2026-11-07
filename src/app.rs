@@ -7,13 +7,33 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::acquire::{Acquisition, Command, Event, LogRequest};
 use crate::export;
-use crate::keys::{self, LogKey};
+use crate::keys::{Act, KeyMap, View};
 use crate::logger::view::LogView;
+use crate::logger::view::Move;
 use crate::logger::writer::{self as log_writer, LogState, Shared, StopReason};
 use crate::logger::{self, csv as log_csv};
 use crate::panel::{Action, DeviceInfo, Outcome, Panel};
 use crate::scope::{Scope, MATH};
 use crate::settings::*;
+
+/// What a logger key does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogKey {
+    /// Start or stop recording (everywhere).
+    Record,
+    /// Switch between the scope and the log view (everywhere).
+    ToggleView,
+    /// Scroll or zoom the log view.
+    Go(Move),
+    /// Time cursors on / off.
+    Cursors,
+    /// Move cursor A (0) or B (1) by dot columns.
+    Cursor(usize, i64),
+    /// Time labels: clock / seconds since start.
+    Axis,
+    /// Export the log as CSV (between the cursors when they are on).
+    Export,
+}
 
 /// Text on the message line.
 #[derive(Clone, Debug)]
@@ -46,6 +66,10 @@ pub struct App {
     pub device_notes: Vec<String>,
     pub panel: Panel,
     pub panel_open: bool,
+    /// The key bindings.
+    pub keys: KeyMap,
+    /// Problems found in the config file, for Settings › Files.
+    pub config_warnings: Vec<String>,
     sent_running: Option<bool>,
     /// The log being recorded, if any.
     pub rec: Option<Shared>,
@@ -81,6 +105,8 @@ impl App {
             device_notes: Vec::new(),
             panel: Panel::new(),
             panel_open: false,
+            keys: KeyMap::default(),
+            config_warnings: Vec::new(),
             sent_running: None,
             rec: None,
             log_view: None,
@@ -313,7 +339,7 @@ impl App {
         }
     }
 
-    /// A logger key (see [`crate::keys`]).
+    /// A logger action.
     fn log_key(&mut self, k: LogKey) {
         let w = self
             .log_view
@@ -432,67 +458,99 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl-C always quits, whatever the bindings are.
+        let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
+        if ctrl_c {
+            self.quit = true;
+            return;
+        }
         if self.help {
-            // Any key closes the help; q still quits.
-            match key.code {
-                KeyCode::Char('q') => self.quit = true,
-                KeyCode::Char('c') if ctrl => self.quit = true,
-                _ => self.help = false,
+            // Any key closes the help; the quit keys still quit.
+            if self.keys.is(Act::Quit, &key) {
+                self.quit = true;
             }
+            self.help = false;
             return;
         }
         if self.panel_open {
-            if ctrl && key.code == KeyCode::Char('c') {
-                self.quit = true;
-            } else {
-                self.panel_key(key);
-            }
+            self.panel_key(key);
             return;
         }
-        if let Some(k) = keys::log_key(&key, self.show_log) {
+        let views: &[View] = if self.show_log {
+            &[View::Global, View::Log, View::Scope]
+        } else {
+            &[View::Global, View::Scope]
+        };
+        if let Some(a) = self.keys.action(views, &key) {
+            self.act(a);
+        }
+    }
+
+    /// Do what a key action of the scope or log view does.
+    pub fn act(&mut self, a: Act) {
+        let log_move = match a {
+            Act::LogBack => Some(LogKey::Go(Move::Divs(-1))),
+            Act::LogOn => Some(LogKey::Go(Move::Divs(1))),
+            Act::LogPageBack => Some(LogKey::Go(Move::Pages(-1))),
+            Act::LogPageOn => Some(LogKey::Go(Move::Pages(1))),
+            Act::LogStart => Some(LogKey::Go(Move::Home)),
+            Act::LogEnd => Some(LogKey::Go(Move::End)),
+            Act::LogZoomIn => Some(LogKey::Go(Move::ZoomIn)),
+            Act::LogZoomOut => Some(LogKey::Go(Move::ZoomOut)),
+            Act::LogFit => Some(LogKey::Go(Move::Fit)),
+            Act::LogNative => Some(LogKey::Go(Move::Native)),
+            Act::LogCursors => Some(LogKey::Cursors),
+            Act::LogCursor(i, on) => Some(LogKey::Cursor(i, if on { 10 } else { -10 })),
+            Act::LogCursorFine(i, on) => Some(LogKey::Cursor(i, if on { 1 } else { -1 })),
+            Act::LogTimeLabels => Some(LogKey::Axis),
+            Act::LogExport => Some(LogKey::Export),
+            Act::Record => Some(LogKey::Record),
+            Act::LogView => Some(LogKey::ToggleView),
+            _ => None,
+        };
+        if let Some(k) = log_move {
             self.log_key(k);
             return;
         }
         let sel = self.scope.settings.selected;
         let s = &mut self.scope.settings;
-        match key.code {
-            KeyCode::Char('c') if ctrl => self.quit = true,
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Char('?') | KeyCode::F(1) => self.help = true,
-            KeyCode::Char('S') | KeyCode::F(2) => {
+        match a {
+            Act::Quit => self.quit = true,
+            Act::Help => self.help = true,
+            Act::Settings => {
                 self.panel_open = true;
                 return;
             }
 
             // Run control.
-            KeyCode::Char(' ') => self.action(Action::RunStop),
-            KeyCode::Char('o') => self.action(Action::Single),
-            KeyCode::Char('a') => self.action(Action::Autoset),
+            Act::RunStop => self.action(Action::RunStop),
+            Act::Single => self.action(Action::Single),
+            Act::Autoset => self.action(Action::Autoset),
 
             // Channels.
-            KeyCode::Tab => s.selected = (sel + 1) % 3,
-            KeyCode::BackTab => s.selected = (sel + 2) % 3,
-            KeyCode::Char('1') => s.channels[0].enabled ^= true,
-            KeyCode::Char('2') => s.channels[1].enabled ^= true,
-            KeyCode::Char('3') => s.math.enabled ^= true,
-            KeyCode::Up => {
+            Act::NextTrace => s.selected = (sel + 1) % 3,
+            Act::PrevTrace => s.selected = (sel + 2) % 3,
+            Act::Ch1 => s.channels[0].enabled ^= true,
+            Act::Ch2 => s.channels[1].enabled ^= true,
+            Act::Math => s.math.enabled ^= true,
+            Act::VoltsSmaller => {
                 let v = volt_idx(s, sel);
                 *v = v.saturating_sub(1);
             }
-            KeyCode::Down => {
+            Act::VoltsBigger => {
                 let v = volt_idx(s, sel);
                 *v = (*v + 1).min(VOLT_DIVS.len() - 1);
             }
-            KeyCode::Char(']') => move_offset(s, sel, 0.5),
-            KeyCode::Char('[') => move_offset(s, sel, -0.5),
-            KeyCode::Char('}') => move_offset(s, sel, 0.1),
-            KeyCode::Char('{') => move_offset(s, sel, -0.1),
-            KeyCode::Char('0') => *offset(s, sel) = 0.0,
-            KeyCode::Char('c') if sel < 2 => {
+            Act::TraceUp => move_offset(s, sel, 0.5),
+            Act::TraceDown => move_offset(s, sel, -0.5),
+            Act::TraceUpFine => move_offset(s, sel, 0.1),
+            Act::TraceDownFine => move_offset(s, sel, -0.1),
+            Act::TraceCenter => *offset(s, sel) = 0.0,
+            Act::Coupling if sel < 2 => {
                 s.channels[sel].coupling = s.channels[sel].coupling.toggle()
             }
-            KeyCode::Char('p') if sel < 2 => {
+            Act::Probe if sel < 2 => {
                 let ch = &mut s.channels[sel];
                 let old = ch.probe as f64;
                 ch.probe = if ch.probe == 1 { 10 } else { 1 };
@@ -501,75 +559,70 @@ impl App {
                     s.trigger.level *= ch.probe as f64 / old;
                 }
             }
-            KeyCode::Char('i') if sel < 2 => s.channels[sel].invert ^= true,
-            KeyCode::Char('m') => {
+            Act::Invert if sel < 2 => s.channels[sel].invert ^= true,
+            Act::MathFunction => {
                 s.math.mode = s.math.mode.next();
                 s.math.enabled = true;
             }
 
             // Time base.
-            KeyCode::Left => s.time_idx = s.time_idx.saturating_sub(1),
-            KeyCode::Right => s.time_idx = (s.time_idx + 1).min(TIME_DIVS.len() - 1),
+            Act::TimeSmaller => s.time_idx = s.time_idx.saturating_sub(1),
+            Act::TimeBigger => s.time_idx = (s.time_idx + 1).min(TIME_DIVS.len() - 1),
 
             // Trigger.
-            KeyCode::Char('t') => s.trigger.mode = s.trigger.mode.next(),
-            KeyCode::Char('s') => s.trigger.source = 1 - s.trigger.source.min(1),
-            KeyCode::Char('e') => s.trigger.slope = s.trigger.slope.next(),
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                s.trigger.level += 0.1 * s.channels[s.trigger.source].volts_per_div()
-            }
-            KeyCode::Char('-') | KeyCode::Char('_') => {
+            Act::TriggerMode => s.trigger.mode = s.trigger.mode.next(),
+            Act::TriggerSource => s.trigger.source = 1 - s.trigger.source.min(1),
+            Act::TriggerEdge => s.trigger.slope = s.trigger.slope.next(),
+            Act::TriggerUp => s.trigger.level += 0.1 * s.channels[s.trigger.source].volts_per_div(),
+            Act::TriggerDown => {
                 s.trigger.level -= 0.1 * s.channels[s.trigger.source].volts_per_div()
             }
-            KeyCode::Char('T') => self.action(Action::TriggerToMiddle),
-            KeyCode::Char(',') | KeyCode::Char('<') => {
-                s.trigger.position = (s.trigger.position - 0.05).max(0.0)
-            }
-            KeyCode::Char('.') | KeyCode::Char('>') => {
-                s.trigger.position = (s.trigger.position + 0.05).min(1.0)
-            }
+            Act::TriggerToMiddle => self.action(Action::TriggerToMiddle),
+            Act::TriggerLeft => s.trigger.position = (s.trigger.position - 0.05).max(0.0),
+            Act::TriggerRight => s.trigger.position = (s.trigger.position + 0.05).min(1.0),
 
             // Display.
-            KeyCode::Char('A') => s.display.averaging = next_in(&AVERAGING, s.display.averaging),
-            KeyCode::Char('P') => {
+            Act::Averaging => s.display.averaging = next_in(&AVERAGING, s.display.averaging),
+            Act::Persistence => {
                 s.display.persistence = next_in(&PERSISTENCE, s.display.persistence);
                 self.scope.history.clear();
             }
-            KeyCode::Char('d') => s.display.dots ^= true,
-            KeyCode::Char('z') => {
+            Act::Dots => s.display.dots ^= true,
+            Act::Interpolation => {
                 s.display.interpolation = match s.display.interpolation {
                     Interpolation::Sinc => Interpolation::Linear,
                     Interpolation::Linear => Interpolation::Sinc,
                 }
             }
-            KeyCode::Char('M') => s.display.measurements ^= true,
-            KeyCode::Char('f') => s.display.spectrum ^= true,
-            KeyCode::Char('F') => {
+            Act::MeasurePanel => s.display.measurements ^= true,
+            Act::Spectrum => s.display.spectrum ^= true,
+            Act::SpectrumZoom => {
                 s.display.spectrum_zoom = (s.display.spectrum_zoom + 1) % (MAX_SPECTRUM_ZOOM + 1)
             }
-            KeyCode::Char('w') => s.display.window = s.display.window.next(),
-            KeyCode::Char('x') => s.display.xy ^= true,
+            Act::FftWindow => s.display.window = s.display.window.next(),
+            Act::Xy => s.display.xy ^= true,
 
             // Cursors.
-            KeyCode::Char('v') => {
+            Act::Cursors => {
                 s.cursors.hidden ^= true;
                 if !s.cursors.hidden && !(0..4).any(|i| s.cursors.get(i).enabled) {
                     self.notify("No cursor is on: turn them on in Settings › Cursors", false);
                 }
             }
-            KeyCode::Char(c @ ('h' | 'l' | 'H' | 'L' | 'j' | 'k' | 'J' | 'K')) => move_cursor(s, c),
+            Act::CursorMove(i, up) => move_cursor(s, i, if up { 0.1 } else { -0.1 }),
+            Act::CursorFine(i, up) => move_cursor(s, i, if up { 0.01 } else { -0.01 }),
 
             // Calibration output.
-            KeyCode::Char('g') => s.cal_freq = next_in(&CAL_FREQS, s.cal_freq),
-            KeyCode::Char('G') => {
+            Act::CalFreqUp => s.cal_freq = next_in(&CAL_FREQS, s.cal_freq),
+            Act::CalFreqDown => {
                 let i = CAL_FREQS.iter().position(|f| *f == s.cal_freq).unwrap_or(0);
                 s.cal_freq = CAL_FREQS[(i + CAL_FREQS.len() - 1) % CAL_FREQS.len()];
             }
 
             // Files.
-            KeyCode::Char('E') => self.action(Action::ExportCsv),
-            KeyCode::Char('W') => self.action(Action::ExportJson),
-            KeyCode::Char('R') => self.action(Action::Reset),
+            Act::ExportCsv => self.action(Action::ExportCsv),
+            Act::ExportJson => self.action(Action::ExportJson),
+            Act::Reset => self.action(Action::Reset),
             _ => return,
         }
         self.changed();
@@ -579,7 +632,10 @@ impl App {
     fn panel_key(&mut self, key: KeyEvent) {
         let d = self.device_info();
         let persistence = self.scope.settings.display.persistence;
-        match self.panel.handle_key(key, &mut self.scope.settings, &d) {
+        match self
+            .panel
+            .handle_key(key, &mut self.scope.settings, &d, &self.keys)
+        {
             Outcome::None => {}
             Outcome::Changed => {
                 if self.scope.settings.display.persistence != persistence {
@@ -656,6 +712,7 @@ impl App {
                         .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
                 })
                 .collect(),
+            config_warnings: self.config_warnings.clone(),
             settings_file: self
                 .settings_path
                 .as_ref()
@@ -750,19 +807,10 @@ fn move_offset(s: &mut Settings, sel: usize, by: f64) {
     *o = o.clamp(-V_DIVS / 2.0, V_DIVS / 2.0);
 }
 
-/// h/l move time cursor A, H/L cursor B; j/k and J/K the voltage cursors.
-/// Only cursors that are on screen move.
-fn move_cursor(s: &mut Settings, key: char) {
-    let (i, by) = match key {
-        'h' => (0, -0.1),
-        'l' => (0, 0.1),
-        'H' => (1, -0.1),
-        'L' => (1, 0.1),
-        'j' => (2, -0.1),
-        'k' => (2, 0.1),
-        'J' => (3, -0.1),
-        _ => (3, 0.1),
-    };
+/// Move cursor `i` (0 time A, 1 time B, 2 voltage A, 3 voltage B) by
+/// `by` divisions (0.1, or 0.01 for the fine keys: less than one braille
+/// dot below 50 cells per division). Only cursors that are on screen move.
+fn move_cursor(s: &mut Settings, i: usize, by: f64) {
     if !s.cursors.shown(i) {
         return;
     }
@@ -772,5 +820,5 @@ fn move_cursor(s: &mut Settings, key: char) {
         V_DIVS / 2.0
     };
     let c = s.cursors.get_mut(i);
-    c.position = (((c.position + by) * 10.0).round() / 10.0).clamp(-limit, limit);
+    c.position = (((c.position + by) * 100.0).round() / 100.0).clamp(-limit, limit);
 }

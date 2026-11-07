@@ -132,7 +132,7 @@ fn help_overlay_lists_keys_and_closes() {
 #[test]
 fn every_key_in_the_help_does_something_or_is_documented() {
     // Each listed key changes state (or quits/opens help); none panics.
-    let keys: Vec<KeyCode> = "oa123[]{}0cpimtse+-T,.APdzMfFwxvhlHLjkJKgGR"
+    let keys: Vec<KeyCode> = "oa123[]{}0cpiMtSe+-T,.APdzmfFwxgGR"
         .chars()
         .map(KeyCode::Char)
         .chain([
@@ -177,7 +177,7 @@ fn keys_change_scales_and_trigger() {
     assert_eq!(r.app.scope.settings.trigger.mode, TriggerMode::Normal);
     r.char('e');
     assert_eq!(r.app.scope.settings.trigger.slope, Slope::Falling);
-    r.char('s');
+    r.char('S');
     assert_eq!(r.app.scope.settings.trigger.source, 1);
     r.char('+');
     // 0.1 div of CH2 (2 V/div).
@@ -319,7 +319,7 @@ fn math_channel_is_drawn_and_measured() {
     assert!(t.contains("M CH1+CH2 2 V/div"));
     assert!(t.contains("MATH"));
     assert!(r.app.scope.measure(2).is_some());
-    r.char('m');
+    r.char('M');
     assert!(r.text(160, 40).contains("M CH1-CH2"));
 }
 
@@ -464,7 +464,7 @@ fn grid_settings_in_the_panel_change_the_grid() {
     let before = r.screen(120, 40);
     assert!(count(&before, '·') > 50);
     // Display › Grid style: solid; Grid lines: full.
-    r.char('S');
+    r.char('s');
     r.char('/');
     for c in "grid style".chars() {
         r.char(c);
@@ -487,7 +487,7 @@ fn grid_settings_in_the_panel_change_the_grid() {
     r.char('l');
     r.char('j');
     assert_eq!(r.app.scope.settings.display.grid_extent, GridExtent::Full);
-    r.char('S');
+    r.char('s');
     let full = r.screen(120, 40);
     // Whole lines: many more line cells than the center cross alone.
     assert!(count(&full, '─') > 400, "{}", full.join("\n"));
@@ -676,7 +676,7 @@ fn trace_colours_follow_the_colour_setting() {
 #[test]
 fn settings_panel_opens_and_closes() {
     let mut r = rig();
-    r.char('S');
+    r.char('s');
     assert!(r.app.panel_open);
     let t = r.text(140, 40);
     assert!(t.contains("Settings · Channel 1"), "{t}");
@@ -693,7 +693,7 @@ fn settings_panel_opens_and_closes() {
     assert!(!r.app.panel_open);
     assert!(!r.app.quit);
     // Ctrl-C still quits from the panel.
-    r.char('S');
+    r.char('s');
     r.app
         .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(r.app.quit);
@@ -703,7 +703,7 @@ fn settings_panel_opens_and_closes() {
 fn settings_panel_changes_coupling_at_once_and_keeps_it() {
     use openhantek_tui::panel::Focus;
     let mut r = rig();
-    r.char('S');
+    r.char('s');
     // Channel 1 › Coupling is the 4th item.
     r.char('l');
     for _ in 0..3 {
@@ -723,7 +723,7 @@ fn settings_panel_changes_coupling_at_once_and_keeps_it() {
     assert!(r.text(140, 40).contains("CH1 1 V/div AC x1"));
     // The key hints no longer talk about keeping a value.
     assert!(!r.text(140, 40).contains("keep"));
-    r.char('S');
+    r.char('s');
     assert!(!r.app.panel_open);
     assert_eq!(r.app.scope.settings.channels[0].coupling, Coupling::Ac);
 }
@@ -731,7 +731,7 @@ fn settings_panel_changes_coupling_at_once_and_keeps_it() {
 #[test]
 fn settings_panel_search_and_typed_value() {
     let mut r = rig();
-    r.char('S');
+    r.char('s');
     r.char('/');
     for c in "level".chars() {
         r.char(c);
@@ -782,7 +782,7 @@ fn settings_panel_search_and_typed_value() {
 #[test]
 fn settings_panel_runs_actions_and_shows_device() {
     let mut r = rig();
-    r.char('S');
+    r.char('s');
     r.char('/');
     for c in "run".chars() {
         r.char(c);
@@ -809,7 +809,7 @@ fn panel_help_line_has_the_heading_colour() {
     use openhantek_tui::theme::{ColorMode, Palette};
     let mut r = rig();
     r.app.scope.settings.display.colors = ColorMode::TrueColor;
-    r.char('S');
+    r.char('s');
     r.char('l');
     let buf = r.buffer(120, 40);
     let lines = r.screen(120, 40);
@@ -853,7 +853,7 @@ fn panel_rows(lines: &[String]) -> usize {
 fn settings_panel_height_is_fixed_and_fits_its_content() {
     use openhantek_tui::panel::Focus;
     let mut r = rig();
-    r.char('S');
+    r.char('s');
     let first = panel_rows(&r.screen(120, 40));
     // Not more than the old 40 % of the screen (16 rows at 120x40): 13
     // categories (with the Logger) and 3 rows around them.
@@ -880,7 +880,7 @@ fn settings_panel_height_is_fixed_and_fits_its_content() {
     // A long option list (time/div) scrolls inside the same panel, and
     // the help line and key hints stay.
     let mut r = rig();
-    r.char('S');
+    r.char('s');
     while r.app.panel.groups()[r.app.panel.cat].name != "Timebase" {
         r.char('j');
     }
@@ -897,7 +897,7 @@ fn settings_panel_height_is_fixed_and_fits_its_content() {
     assert_eq!(panel_rows(&lines), first);
     let t = lines.join("\n");
     assert!(t.contains("●"), "{t}");
-    assert!(t.contains("S close"), "{t}");
+    assert!(t.contains("q close"), "{t}");
     // At 80x24 the panel shrinks so a small plot stays above it, and it
     // too keeps its size.
     r.key(KeyCode::Esc);
@@ -910,7 +910,7 @@ fn settings_panel_height_is_fixed_and_fits_its_content() {
 #[test]
 fn settings_panel_fits_small_screens() {
     let mut r = rig();
-    r.char('S');
+    r.char('s');
     for (w, h) in [(80, 24), (60, 20), (40, 12), (20, 8), (300, 100)] {
         let t = r.text(w, h);
         if w >= 60 {
@@ -1160,7 +1160,7 @@ fn each_cursor_has_its_own_style_and_colour() {
 fn settings_panel_changes_trace_style_live() {
     let mut r = rig();
     let before = r.screen(140, 40);
-    r.char('S');
+    r.char('s');
     // Channel 1 › Style is the last item.
     r.char('l');
     r.char('G');
@@ -1173,7 +1173,7 @@ fn settings_panel_changes_trace_style_live() {
     );
     assert!(r.text(140, 40).contains("braille bold"));
     r.key(KeyCode::Enter);
-    r.char('S');
+    r.char('s');
     assert!(!r.app.panel_open);
     assert_eq!(
         r.app.scope.settings.display.trace_style,
@@ -1309,4 +1309,82 @@ fn measure_panel_shows_cursors_before_the_other_traces_when_short() {
         assert!(ch1 > cur, "{t}");
     }
     assert!(t.contains("ΔT"), "{t}");
+}
+
+#[test]
+fn settings_open_with_s_enter_and_f2_and_trigger_source_is_capital_s() {
+    for k in [KeyCode::Char('s'), KeyCode::Enter, KeyCode::F(2)] {
+        let mut r = rig();
+        r.key(k);
+        assert!(r.app.panel_open, "{k:?}");
+        // Inside the panel Enter goes into the column, it does not close.
+        r.key(KeyCode::Enter);
+        assert!(r.app.panel_open);
+        assert_eq!(r.app.panel.focus, openhantek_tui::panel::Focus::Items);
+        r.char('s');
+        assert!(!r.app.panel_open);
+    }
+    let mut r = rig();
+    r.char('S');
+    assert_eq!(r.app.scope.settings.trigger.source, 1);
+    // m is the measurement panel now, M the math function.
+    r.char('m');
+    assert!(!r.app.scope.settings.display.measurements);
+    r.char('M');
+    assert!(r.app.scope.settings.math.enabled);
+}
+
+#[test]
+fn rebound_keys_work_and_show_in_the_help() {
+    use openhantek_tui::keys::KeyMap;
+    let mut r = rig();
+    let (keys, warnings) = KeyMap::from_table(&[
+        ("settings".into(), vec!["o".into()]),
+        ("help".into(), vec!["F10".into()]),
+        ("run_stop".into(), vec!["Ctrl-r".into()]),
+    ]);
+    // `o` was single shot: settings is first and keeps it.
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("key o is bound to settings and single"));
+    r.app.keys = keys;
+    r.char('s');
+    assert!(!r.app.panel_open);
+    r.char('o');
+    assert!(r.app.panel_open);
+    r.char('q');
+    assert!(!r.app.panel_open);
+    r.app
+        .handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(!r.app.scope.running);
+    r.char(' ');
+    assert!(!r.app.scope.running, "space is not run/stop any more");
+    r.key(KeyCode::F(10));
+    assert!(r.app.help);
+    let t = r.text(120, 40);
+    assert!(t.contains("F10") && t.contains("Ctrl-r"), "{t}");
+    assert!(t.contains("o Enter F2") || t.contains("o "), "{t}");
+    r.key(KeyCode::Esc);
+    assert!(!r.app.help);
+    // The hint line uses the bindings too.
+    r.app.message = None;
+    let t = r.text(120, 40);
+    let hint = t.lines().last().unwrap();
+    assert!(hint.contains("F10 help · o settings"), "{hint}");
+}
+
+#[test]
+fn fine_cursor_keys_move_a_hundredth_of_a_division() {
+    let mut r = rig();
+    cursors_on(&mut r, &[0, 3]);
+    r.app
+        .handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT));
+    assert!((r.app.scope.settings.cursors.time_a.position + 1.99).abs() < 1e-9);
+    // Alt-Shift-k arrives as Alt with a capital K (or with SHIFT).
+    r.app
+        .handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::ALT));
+    r.app.handle_key(KeyEvent::new(
+        KeyCode::Char('k'),
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert!((r.app.scope.settings.cursors.volt_b.position - 1.02).abs() < 1e-9);
 }
