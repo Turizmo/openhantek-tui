@@ -161,14 +161,32 @@ Press `S` (or `F2`). The panel opens at the bottom of the screen, and the
 live trace stays above it, so you see each change at once. It has three
 columns, like the file manager yazi: categories, the settings in that
 category with their values, and the possible values (or help) of the
-setting under the cursor.
+setting under the cursor. Number settings (positions, trigger level and
+position, cursor positions, calibration frequency) show their value in a
+box in the third column instead of a list:
+
+```
+│ Level                                 100 mV │ ╭────────╮
+│ Position                                50 % │ │ 100 mV │
+│ Level to middle                            ⏎ │ ╰────────╯
+│ Single shot                                ⏎ │ j k  ± 100 mV
+│                                              │ type: 500m 2k 1.5u
+```
+
+In that column `j` `k` (or `↓` `↑`, `+`) step the value down / up, and a
+digit, `.` or `-` starts typing a new value right there: `Backspace`
+edits, `Enter` applies, and so does moving away (`←` `h` `↑` `↓`, or
+closing the panel); `Esc` drops only the typed text. The calibration
+frequency steps through its fixed steps, and a typed frequency takes the
+nearest one. Settings with a fixed list (volts/div, styles, averaging)
+keep the list.
 
 The panel is only as high as its longest column needs: the 12
 categories, the most settings in any category, or the longest list of
 values, plus the title, the help line and the key hints (15 rows). It is
 worked out over all settings, not the one under the cursor, so it never
-changes size while you move. Value lists longer than 20 rows (time/div,
-calibration frequency) do not count; they scroll in the value column. On
+changes size while you move. Value lists longer than 20 rows (time/div)
+do not count; they scroll in the value column. On
 a short screen the panel shrinks so a small plot stays above it, and its
 columns scroll to keep the cursor in view.
 
@@ -180,7 +198,8 @@ columns scroll to keep the cursor in view.
 | `Esc` | go back one column; at the left: clear the search, then close |
 | `Space` | toggle on/off, or the next value |
 | `+` `-` | next / previous value; on numbers: one step up / down |
-| `=` `i` | type an exact number, like `500m`, `2k`, `1.5u`, `-0.2V`, `25%` |
+| digits `.` `-` | in the value column of a number: type it, like `500m`, `2k`, `1.5u`, `-0.2V`, `25%` |
+| `=` `i` | on a number: type it, starting from the current value |
 | `/` | search all settings as you type; `Enter` ends typing, `Esc` clears |
 | `gg` `G` | first / last row |
 | `S` `F2` `q` | close the panel (changes stay) |

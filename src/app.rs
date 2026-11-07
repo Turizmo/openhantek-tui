@@ -317,7 +317,11 @@ impl App {
                 }
                 self.changed();
             }
-            Outcome::Close => self.panel_open = false,
+            Outcome::Close => {
+                // Closing may apply a number that was being typed.
+                self.panel_open = false;
+                self.changed();
+            }
             Outcome::Action(a) => {
                 self.action(a);
                 self.changed();

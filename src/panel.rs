@@ -1,5 +1,6 @@
 //! Settings panel, with yazi-style keys: three columns (categories,
-//! settings, values), h/j/k/l to move, `/` to search, `=` to type a value.
+//! settings, values), h/j/k/l to move, `/` to search. Number settings
+//! show their value in the value column: j/k step it, digits type it.
 //!
 //! This is the model only: no drawing and no terminal. The drawing is in
 //! `ui.rs`.
@@ -367,9 +368,8 @@ impl Field {
         use Field::*;
         match self {
             ChEnabled(_) | ChInvert(_) | MathEnabled | Dots | Xy | SpecOn | MeasPanel => Kind::Bool,
-            ChOffset(_) | MathOffset | TrigLevel | TrigPosition | CursorT(_) | CursorV(_) => {
-                Kind::Number
-            }
+            ChOffset(_) | MathOffset | TrigLevel | TrigPosition | CursorT(_) | CursorV(_)
+            | CalFreq => Kind::Number,
             Roll | DevModel | DevSerial | DevFirmware | DevState | DevCalibration | DevRate
             | ExportDir | SettingsFile => Kind::Info,
             Act(_) => Kind::Action,
@@ -449,7 +449,6 @@ impl Field {
                 })
                 .collect(),
             CursorMode => list(&["off", "time", "voltage"]),
-            CalFreq => CAL_FREQS.iter().map(|f| fmt_si(*f as f64, "Hz")).collect(),
             _ => Vec::new(),
         }
     }
@@ -501,7 +500,6 @@ impl Field {
                 ],
                 &s.cursors.mode,
             ),
-            CalFreq => index_of(&CAL_FREQS, &s.cal_freq),
             _ => 0,
         }
     }
@@ -577,7 +575,6 @@ impl Field {
                     crate::settings::CursorMode::Volt,
                 ][i.min(2)]
             }
-            CalFreq => s.cal_freq = CAL_FREQS[i.min(CAL_FREQS.len() - 1)],
             _ => {}
         }
     }
@@ -590,6 +587,7 @@ impl Field {
             TrigLevel | CursorV(_) => "V",
             TrigPosition => "%",
             CursorT(_) => "s",
+            CalFreq => "Hz",
             _ => "",
         }
     }
@@ -617,6 +615,7 @@ impl Field {
                 let (scale, offset) = Self::cursor_scale(s);
                 (s.cursors.v[i] - offset) * scale
             }
+            CalFreq => s.cal_freq as f64,
             _ => 0.0,
         }
     }
@@ -647,6 +646,15 @@ impl Field {
                 let (scale, offset) = Self::cursor_scale(s);
                 s.cursors.v[i] = (v / scale + offset).clamp(-half_v, half_v);
             }
+            // The calibration output has fixed steps: the nearest one.
+            CalFreq if v > 0.0 => {
+                let far = |f: &&u32| ((**f as f64) / v).ln().abs();
+                s.cal_freq = *CAL_FREQS
+                    .iter()
+                    .min_by(|a, b| far(a).total_cmp(&far(b)))
+                    .unwrap_or(&1_000);
+            }
+            CalFreq => return Err("the frequency must be above 0".into()),
             _ => return Err(format!("{} is not a number", self.label())),
         }
         // Typing a cursor position turns that kind of cursor on.
@@ -656,6 +664,29 @@ impl Field {
             _ => {}
         }
         Ok(())
+    }
+
+    /// One step up (`dir` 1) or down (-1) of a number field: the next
+    /// step of the calibration frequency, the value plus [`Field::step`]
+    /// for the others.
+    pub fn step_number(self, s: &mut Settings, dir: i64) {
+        if self == Field::CalFreq {
+            let i = index_of(&CAL_FREQS, &s.cal_freq) as i64 + dir;
+            s.cal_freq = CAL_FREQS[i.clamp(0, CAL_FREQS.len() as i64 - 1) as usize];
+        } else {
+            let v = self.number(s) + dir as f64 * self.step(s);
+            let _ = self.set_number(s, v, "");
+        }
+    }
+
+    /// The step of [`Field::step_number`] as text.
+    pub fn step_text(self, s: &Settings) -> String {
+        match self {
+            Field::ChOffset(_) | Field::MathOffset => format!("± {:.1} div", self.step(s)),
+            Field::TrigPosition => format!("± {:.0} %", self.step(s)),
+            Field::CalFreq => "next / previous step".into(),
+            _ => format!("± {}", fmt_si(self.step(s), self.unit())),
+        }
     }
 
     /// Step for `+` and `-` on a number field, in its unit.
@@ -901,8 +932,8 @@ impl Panel {
             .flat_map(|c| &c.fields)
             .map(|f| match f.kind() {
                 Kind::Choice | Kind::Bool => f.options(s, d).len(),
-                // Value, step, a blank row and the key hint.
-                Kind::Number => 4,
+                // The value box, the step, the key hint and an error.
+                Kind::Number => 6,
                 Kind::Info | Kind::Action => 1,
             })
             .filter(|&n| n <= OPTION_ROWS_MAX)
@@ -937,6 +968,11 @@ impl Panel {
         self.item = self.item.min(n.saturating_sub(1));
     }
 
+    /// True when the value column shows a number (not a list).
+    pub fn on_number(&self) -> bool {
+        self.focus == Focus::Values && self.current().is_some_and(|f| f.kind() == Kind::Number)
+    }
+
     /// Handle one key. `s` is changed live; `d` gives read-only facts.
     pub fn handle_key(&mut self, key: KeyEvent, s: &mut Settings, d: &DeviceInfo) -> Outcome {
         if self.input.is_some() {
@@ -944,6 +980,12 @@ impl Panel {
         }
         if self.searching {
             return self.search_key(key, s, d);
+        }
+        if self.on_number() {
+            if let Some(out) = self.number_key(key, s) {
+                self.pending_g = false;
+                return out;
+            }
         }
         let g_was = std::mem::take(&mut self.pending_g);
         match key.code {
@@ -1101,7 +1143,10 @@ impl Panel {
                         self.focus = Focus::Values;
                         Outcome::None
                     }
-                    Kind::Number => self.open_input(s),
+                    Kind::Number => {
+                        self.focus = Focus::Values;
+                        Outcome::None
+                    }
                     Kind::Action => match f {
                         Field::Act(a) => Outcome::Action(a),
                         _ => Outcome::None,
@@ -1132,10 +1177,7 @@ impl Panel {
                 let i = (f.index(s) as i64 + dir).rem_euclid(n.max(1));
                 f.set_index(s, i as usize);
             }
-            Kind::Number => {
-                let v = f.number(s) + dir as f64 * f.step(s);
-                let _ = f.set_number(s, v, "");
-            }
+            Kind::Number => f.step_number(s, dir),
             Kind::Action => {
                 if let Field::Act(a) = f {
                     return Outcome::Action(a);
@@ -1150,11 +1192,13 @@ impl Panel {
         }
     }
 
+    /// Start typing a number, with the current value as the start text
+    /// (so Backspace edits it). Also moves to the value column: `=` and
+    /// `i` on a number setting.
     fn open_input(&mut self, s: &Settings) -> Outcome {
         if let Some(f) = self.current() {
             if f.kind() == Kind::Number {
                 let v = f.number(s);
-                // Start with the current value, so Backspace edits it.
                 let text = match f {
                     Field::ChOffset(_) | Field::MathOffset => format!("{v:.1}"),
                     Field::TrigPosition => format!("{v:.0}"),
@@ -1162,45 +1206,126 @@ impl Panel {
                 };
                 self.input = Some(text);
                 self.error = None;
+                self.focus = Focus::Values;
             }
         }
         Outcome::None
     }
 
+    /// A key in the value column of a number setting, when not typing.
+    /// `None`: the key does what it does in any column.
+    fn number_key(&mut self, key: KeyEvent, s: &mut Settings) -> Option<Outcome> {
+        let f = self.current()?;
+        let step = |s: &mut Settings, dir: i64| {
+            let before = s.clone();
+            f.step_number(s, dir);
+            if *s == before {
+                Outcome::None
+            } else {
+                Outcome::Changed
+            }
+        };
+        Some(match key.code {
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('+') => step(s, 1),
+            KeyCode::Char('j') | KeyCode::Down => step(s, -1),
+            // Digits, a point or a minus start a new value.
+            KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
+                self.input = Some(c.to_string());
+                self.error = None;
+                Outcome::None
+            }
+            KeyCode::Char('=') | KeyCode::Char('i') => self.open_input(s),
+            KeyCode::Backspace => {
+                self.open_input(s);
+                if let Some(t) = self.input.as_mut() {
+                    t.pop();
+                }
+                Outcome::None
+            }
+            KeyCode::Char('g') | KeyCode::Char('G') => Outcome::None,
+            _ => return None,
+        })
+    }
+
+    /// Apply the typed text. On an error the text stays, with the error.
+    fn apply_input(&mut self, s: &mut Settings) -> Result<Outcome, ()> {
+        let text = self.input.clone().unwrap_or_default();
+        let Some(f) = self.current() else {
+            self.input = None;
+            return Ok(Outcome::None);
+        };
+        let before = s.clone();
+        match parse_value(&text).and_then(|(v, unit)| f.set_number(s, v, &unit)) {
+            Ok(()) => {
+                self.input = None;
+                self.error = None;
+                Ok(if *s == before {
+                    Outcome::None
+                } else {
+                    Outcome::Changed
+                })
+            }
+            Err(e) => {
+                self.error = Some(e);
+                Err(())
+            }
+        }
+    }
+
+    /// A key while typing a number. Enter applies it; moving away (←, h,
+    /// ↑ ↓, closing) applies it too; Esc drops only the typed text.
     fn input_key(&mut self, key: KeyEvent, s: &mut Settings) -> Outcome {
         match key.code {
             KeyCode::Esc => {
                 self.input = None;
                 self.error = None;
+                Outcome::None
             }
             KeyCode::Backspace => {
                 if let Some(t) = self.input.as_mut() {
                     t.pop();
                 }
+                Outcome::None
+            }
+            KeyCode::Enter => self.apply_input(s).unwrap_or(Outcome::None),
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Tab => match self.apply_input(s) {
+                Ok(out) => {
+                    self.focus = Focus::Items;
+                    out
+                }
+                Err(()) => Outcome::None,
+            },
+            KeyCode::Up | KeyCode::Down => match self.apply_input(s) {
+                Ok(out) => {
+                    let dir = if key.code == KeyCode::Up { 1 } else { -1 };
+                    let before = s.clone();
+                    if let Some(f) = self.current() {
+                        f.step_number(s, dir);
+                    }
+                    if out == Outcome::Changed || *s != before {
+                        Outcome::Changed
+                    } else {
+                        Outcome::None
+                    }
+                }
+                Err(()) => Outcome::None,
+            },
+            KeyCode::F(2) => {
+                // Close; a value that does not parse is dropped.
+                let _ = self.apply_input(s);
+                self.input = None;
+                self.error = None;
+                self.focus = Focus::Items;
+                Outcome::Close
             }
             KeyCode::Char(c) => {
                 if let Some(t) = self.input.as_mut() {
                     t.push(c);
                 }
+                Outcome::None
             }
-            KeyCode::Enter => {
-                let text = self.input.clone().unwrap_or_default();
-                let Some(f) = self.current() else {
-                    self.input = None;
-                    return Outcome::None;
-                };
-                match parse_value(&text).and_then(|(v, unit)| f.set_number(s, v, &unit)) {
-                    Ok(()) => {
-                        self.input = None;
-                        self.error = None;
-                        return Outcome::Changed;
-                    }
-                    Err(e) => self.error = Some(e),
-                }
-            }
-            _ => {}
+            _ => Outcome::None,
         }
-        Outcome::None
     }
 
     fn search_key(&mut self, key: KeyEvent, s: &mut Settings, d: &DeviceInfo) -> Outcome {
@@ -1400,9 +1525,10 @@ mod tests {
         let mut p = Panel::new();
         let mut s = Settings::default();
         goto(&mut p, &mut s, "Trigger", "Level");
+        // `=` still types, with the value as the start text.
         key(&mut p, &mut s, KeyCode::Char('='));
-        assert!(p.input.is_some());
-        // Clear the start text, type a new value.
+        assert_eq!(p.focus, Focus::Values);
+        assert_eq!(p.input.as_deref(), Some("0V"));
         for _ in 0..10 {
             key(&mut p, &mut s, KeyCode::Backspace);
         }
@@ -1410,26 +1536,96 @@ mod tests {
         assert_eq!(key(&mut p, &mut s, KeyCode::Enter), Outcome::Changed);
         assert!((s.trigger.level - 0.5).abs() < 1e-12);
         assert!(p.input.is_none());
+        assert_eq!(p.focus, Focus::Values);
         // A bad value keeps the input open, with an error.
-        key(&mut p, &mut s, KeyCode::Char('i'));
-        for _ in 0..10 {
-            key(&mut p, &mut s, KeyCode::Backspace);
-        }
         keys(&mut p, &mut s, "abc");
+        assert!(p.input.is_none(), "letters do not start a value");
+        keys(&mut p, &mut s, "1x");
         assert_eq!(key(&mut p, &mut s, KeyCode::Enter), Outcome::None);
         assert!(p.error.is_some() && p.input.is_some());
+        // Esc drops only the typed text.
         key(&mut p, &mut s, KeyCode::Esc);
         assert!(p.input.is_none());
+        assert_eq!(p.focus, Focus::Values);
         assert!((s.trigger.level - 0.5).abs() < 1e-12);
-        // Enter on a number field opens the input too.
+        // Position takes percent.
         goto(&mut p, &mut s, "Trigger", "Position");
         key(&mut p, &mut s, KeyCode::Enter);
-        assert_eq!(p.input.as_deref(), Some("50"));
-        key(&mut p, &mut s, KeyCode::Backspace);
-        key(&mut p, &mut s, KeyCode::Backspace);
         keys(&mut p, &mut s, "25%");
         key(&mut p, &mut s, KeyCode::Enter);
         assert!((s.trigger.position - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn number_value_column_steps_and_types() {
+        let mut p = Panel::new();
+        let mut s = Settings::default();
+        goto(&mut p, &mut s, "Trigger", "Level");
+        // l goes to the value column, which shows the number, no list.
+        key(&mut p, &mut s, KeyCode::Char('l'));
+        assert_eq!(p.focus, Focus::Values);
+        assert!(p.on_number());
+        assert!(p.input.is_none());
+        // k and ↑ step up, j and ↓ down, by the +/- step (0.1 div = 100 mV).
+        assert_eq!(key(&mut p, &mut s, KeyCode::Char('k')), Outcome::Changed);
+        assert!((s.trigger.level - 0.1).abs() < 1e-12);
+        key(&mut p, &mut s, KeyCode::Up);
+        assert!((s.trigger.level - 0.2).abs() < 1e-12);
+        key(&mut p, &mut s, KeyCode::Char('j'));
+        key(&mut p, &mut s, KeyCode::Down);
+        key(&mut p, &mut s, KeyCode::Down);
+        assert!((s.trigger.level + 0.1).abs() < 1e-12);
+        assert_eq!(p.focus, Focus::Values);
+        // A digit starts a new value at once; SI suffixes work.
+        keys(&mut p, &mut s, "1.5");
+        assert_eq!(p.input.as_deref(), Some("1.5"));
+        assert!((s.trigger.level + 0.1).abs() < 1e-12, "not applied yet");
+        key(&mut p, &mut s, KeyCode::Backspace);
+        keys(&mut p, &mut s, "25m");
+        assert_eq!(p.input.as_deref(), Some("1.25m"));
+        assert_eq!(key(&mut p, &mut s, KeyCode::Enter), Outcome::Changed);
+        assert!((s.trigger.level - 1.25e-3).abs() < 1e-12);
+        // A minus starts a negative value; moving away applies it.
+        keys(&mut p, &mut s, "-2u");
+        assert_eq!(key(&mut p, &mut s, KeyCode::Left), Outcome::Changed);
+        assert!((s.trigger.level + 2e-6).abs() < 1e-15);
+        assert_eq!(p.focus, Focus::Items);
+        assert!(p.input.is_none());
+        // ↑ while typing applies, then steps.
+        key(&mut p, &mut s, KeyCode::Char('l'));
+        keys(&mut p, &mut s, "1");
+        key(&mut p, &mut s, KeyCode::Up);
+        assert!((s.trigger.level - 1.1).abs() < 1e-12);
+        // Backspace edits the current value.
+        key(&mut p, &mut s, KeyCode::Backspace);
+        assert_eq!(p.input.as_deref(), Some("1.1"));
+        // Esc cancels the typing, a second Esc goes back.
+        key(&mut p, &mut s, KeyCode::Esc);
+        assert_eq!(p.focus, Focus::Values);
+        key(&mut p, &mut s, KeyCode::Esc);
+        assert_eq!(p.focus, Focus::Items);
+        assert!((s.trigger.level - 1.1).abs() < 1e-12);
+        // The calibration frequency steps through its fixed steps, and a
+        // typed value snaps to the nearest one.
+        goto(&mut p, &mut s, "Calibration output", "Frequency");
+        key(&mut p, &mut s, KeyCode::Enter);
+        key(&mut p, &mut s, KeyCode::Char('k'));
+        assert_eq!(s.cal_freq, 1_200);
+        keys(&mut p, &mut s, "9.5k");
+        key(&mut p, &mut s, KeyCode::Enter);
+        assert_eq!(s.cal_freq, 10_000);
+        // Lists keep their list: j moves the option.
+        goto(&mut p, &mut s, "Display", "Averaging");
+        key(&mut p, &mut s, KeyCode::Char('l'));
+        assert!(!p.on_number());
+        key(&mut p, &mut s, KeyCode::Char('j'));
+        assert_eq!(s.display.averaging, 2);
+        // Closing while typing applies the value.
+        goto(&mut p, &mut s, "Trigger", "Level");
+        key(&mut p, &mut s, KeyCode::Char('l'));
+        keys(&mut p, &mut s, "300m");
+        assert_eq!(key(&mut p, &mut s, KeyCode::F(2)), Outcome::Close);
+        assert!((s.trigger.level - 0.3).abs() < 1e-12);
     }
 
     #[test]

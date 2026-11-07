@@ -1105,23 +1105,7 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
                     right.push(Line::styled(format!(" {mark} {o} "), style));
                 }
             }
-            Kind::Number => {
-                right.push(Line::from(format!(" Value  {}", field.value(s, &d))));
-                right.push(Line::from(format!(
-                    " Step   ± {}",
-                    match field {
-                        crate::panel::Field::ChOffset(_) | crate::panel::Field::MathOffset =>
-                            format!("{:.1} div", field.step(s)),
-                        crate::panel::Field::TrigPosition => format!("{:.0} %", field.step(s)),
-                        _ => fmt_si(field.step(s), field.unit()),
-                    }
-                )));
-                right.push(Line::from(""));
-                right.push(Line::styled(
-                    " = or ⏎ type a value · + - step",
-                    Style::default().fg(pal.label),
-                ));
-            }
+            Kind::Number => right = number_column(p, field, s, &d, pal),
             Kind::Info => {
                 right.push(Line::from(format!(" {}", field.value(s, &d))));
             }
@@ -1143,6 +1127,54 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     );
 }
 
+/// The value column of a number setting: the value in a box, the step and
+/// how to type. In the value column the box is bright; while typing it
+/// holds the typed text and a cursor.
+fn number_column(
+    p: &crate::panel::Panel,
+    field: crate::panel::Field,
+    s: &Settings,
+    d: &crate::panel::DeviceInfo,
+    pal: &Palette,
+) -> Vec<Line<'static>> {
+    let here = p.focus == Focus::Values;
+    let text = match (&p.input, here) {
+        (Some(t), true) => format!("{t}▏"),
+        _ => field.value(s, d),
+    };
+    let w = text.chars().count() + 2;
+    let (frame, value) = if here {
+        let c = Style::default().fg(pal.trace[0]);
+        (c, c.add_modifier(Modifier::BOLD))
+    } else {
+        (Style::default().fg(pal.label), Style::default())
+    };
+    let bar = "─".repeat(w);
+    let mut lines = vec![
+        Line::styled(format!(" ╭{bar}╮"), frame),
+        Line::from(vec![
+            Span::styled(" │ ", frame),
+            Span::styled(text, value),
+            Span::styled(" │", frame),
+        ]),
+        Line::styled(format!(" ╰{bar}╯"), frame),
+        Line::from(format!(" j k  {}", field.step_text(s))),
+    ];
+    let hint = Style::default().fg(pal.label);
+    if here && p.input.is_some() {
+        lines.push(Line::styled(" ⏎ apply · esc cancel", hint));
+    } else {
+        lines.push(Line::styled(" type: 500m 2k 1.5u", hint));
+    }
+    if let (Some(e), true) = (&p.error, here) {
+        lines.push(Line::styled(
+            format!(" {e}"),
+            Style::default().fg(Color::LightRed),
+        ));
+    }
+    lines
+}
+
 /// The bottom line of the panel: key hints, or the line being typed.
 fn panel_foot(
     app: &App,
@@ -1152,25 +1184,19 @@ fn panel_foot(
 ) -> Line<'static> {
     let p = &app.panel;
     let hint = Style::default().fg(Color::DarkGray);
-    let foot_line = if let Some(text) = &p.input {
+    let foot_line = if p.input.is_some() {
         let label = current.map_or("", |f| f.label());
-        let mut spans = vec![
-            Span::styled(format!(" {label} = "), Style::default().fg(Color::White)),
-            Span::styled(
-                format!("{text}▏"),
-                Style::default()
-                    .fg(pal.trace[0])
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if let Some(e) = &p.error {
-            spans.push(Span::styled(
-                format!("  {e}"),
-                Style::default().fg(Color::LightRed),
-            ));
-        }
-        spans.push(Span::styled("  ⏎ apply · esc cancel · 500m 2k 1.5u", hint));
-        Line::from(spans)
+        Line::styled(
+            format!(" typing {label} · ⏎ apply · ← h ↑ ↓ apply and move · esc cancel · ⌫ edit"),
+            hint,
+        )
+    } else if p.on_number() && width >= 90 {
+        Line::styled(
+            " j/k ↑/↓ step · digits . - type a value (500m 2k 1.5u) · ⌫ edit · esc/h back · S close",
+            hint,
+        )
+    } else if p.on_number() {
+        Line::styled(" j/k step · type a value · ⌫ edit · esc back", hint)
     } else if p.searching {
         Line::from(vec![
             Span::styled(
@@ -1183,12 +1209,12 @@ fn panel_foot(
         ])
     } else if width >= 108 {
         Line::styled(
-            " j/k move · h/l out/in · esc back · space toggle · +/- step · = type · / search · gg/G · S close",
+            " j/k move · h/l out/in · esc back · space toggle · +/- step · / search · gg/G · S close",
             hint,
         )
     } else {
         Line::styled(
-            " hjkl move · esc back · space toggle · = type · / find · S close",
+            " hjkl move · esc back · space toggle · +/- step · / find · S close",
             hint,
         )
     };
@@ -1199,7 +1225,7 @@ fn panel_foot(
 pub const KEYS: [(&str, &str); 45] = [
     ("q Esc", "quit (saves settings)"),
     ("? F1", "this help"),
-    ("S F2", "settings panel (h j k l, / search, = type)"),
+    ("S F2", "settings panel (h j k l, / search, type numbers)"),
     ("space", "run / stop"),
     ("o", "single shot: arm the trigger once"),
     ("a", "autoset"),

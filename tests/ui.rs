@@ -613,18 +613,43 @@ fn settings_panel_search_and_typed_value() {
     assert!(t.contains("Trigger › Level"), "{t}");
     assert!(t.contains("/level"));
     r.key(KeyCode::Enter);
-    // Type an exact trigger level.
-    r.char('=');
-    for _ in 0..8 {
-        r.key(KeyCode::Backspace);
-    }
+    // The value column shows the number in a box, not a list.
+    let t = r.text(140, 40);
+    assert!(t.contains("│ 0 V │"), "{t}");
+    assert!(t.contains("j k  ± 100 mV"), "{t}");
+    // Into the value column: j/k step it at once.
+    r.char('l');
+    r.char('k');
+    assert!((r.app.scope.settings.trigger.level - 0.1).abs() < 1e-12);
+    assert!(r.text(140, 40).contains("│ 100 mV │"));
+    assert!(r.text(140, 40).contains("Trig Auto CH1 ↑ 100 mV"));
+    r.char('j');
+    r.key(KeyCode::Down);
+    assert!((r.app.scope.settings.trigger.level + 0.1).abs() < 1e-12);
+    // Typing digits edits the value in the box.
     for c in "750m".chars() {
         r.char(c);
     }
-    assert!(r.text(140, 40).contains("Level = 750m"));
+    let t = r.text(140, 40);
+    assert!(t.contains("│ 750m▏ │"), "{t}");
+    assert!(t.contains("⏎ apply · esc cancel"), "{t}");
     r.key(KeyCode::Enter);
     assert!((r.app.scope.settings.trigger.level - 0.75).abs() < 1e-12);
-    assert!(r.text(140, 40).contains("Trig Auto CH1 ↑ 750 mV"));
+    let t = r.text(140, 40);
+    assert!(t.contains("Trig Auto CH1 ↑ 750 mV"));
+    assert!(t.contains("│ 750 mV │"), "{t}");
+    // A bad value shows an error in the column; Esc drops it.
+    for c in "5q".chars() {
+        r.char(c);
+    }
+    r.key(KeyCode::Enter);
+    assert!(r.text(140, 40).contains("unknown unit: q"));
+    r.key(KeyCode::Esc);
+    assert!(!r.text(140, 40).contains("unknown unit"));
+    assert!((r.app.scope.settings.trigger.level - 0.75).abs() < 1e-12);
+    // Small screens still show the box.
+    let t = r.text(80, 24);
+    assert!(t.contains("│ 750 mV │"), "{t}");
 }
 
 #[test]
