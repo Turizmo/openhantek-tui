@@ -740,45 +740,68 @@ impl Plot {
         }
     }
 
-    /// The classic look: straight lines from point to point. More than two
-    /// points per dot column are cut to the low and high value of each
-    /// column first, low then high, so a noisy or steep trace is drawn as
-    /// a zigzag that fills its column. With `dots`, only those points.
+    /// The braille thin look: straight lines from point to point. More
+    /// than two points per dot column are cut to the low and high value of
+    /// each column first, and each column is one vertical run of dots from
+    /// its low to its high value, so a noisy or steep trace fills its
+    /// column. A run is stretched to the row next to where the column
+    /// before ended, so the line has no gaps but an edge stays one dot
+    /// column wide. With `dots`, only the low and high points.
     pub fn classic(&mut self, points: &[(f64, f64)], dots: bool, layer: u8, color: Color) {
         let w = self.dots_w();
         let finite = |p: &&(f64, f64)| p.0.is_finite() && p.1.is_finite();
         let n = points.iter().filter(finite).count();
-        // Dot positions; `None` breaks the line.
-        let pts: Vec<Option<(i64, i64)>> = if n > 2 * w {
-            let mut cols: Vec<Option<(f64, f64)>> = vec![None; w];
+        if n > 2 * w {
+            // Dot rows (top, bottom) of the samples in each dot column.
+            let mut cols: Vec<Option<(i64, i64)>> = vec![None; w];
             for p in points.iter().filter(finite) {
                 let c = self.px(p.0).floor();
                 if c < 0.0 || c >= w as f64 {
                     continue;
                 }
+                let y = self.py(p.1).floor() as i64;
                 let r = &mut cols[c as usize];
-                *r = Some(r.map_or((p.1, p.1), |(lo, hi)| (lo.min(p.1), hi.max(p.1))));
+                *r = Some(r.map_or((y, y), |(t, b)| (t.min(y), b.max(y))));
             }
-            cols.iter()
-                .enumerate()
-                .filter_map(|(c, r)| r.map(|(lo, hi)| (c as i64, lo, hi)))
-                .flat_map(|(c, lo, hi)| {
-                    [
-                        Some((c, self.py(lo).floor() as i64)),
-                        Some((c, self.py(hi).floor() as i64)),
-                    ]
-                })
-                .collect()
-        } else {
-            points
-                .iter()
-                .map(|p| {
-                    finite(&p).then(|| (self.px(p.0).floor() as i64, self.py(p.1).floor() as i64))
-                })
-                .collect()
-        };
+            let mut prev: Option<(i64, i64, i64)> = None;
+            for (c, r) in cols.iter().enumerate() {
+                let Some((mut top, mut bot)) = *r else {
+                    continue;
+                };
+                let c = c as i64;
+                if dots {
+                    self.set(c, top, layer, color);
+                    self.set(c, bot, layer, color);
+                    continue;
+                }
+                if let Some((pc, pt, pb)) = prev {
+                    // The row of this column next to the run before it.
+                    let (from, to) = if top > pb {
+                        (pb, pb + 1)
+                    } else if bot < pt {
+                        (pt, pt - 1)
+                    } else {
+                        (top, top)
+                    };
+                    if pc + 1 == c {
+                        top = top.min(to);
+                        bot = bot.max(to);
+                    } else {
+                        // Columns with no samples between: a line.
+                        let near = to.clamp(top, bot);
+                        self.line((pc, from), (c, near), layer, color);
+                    }
+                }
+                self.vrun(c, top, bot, layer, color);
+                prev = Some((c, top, bot));
+            }
+            return;
+        }
+        let pts = points.iter().map(|p| {
+            finite(&p).then(|| (self.px(p.0).floor() as i64, self.py(p.1).floor() as i64))
+        });
         let mut prev: Option<(i64, i64)> = None;
-        for p in pts {
+        for p in pts.collect::<Vec<_>>() {
             match (p, prev) {
                 (Some(b), Some(a)) if !dots => self.line(a, b, layer, color),
                 (Some(b), _) => self.set(b.0, b.1, layer, color),
@@ -1453,6 +1476,58 @@ mod tests {
                 col.first() <= Some(&(hi + 1)) && col.last() >= Some(&(lo - 1)),
                 "{x}: {col:?}"
             );
+        }
+    }
+
+    #[test]
+    fn braille_thin_edges_are_one_dot_column_wide() {
+        let (cx, ry) = (6, 3);
+        // A square wave from -2 to 2 divisions, 2.5 periods, many samples.
+        let sq = samples(5000, |x| if (x / 2.0).rem_euclid(2.0) < 1.0 { 2.0 } else { -2.0 });
+        let mut p = Plot::new(cx, ry);
+        p.classic(&sq, false, LAYER_CH1, RED);
+        let edge = 4 * ry * 4; // 4 divisions of dot rows
+        let tall: Vec<bool> = (0..p.dots_w())
+            .map(|x| column(&p, x).len() > edge / 2)
+            .collect();
+        let edges = tall.iter().filter(|t| **t).count();
+        assert!(edges >= 4, "{edges} edges");
+        for x in 1..tall.len() {
+            assert!(!(tall[x - 1] && tall[x]), "edge two columns wide at {x}");
+        }
+        // Still no gaps: every column from the first to the last is lit.
+        let used = used_columns(&p);
+        assert_eq!(used.len(), used[used.len() - 1] - used[0] + 1);
+
+        // A sine: two neighbour columns both taller than 2 dot rows only
+        // where the curve itself is that steep.
+        let f = |x: f64| 3.0 * (std::f64::consts::TAU * x / 2.5).sin();
+        let df = |x: f64| 3.0 * std::f64::consts::TAU / 2.5 * (std::f64::consts::TAU * x / 2.5).cos();
+        let mut p = Plot::new(cx, ry);
+        p.classic(&samples(5000, f), false, LAYER_CH1, RED);
+        let rows_per_col = (4 * ry) as f64 / (2 * cx) as f64;
+        let x_of = |c: usize| (c as f64 + 0.5) / (2 * cx) as f64 - 5.0;
+        let mut checked = 0;
+        for c in 1..p.dots_w() {
+            let steep = df(x_of(c)).abs() * rows_per_col > 2.0
+                || df(x_of(c - 1)).abs() * rows_per_col > 2.0;
+            if steep {
+                continue;
+            }
+            checked += 1;
+            let (a, b) = (column(&p, c - 1).len(), column(&p, c).len());
+            assert!(!(a > 2 && b > 2), "double at dot column {c}: {a} {b}");
+        }
+        assert!(checked > 10, "{checked}");
+        let used = used_columns(&p);
+        assert_eq!(used.len(), used[used.len() - 1] - used[0] + 1);
+        // Each column connects to the next: their runs touch or overlap
+        // by at most one row (diagonal neighbours).
+        for c in used[0] + 1..=used[used.len() - 1] {
+            let (a, b) = (column(&p, c - 1), column(&p, c));
+            let (a0, a1) = (a[0] as i64, *a.last().unwrap() as i64);
+            let (b0, b1) = (b[0] as i64, *b.last().unwrap() as i64);
+            assert!(b0 <= a1 + 1 && b1 >= a0 - 1, "gap at {c}");
         }
     }
 

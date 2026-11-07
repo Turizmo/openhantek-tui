@@ -220,7 +220,7 @@ time view and the spectrum:
 
 | Style | Look |
 |---|---|
-| `braille thin` (default) | lines from point to point through the low and high value of each dot column, like the first version |
+| `braille thin` (default) | lines from point to point through the low and high value of each dot column; each column is one run of dots that starts next to where the column before ended, so edges and steep flanks stay one dot wide |
 | `braille bold` | one dot run per column, two dots thick |
 | `ascii lines` | no braille, for fonts that draw it badly: one character per cell, `\|` on steep runs, `/` and `\` on slopes, `_` `-` `‾` for flat parts at the bottom, middle or top of the cell; dots mode puts `.` `·` `'` per sample |
 | `box lines` | no braille: one connected line of box-drawing characters, which the terminal joins cell to cell. `─` for flat runs at the level of the cell row, `│` for steep runs and noise, `╭` `╮` `╰` `╯` where the line turns, `╵` `╷` where a run stops in a cell; dots mode puts `•` per sample |
