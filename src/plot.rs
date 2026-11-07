@@ -4,7 +4,8 @@
 //! number of cells, so the grid looks the same in every division. Traces
 //! are drawn in one of the [`TraceStyle`]s: classic lines from point to
 //! point, one dot thick (one vertical run of dots per dot column), bold,
-//! or text lines with no braille at all (`|`, `/`, `\`, `_`, `-`, `‾`).
+//! text lines with no braille at all (`|`, `/`, `\`, `_`, `-`, `‾`), or
+//! connected box-drawing lines (`─`, `│`, `╭`, `╮`, `╰`, `╯`).
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
@@ -61,6 +62,31 @@ impl Cell {
             self.text
         }
     }
+}
+
+/// Sides a box character of the box style connects, as bits.
+const BOX_UP: u8 = 1;
+const BOX_DOWN: u8 = 2;
+const BOX_LEFT: u8 = 4;
+const BOX_RIGHT: u8 = 8;
+
+/// Box characters by the sides they connect (up, down, left, right
+/// bits). A cell with no sides is a point: `─`.
+const BOX_CHARS: [char; 16] = [
+    '─', '╵', '╷', '│', '╴', '╯', '╮', '┤', '╶', '╰', '╭', '├', '─', '┴', '┬', '┼',
+];
+
+fn box_char(sides: u8) -> char {
+    BOX_CHARS[(sides & 15) as usize]
+}
+
+/// Sides of a box character, 0 for any other character.
+fn box_sides(c: char) -> u8 {
+    BOX_CHARS
+        .iter()
+        .skip(1)
+        .position(|&b| b == c)
+        .map_or(0, |i| i as u8 + 1)
 }
 
 /// Braille dot bit for dot column `dx` (0..2) and dot row `dy` (0..4).
@@ -230,6 +256,8 @@ impl Plot {
             (TraceStyle::Bold, true) => self.points_bold(points, layer, color),
             (TraceStyle::Line, false) => self.text_line(points, layer, color),
             (TraceStyle::Line, true) => self.text_points(points, layer, color),
+            (TraceStyle::Box, false) => self.box_line(points, layer, color),
+            (TraceStyle::Box, true) => self.box_points(points, layer, color),
         }
     }
 
@@ -393,6 +421,210 @@ impl Plot {
                 _ => '.',
             };
             self.put_glyph((px / 2.0) as usize, (py / 4.0) as usize, ch, layer, color);
+        }
+    }
+
+    /// The box style: the trace as one connected line of box-drawing
+    /// characters (`─`, `│`, `╭`, `╮`, `╰`, `╯`, ...), one cell row per
+    /// level. The line crosses the side between two cell columns at the
+    /// row of the trace there. Inside a column it runs up or down from
+    /// the row it comes in at to the row it goes out at, and on to the
+    /// low and high rows of the column when the trace gets to the middle
+    /// of them (peaks and noise). Each cell gets the
+    /// character for the sides it connects, so the line has no gaps. A
+    /// non-finite point breaks the line.
+    pub fn box_line(&mut self, points: &[(f64, f64)], layer: u8, color: Color) {
+        let w = self.cols;
+        let y_max = self.dots_h() as f64 - 1e-6;
+        // Low and high dot y per cell column.
+        let mut span: Vec<Option<(f64, f64)>> = vec![None; w];
+        // Dot y where the line crosses the left side of column b; b = w
+        // is the right side of the last column.
+        let mut cross: Vec<Option<f64>> = vec![None; w + 1];
+        fn add(span: &mut [Option<(f64, f64)>], c: i64, y: f64) {
+            if c < 0 || c >= span.len() as i64 {
+                return;
+            }
+            let r = &mut span[c as usize];
+            *r = Some(r.map_or((y, y), |(lo, hi)| (lo.min(y), hi.max(y))));
+        }
+        // A line that starts or ends in the first or last column goes on
+        // off the screen: it crosses the plot side at its end point.
+        let end_at_side = |cross: &mut [Option<f64>], p: Option<(f64, f64)>| {
+            if let Some(p) = p {
+                let side = if p.0 < 1.0 { 0 } else { w };
+                if (p.0 < 1.0 || p.0 >= (w - 1) as f64) && cross[side].is_none() {
+                    cross[side] = Some(p.1);
+                }
+            }
+        };
+        let mut prev: Option<(f64, f64)> = None;
+        for &(x, y) in points {
+            if !x.is_finite() || !y.is_finite() {
+                end_at_side(&mut cross, prev);
+                prev = None;
+                continue;
+            }
+            // Cell x (continuous) and dot y.
+            let p = (self.px(x) / 2.0, self.py(y).clamp(0.0, y_max));
+            match prev {
+                None => end_at_side(&mut cross, Some(p)),
+                Some(q) => {
+                    let (a, b) = if q.0 <= p.0 { (q, p) } else { (p, q) };
+                    let at = |x: f64| {
+                        if b.0 - a.0 <= f64::EPSILON {
+                            b.1
+                        } else {
+                            a.1 + (b.1 - a.1) * (x - a.0) / (b.0 - a.0)
+                        }
+                    };
+                    // As in `trace_run`: the step from `a` goes to the
+                    // columns after `a`, and the line leaves the column of
+                    // `a` at its level, so an edge lands in one column.
+                    let (ca, cb) = (a.0.floor() as i64, b.0.floor() as i64);
+                    let x_at = |c: i64| if c == ca + 1 { a.0 } else { c as f64 };
+                    for c in (ca + 1).max(0)..=cb.min(w as i64 - 1) {
+                        add(&mut span, c, at(x_at(c)));
+                        add(&mut span, c, at(if c == cb { b.0 } else { (c + 1) as f64 }));
+                    }
+                    for side in (ca + 1).max(0)..=cb.min(w as i64) {
+                        cross[side as usize] = Some(at(x_at(side)));
+                    }
+                }
+            }
+            add(&mut span, p.0.floor() as i64, p.1);
+            prev = Some(p);
+        }
+        end_at_side(&mut cross, prev);
+        let rows = self.rows;
+        let row = move |y: f64| ((y / 4.0).floor().max(0.0) as usize).min(rows - 1);
+        // How far (in dots) the line on a side must get into a row to
+        // reach it.
+        const REACH: f64 = 1.0;
+        // How far a peak or noise inside a column must get into a row to
+        // reach it: to the middle of the row, where its line is.
+        const PEAK: f64 = 2.0;
+        // Row of the line on each side. A side that gets less than REACH
+        // into another row than the sides around it (a peak that just
+        // touches the row above) stays in their row, so the peak is flat.
+        let mut side_row: Vec<Option<usize>> = (0..=w)
+            .map(|s| {
+                let y = cross[s]?;
+                let r = row(y);
+                let near = |o: Option<usize>| o.and_then(|o| cross[o]).map(row);
+                let (a, b) = (near(s.checked_sub(1)), near((s < w).then_some(s + 1)));
+                Some(match (a, b) {
+                    (Some(a), Some(b)) if a == b && a.abs_diff(r) == 1 => {
+                        let border = 4.0 * r.max(a) as f64;
+                        if (y - border).abs() < REACH {
+                            a
+                        } else {
+                            r
+                        }
+                    }
+                    _ => r,
+                })
+            })
+            .collect();
+        // Low and high row of each column, from the trace in it.
+        let reach: Vec<Option<(usize, usize)>> = span
+            .iter()
+            .map(|r| {
+                r.map(|(lo, hi)| {
+                    if hi - lo > 2.0 * PEAK {
+                        (row(lo + PEAK), row(hi - PEAK))
+                    } else {
+                        let mid = row((lo + hi) / 2.0);
+                        (mid, mid)
+                    }
+                })
+            })
+            .collect();
+        // A peak one row above (or a dip one row below) the line on both
+        // sides of its column: the line goes up on the side nearer the
+        // peak and turns in the next column (`╭╮` over `╯╰`), not a loose
+        // `╷` over `┴`.
+        for c in 0..w {
+            let (Some((top, bottom)), Some(l), Some(r)) = (reach[c], side_row[c], side_row[c + 1])
+            else {
+                continue;
+            };
+            let (Some(yl), Some(yr), Some((lo, hi))) = (cross[c], cross[c + 1], span[c]) else {
+                continue;
+            };
+            let (low, high) = (l.min(r), l.max(r));
+            if top + 1 == low && bottom <= high {
+                let s = if (yl - lo).abs() < (yr - lo).abs() {
+                    c
+                } else {
+                    c + 1
+                };
+                side_row[s] = Some(top);
+            } else if bottom == high + 1 && top >= low {
+                let s = if (yl - hi).abs() < (yr - hi).abs() {
+                    c
+                } else {
+                    c + 1
+                };
+                side_row[s] = Some(bottom);
+            }
+        }
+        for c in 0..w {
+            let Some((mut top, mut bottom)) = reach[c] else {
+                continue;
+            };
+            let (left, right) = (side_row[c], side_row[c + 1]);
+            for r in [left, right].into_iter().flatten() {
+                top = top.min(r);
+                bottom = bottom.max(r);
+            }
+            for r in top..=bottom {
+                let mut sides = 0;
+                if r > top {
+                    sides |= BOX_UP;
+                }
+                if r < bottom {
+                    sides |= BOX_DOWN;
+                }
+                if left == Some(r) {
+                    sides |= BOX_LEFT;
+                }
+                if right == Some(r) {
+                    sides |= BOX_RIGHT;
+                }
+                self.put_box(c, r, sides, layer, color);
+            }
+        }
+    }
+
+    /// Put the box character for `sides` in a cell. On a cell that already
+    /// has a box character of the same layer and colour (an old trace of
+    /// the persistence), the sides of both are joined.
+    fn put_box(&mut self, col: usize, row: usize, sides: u8, layer: u8, color: Color) {
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+        let cell = &self.cells[row * self.cols + col];
+        let old = match cell.glyph {
+            Some(g) if cell.layer == layer && cell.color == color => box_sides(g),
+            _ => 0,
+        };
+        self.put_glyph(col, row, box_char(sides | old), layer, color);
+    }
+
+    /// Dots mode of the box style: `•` per point, in the cell row of the
+    /// point.
+    pub fn box_points(&mut self, points: &[(f64, f64)], layer: u8, color: Color) {
+        let y_max = self.dots_h() as f64 - 1e-6;
+        for &(x, y) in points {
+            if !x.is_finite() || !y.is_finite() {
+                continue;
+            }
+            let (px, py) = (self.px(x), self.py(y).clamp(0.0, y_max));
+            if px < 0.0 || px >= self.dots_w() as f64 {
+                continue;
+            }
+            self.put_glyph((px / 2.0) as usize, (py / 4.0) as usize, '•', layer, color);
         }
     }
 
@@ -1142,6 +1374,262 @@ mod tests {
             "{text}"
         );
         assert_eq!(d.char_at(d.col_of(-4.0), d.row_of(0.0)), '·');
+    }
+
+    fn box_plot(pts: &[(f64, f64)]) -> Plot {
+        let mut p = Plot::new(6, 3);
+        p.styled(pts, TraceStyle::Box, false, LAYER_CH1, RED);
+        p
+    }
+
+    /// Every side a box character connects meets the neighbour on that
+    /// side, which connects back, or the side of the plot (the line goes
+    /// on off the screen). So the line has no gaps and no loose ends
+    /// except where it stops in a cell.
+    fn assert_connected(p: &Plot) {
+        let text = text_rows(p);
+        let sides = |c: usize, r: usize| box_sides(p.char_at(c, r));
+        for r in 0..p.rows {
+            for c in 0..p.cols {
+                let ch = p.char_at(c, r);
+                if ch == ' ' {
+                    continue;
+                }
+                let s = sides(c, r);
+                assert!(s != 0, "({c}, {r}) {ch:?}:\n{text}");
+                let ok = |bit: u8, nb: Option<(usize, usize)>, back: u8| {
+                    s & bit == 0 || nb.is_some_and(|(nc, nr)| sides(nc, nr) & back != 0)
+                };
+                let up = r.checked_sub(1).map(|r| (c, r));
+                let down = (r + 1 < p.rows).then_some((c, r + 1));
+                assert!(ok(BOX_UP, up, BOX_DOWN), "({c}, {r}) up:\n{text}");
+                assert!(ok(BOX_DOWN, down, BOX_UP), "({c}, {r}) down:\n{text}");
+                // Left of the first column and right of the last are the
+                // plot sides.
+                if c > 0 {
+                    assert!(
+                        ok(BOX_LEFT, Some((c - 1, r)), BOX_RIGHT),
+                        "({c}, {r}) left:\n{text}"
+                    );
+                }
+                if c + 1 < p.cols {
+                    assert!(
+                        ok(BOX_RIGHT, Some((c + 1, r)), BOX_LEFT),
+                        "({c}, {r}) right:\n{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Cell columns with any ink.
+    fn inked_columns(p: &Plot) -> usize {
+        (0..p.cols)
+            .filter(|&c| (0..p.rows).any(|r| p.char_at(c, r) != ' '))
+            .count()
+    }
+
+    #[test]
+    fn box_chars_and_sides_match() {
+        for s in 1..16 {
+            assert_eq!(box_sides(box_char(s)), s);
+        }
+        assert_eq!(box_char(BOX_LEFT | BOX_RIGHT), '─');
+        assert_eq!(box_char(BOX_UP | BOX_DOWN), '│');
+        assert_eq!(box_char(BOX_RIGHT | BOX_DOWN), '╭');
+        assert_eq!(box_char(BOX_LEFT | BOX_DOWN), '╮');
+        assert_eq!(box_char(BOX_UP | BOX_RIGHT), '╰');
+        assert_eq!(box_char(BOX_UP | BOX_LEFT), '╯');
+        assert_eq!(box_sides('x'), 0);
+    }
+
+    #[test]
+    fn box_flat_line_is_all_dashes() {
+        for y in [0.0, 1.0, -2.3, 3.9] {
+            let p = box_plot(&samples(2000, |_| y));
+            let row = p.row_of(y);
+            for r in 0..p.rows {
+                for c in 0..p.cols {
+                    let want = if r == row { '─' } else { ' ' };
+                    assert_eq!(p.char_at(c, r), want, "{y}:\n{}", text_rows(&p));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn box_square_wave_has_corners_and_bars() {
+        for n in [200, 2000, 20_000] {
+            let (hi, lo) = (2.1, -2.1);
+            let p = box_plot(&samples(
+                n,
+                |x| if x.rem_euclid(4.0) < 2.0 { hi } else { lo },
+            ));
+            let text = text_rows(&p);
+            assert!(!text.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)));
+            assert_connected(&p);
+            assert_eq!(inked_columns(&p), p.cols, "n {n}:\n{text}");
+            let (rh, rl) = (p.row_of(hi), p.row_of(lo));
+            let top: String = (0..p.cols).map(|c| p.char_at(c, rh)).collect();
+            let bottom: String = (0..p.cols).map(|c| p.char_at(c, rl)).collect();
+            // Falling edge: ─╮ on top, ╰─ below; rising: ─╯ below, ╭─ on top.
+            assert!(top.contains("─╮") && top.contains("╭─"), "n {n}:\n{text}");
+            assert!(
+                bottom.contains("╰─") && bottom.contains("─╯"),
+                "n {n}:\n{text}"
+            );
+            // Five edges, each one column of │ between the levels.
+            let bars = (0..p.cols)
+                .filter(|&c| (rh + 1..rl).all(|r| p.char_at(c, r) == '│'))
+                .count();
+            assert_eq!(bars, 5, "n {n}:\n{text}");
+            // Only the two levels and the edges have ink.
+            for r in 0..p.rows {
+                let row: String = (0..p.cols).map(|c| p.char_at(c, r)).collect();
+                if r < rh || r > rl {
+                    assert!(row.trim().is_empty(), "n {n} row {r}:\n{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn box_sine_has_round_peaks_and_dips() {
+        for n in [500, 5000] {
+            // Period of 4 divisions, 24 cells: flat for a few cells at the
+            // peaks.
+            let f = |x: f64| 3.0 * (x * std::f64::consts::FRAC_PI_2).cos();
+            let p = box_plot(&samples(n, f));
+            let text = text_rows(&p);
+            assert_connected(&p);
+            assert_eq!(inked_columns(&p), p.cols, "n {n}:\n{text}");
+            let row = |r: usize| (0..p.cols).map(|c| p.char_at(c, r)).collect::<String>();
+            let (top, bottom) = (row(p.row_of(3.0)), row(p.row_of(-3.0)));
+            // ╭─...─╮ at each peak, ╰─...─╯ at each dip, nothing else.
+            let caps = |s: &str, a: char, b: char| {
+                let t = s.trim();
+                t.split(' ')
+                    .filter(|w| !w.is_empty())
+                    .all(|w| w.starts_with(a) && w.ends_with(b) && w.chars().count() >= 3)
+            };
+            assert!(
+                caps(&top, '╭', '╮') && top.matches('╭').count() == 3,
+                "n {n}:\n{text}"
+            );
+            assert!(
+                caps(&bottom, '╰', '╯') && bottom.matches('╰').count() == 2,
+                "n {n}:\n{text}"
+            );
+            assert!(row(p.row_of(3.0) - 1).trim().is_empty(), "n {n}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn box_lines_have_no_gaps() {
+        type Signal = (&'static str, fn(f64) -> f64);
+        let signals: [Signal; 5] = [
+            ("steep sine", |x| 3.9 * (x * 4.0).sin()),
+            ("slow slope", |x| x * 0.1),
+            ("noise", |x| {
+                (x * 1.7).sin() + 0.6 * (x * 97.0).sin() * (x * 13.0).cos()
+            }),
+            ("off screen", |x| 6.0 * (x * 1.3).sin()),
+            ("ramp", |x| 0.8 * x),
+        ];
+        for (name, f) in signals {
+            for n in [20, 61, 300, 3000, 30_000] {
+                let p = box_plot(&samples(n, f));
+                assert_connected(&p);
+                assert_eq!(
+                    inked_columns(&p),
+                    p.cols,
+                    "{name} n {n}:\n{}",
+                    text_rows(&p)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn box_noise_fills_the_column() {
+        // Up and down by 2 divisions many times inside each cell column.
+        let p = box_plot(&samples(20_000, |x| {
+            if (x * 300.0).sin() > 0.0 {
+                1.0
+            } else {
+                -1.0
+            }
+        }));
+        let (r0, r1) = (p.row_of(1.0), p.row_of(-1.0));
+        for c in 1..p.cols - 1 {
+            for r in r0 + 1..r1 - 1 {
+                let s = box_sides(p.char_at(c, r));
+                assert!(
+                    s & BOX_UP != 0 && s & BOX_DOWN != 0,
+                    "({c}, {r}):\n{}",
+                    text_rows(&p)
+                );
+            }
+        }
+        assert_connected(&p);
+    }
+
+    #[test]
+    fn box_nan_breaks_the_line() {
+        let pts = samples(2000, |x| if x.abs() < 1.0 { f64::NAN } else { 0.5 });
+        let p = box_plot(&pts);
+        assert_connected(&p);
+        let row = p.row_of(0.5);
+        let line: String = (0..p.cols).map(|c| p.char_at(c, row)).collect();
+        let parts: Vec<&str> = line.split(' ').filter(|s| !s.is_empty()).collect();
+        assert_eq!(parts.len(), 2, "{line}");
+        // The ends in the gap stop in their cell (`╴`, `╶`); at the
+        // screen sides the line goes on (`─`).
+        assert!(
+            parts[0].starts_with('─') && parts[0].ends_with(['─', '╴']),
+            "{line}"
+        );
+        assert!(
+            parts[1].starts_with(['─', '╶']) && parts[1].ends_with('─'),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn box_layers_and_dots() {
+        let flat = samples(500, |_| 0.0);
+        let mut p = Plot::new(4, 2);
+        p.styled(&flat, TraceStyle::Box, false, LAYER_CH2, BLUE);
+        let row = p.row_of(0.0);
+        assert_eq!(p.cell(5, row).color, BLUE);
+        p.styled(&flat, TraceStyle::Box, false, LAYER_CH1, RED);
+        assert_eq!(p.char_at(5, row), '─');
+        assert_eq!(p.cell(5, row).color, RED);
+        // A lower layer does not take the cell back.
+        p.styled(&flat, TraceStyle::Box, false, LAYER_PERSIST, BLUE);
+        assert_eq!(p.cell(5, row).color, RED);
+        // On one layer the later trace wins; with the same colour (old
+        // traces of the persistence) the sides are joined.
+        let mut q = Plot::new(4, 2);
+        let step = samples(500, |x| if x < 0.0 { 0.0 } else { 1.0 });
+        q.styled(&flat, TraceStyle::Box, false, LAYER_PERSIST, BLUE);
+        q.styled(&step, TraceStyle::Box, false, LAYER_PERSIST, RED);
+        let c = q.col_of(0.0);
+        assert_eq!(q.char_at(c, row), '╯', "{}", text_rows(&q));
+        q.styled(&flat, TraceStyle::Box, false, LAYER_PERSIST, RED);
+        assert_eq!(q.char_at(c, row), '┴', "{}", text_rows(&q));
+        // Dots: one character per point.
+        let mut d = Plot::new(4, 2);
+        d.styled(
+            &[(-4.0, 0.0), (0.0, 2.0), (f64::NAN, 1.0)],
+            TraceStyle::Box,
+            true,
+            LAYER_CH1,
+            RED,
+        );
+        let text = text_rows(&d);
+        assert_eq!(text.chars().filter(|&c| c == '•').count(), 2, "{text}");
+        assert_eq!(d.char_at(d.col_of(-4.0), d.row_of(0.0)), '•');
     }
 
     #[test]

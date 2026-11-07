@@ -225,14 +225,19 @@ pub enum TraceStyle {
     /// `|` for steep runs, `/` and `\` for slopes, `_`, `-` and `‾` for
     /// flat parts at the bottom, middle and top of the cell.
     Line,
+    /// No braille: one connected line of box-drawing characters, one cell
+    /// row per level. `─` for flat runs, `│` for steep ones, `╭ ╮ ╰ ╯`
+    /// where it turns, `╵ ╷` where a run stops in a cell.
+    Box,
 }
 
 impl TraceStyle {
-    pub const ALL: [TraceStyle; 4] = [
+    pub const ALL: [TraceStyle; 5] = [
         TraceStyle::Classic,
         TraceStyle::Thin,
         TraceStyle::Bold,
         TraceStyle::Line,
+        TraceStyle::Box,
     ];
 
     pub fn name(self) -> &'static str {
@@ -241,6 +246,7 @@ impl TraceStyle {
             TraceStyle::Thin => "braille thin",
             TraceStyle::Bold => "bold",
             TraceStyle::Line => "ascii lines",
+            TraceStyle::Box => "box lines",
         }
     }
 }
@@ -484,7 +490,7 @@ mod tests {
         s.trigger.slope = Slope::Both;
         s.display.window = Window::FlatTop;
         s.math.mode = MathMode::Mul;
-        s.display.trace_style = [TraceStyle::Thin, TraceStyle::Bold, TraceStyle::Line];
+        s.display.trace_style = [TraceStyle::Thin, TraceStyle::Box, TraceStyle::Line];
         s.display.cursor_style = CursorStyle::Fine;
         let text = toml::to_string_pretty(&s).unwrap();
         let back: Settings = toml::from_str(&text).unwrap();
@@ -503,10 +509,11 @@ mod tests {
         // Each style is saved by name.
         let mut s = Settings::default();
         s.display.trace_style[1] = TraceStyle::Bold;
+        s.display.trace_style[2] = TraceStyle::Box;
         let text = toml::to_string_pretty(&s).unwrap();
         let text: String = text.split_whitespace().collect();
         assert!(
-            text.contains(r#"trace_style=["Classic","Bold","Classic",]"#),
+            text.contains(r#"trace_style=["Classic","Bold","Box",]"#),
             "{text}"
         );
     }
