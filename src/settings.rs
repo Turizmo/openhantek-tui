@@ -400,6 +400,98 @@ pub const CAL_FREQS: [u32; 38] = [
     30_000, 40_000, 50_000, 60_000, 80_000, 100_000,
 ];
 
+/// Time labels of the log view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TimeAxis {
+    /// Wall-clock time (local time zone is not known: UTC), HH:MM:SS.
+    #[default]
+    Clock,
+    /// Seconds since the start of the log.
+    Seconds,
+}
+
+impl TimeAxis {
+    pub const ALL: [TimeAxis; 2] = [TimeAxis::Clock, TimeAxis::Seconds];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TimeAxis::Clock => "clock (UTC)",
+            TimeAxis::Seconds => "seconds since start",
+        }
+    }
+}
+
+/// Time column of a log CSV export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CsvTime {
+    /// ISO-8601 UTC timestamp, like `2026-11-07T12:34:56.789Z`.
+    #[default]
+    Iso,
+    /// Seconds since the start of the log.
+    Seconds,
+}
+
+impl CsvTime {
+    pub const ALL: [CsvTime; 2] = [CsvTime::Iso, CsvTime::Seconds];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CsvTime::Iso => "ISO 8601 UTC",
+            CsvTime::Seconds => "seconds since start",
+        }
+    }
+}
+
+/// Envelope logger settings (the `[logger]` table).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggerSettings {
+    /// Time step of the log, in seconds (one of [`crate::logger::STEPS`]).
+    pub step: f64,
+    /// Stop the log when the file reaches this many bytes; 0 = no limit.
+    pub log_limit: u64,
+    /// Folder for log files. Empty: `~/.local/share/openhantek-tui/logs`.
+    pub log_dir: Option<std::path::PathBuf>,
+    pub time_axis: TimeAxis,
+    pub csv_time: CsvTime,
+}
+
+impl Default for LoggerSettings {
+    fn default() -> Self {
+        Self {
+            step: crate::logger::STEP_DEFAULT,
+            log_limit: crate::logger::LIMIT_DEFAULT,
+            log_dir: None,
+            time_axis: TimeAxis::Clock,
+            csv_time: CsvTime::Iso,
+        }
+    }
+}
+
+impl LoggerSettings {
+    /// Index of the step in [`crate::logger::STEPS`].
+    pub fn step_idx(&self) -> usize {
+        crate::logger::nearest(&crate::logger::STEPS, self.step)
+    }
+
+    /// Index of the limit in [`crate::logger::LIMITS`].
+    pub fn limit_idx(&self) -> usize {
+        let l = &crate::logger::LIMITS;
+        if self.log_limit == 0 {
+            return l.len() - 1;
+        }
+        let v: Vec<f64> = l[..l.len() - 1].iter().map(|x| *x as f64).collect();
+        crate::logger::nearest(&v, self.log_limit as f64)
+    }
+
+    pub fn dir(&self) -> std::path::PathBuf {
+        self.log_dir
+            .clone()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or_else(crate::logger::default_log_dir)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -414,6 +506,7 @@ pub struct Settings {
     pub cal_freq: u32,
     /// Selected trace: 0 = CH1, 1 = CH2, 2 = MATH.
     pub selected: usize,
+    pub logger: LoggerSettings,
 }
 
 impl Default for Settings {
@@ -435,6 +528,7 @@ impl Default for Settings {
             display: DisplaySettings::default(),
             cal_freq: 1_000,
             selected: 0,
+            logger: LoggerSettings::default(),
         }
     }
 }
@@ -476,6 +570,9 @@ impl Settings {
             self.cal_freq = 1_000;
         }
         self.selected = self.selected.min(2);
+        let lg = &mut self.logger;
+        lg.step = crate::logger::STEPS[lg.step_idx()];
+        lg.log_limit = crate::logger::LIMITS[lg.limit_idx()];
     }
 
     pub fn time_per_div(&self) -> f64 {
@@ -600,6 +697,24 @@ mod tests {
             text.contains(r#"trace_style=["BrailleThin","BrailleBold","Box",]"#),
             "{text}"
         );
+    }
+
+    #[test]
+    fn logger_settings_load_and_fix() {
+        // Old files have no [logger] table.
+        let s: Settings = toml::from_str("selected = 1\n").unwrap();
+        assert_eq!(s.logger, LoggerSettings::default());
+        let text = "[logger]\nstep = 0.0011\nlog_limit = 1300000000\ncsv_time = \"Seconds\"\n";
+        let mut s: Settings = toml::from_str(text).unwrap();
+        s.sanitize();
+        assert_eq!(s.logger.step, 1e-3);
+        assert_eq!(s.logger.log_limit, 1_000_000_000);
+        assert_eq!(s.logger.csv_time, CsvTime::Seconds);
+        s.logger.log_limit = 0;
+        s.sanitize();
+        assert_eq!(s.logger.log_limit, 0);
+        let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
     }
 
     #[test]

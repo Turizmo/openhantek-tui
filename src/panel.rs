@@ -435,7 +435,10 @@ impl Field {
                 .iter()
                 .map(|m| m.name().to_string())
                 .collect(),
-            GridLook => GridStyle::ALL.iter().map(|m| m.name().to_string()).collect(),
+            GridLook => GridStyle::ALL
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect(),
             GridExtent => crate::settings::GridExtent::ALL
                 .iter()
                 .map(|m| m.name().to_string())

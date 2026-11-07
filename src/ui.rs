@@ -436,7 +436,13 @@ fn time_labels(s: &Settings) -> Vec<String> {
     let sel = s.selected;
     let (scale, offset) = trace_scale(s, sel);
     let unit = trace_unit(s, sel);
-    labels(|j| compact((V_DIVS / 2.0 - j as f64 - offset) * scale, scale / 100.0, unit))
+    labels(|j| {
+        compact(
+            (V_DIVS / 2.0 - j as f64 - offset) * scale,
+            scale / 100.0,
+            unit,
+        )
+    })
 }
 
 /// Labels, ground markers, trigger marks and cursor names around the plot.
@@ -1130,9 +1136,7 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
 
 /// Style of the panel heading and of the help line of the setting.
 pub fn panel_heading(pal: &Palette) -> Style {
-    Style::default()
-        .fg(pal.label)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(pal.label).add_modifier(Modifier::BOLD)
 }
 
 /// The value column of a number setting: the value in a box, the step and

@@ -1483,7 +1483,13 @@ mod tests {
     fn braille_thin_edges_are_one_dot_column_wide() {
         let (cx, ry) = (6, 3);
         // A square wave from -2 to 2 divisions, 2.5 periods, many samples.
-        let sq = samples(5000, |x| if (x / 2.0).rem_euclid(2.0) < 1.0 { 2.0 } else { -2.0 });
+        let sq = samples(5000, |x| {
+            if (x / 2.0).rem_euclid(2.0) < 1.0 {
+                2.0
+            } else {
+                -2.0
+            }
+        });
         let mut p = Plot::new(cx, ry);
         p.classic(&sq, false, LAYER_CH1, RED);
         let edge = 4 * ry * 4; // 4 divisions of dot rows
@@ -1502,7 +1508,8 @@ mod tests {
         // A sine: two neighbour columns both taller than 2 dot rows only
         // where the curve itself is that steep.
         let f = |x: f64| 3.0 * (std::f64::consts::TAU * x / 2.5).sin();
-        let df = |x: f64| 3.0 * std::f64::consts::TAU / 2.5 * (std::f64::consts::TAU * x / 2.5).cos();
+        let df =
+            |x: f64| 3.0 * std::f64::consts::TAU / 2.5 * (std::f64::consts::TAU * x / 2.5).cos();
         let mut p = Plot::new(cx, ry);
         p.classic(&samples(5000, f), false, LAYER_CH1, RED);
         let rows_per_col = (4 * ry) as f64 / (2 * cx) as f64;

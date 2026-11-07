@@ -340,7 +340,10 @@ fn grid_settings_in_the_panel_change_the_grid() {
     r.char('1');
     r.char('2');
     let count = |lines: &[String], c: char| -> usize {
-        lines.iter().map(|l| l.chars().filter(|x| *x == c).count()).sum()
+        lines
+            .iter()
+            .map(|l| l.chars().filter(|x| *x == c).count())
+            .sum()
     };
     let before = r.screen(120, 40);
     assert!(count(&before, '·') > 50);
@@ -443,7 +446,10 @@ fn margins_are_small_and_nothing_is_cut() {
         // The trigger mark is in the one column right of the plot.
         let trig = lines.iter().find(|l| l.contains('◂')).unwrap();
         // (At most one spare cell after it, from centering the plot.)
-        assert!(trig.contains("◂│") || trig.contains("◂ │"), "{w}x{h}: {trig}");
+        assert!(
+            trig.contains("◂│") || trig.contains("◂ │"),
+            "{w}x{h}: {trig}"
+        );
         // The time labels are whole and do not touch.
         let time = lines.iter().find(|l| l.contains("-5ms")).unwrap();
         assert!(time.contains("5ms│") || time.contains("5ms "), "{time}");
@@ -460,7 +466,9 @@ fn margins_are_small_and_nothing_is_cut() {
     r.app.scope.settings.cursors.mode = CursorMode::Volt;
     let lines = r.screen(120, 40);
     for name in [" A ", " B "] {
-        let row = lines.iter().find(|l| l.starts_with('│') && l.contains(name));
+        let row = lines
+            .iter()
+            .find(|l| l.starts_with('│') && l.contains(name));
         assert!(row.is_some(), "{name}\n{}", lines.join("\n"));
     }
 }
@@ -1004,7 +1012,11 @@ fn settings_panel_changes_trace_style_live() {
     assert!(!r.app.panel_open);
     assert_eq!(
         r.app.scope.settings.display.trace_style,
-        [TraceStyle::BrailleBold, TraceStyle::BrailleThin, TraceStyle::BrailleThin]
+        [
+            TraceStyle::BrailleBold,
+            TraceStyle::BrailleThin,
+            TraceStyle::BrailleThin
+        ]
     );
     assert_ne!(r.screen(140, 40), before);
 }
