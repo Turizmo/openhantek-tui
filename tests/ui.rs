@@ -479,6 +479,20 @@ fn braille_dots(lines: &[String]) -> u32 {
         .sum()
 }
 
+/// Characters the line style draws with.
+const LINE_CHARS: &str = "|/\\_‾'.";
+
+/// Trace ink on the screen: braille dots, and four per line style
+/// character (a cell of braille has up to eight).
+fn ink(lines: &[String]) -> u32 {
+    let glyphs = lines
+        .iter()
+        .flat_map(|l| l.chars())
+        .filter(|c| LINE_CHARS.contains(*c))
+        .count() as u32;
+    braille_dots(lines) + 4 * glyphs
+}
+
 fn styled_rig(style: TraceStyle) -> Rig {
     let mut r = Rig::new([SINE_1K, Wave::CalOut]);
     r.app.scope.settings.display.trace_style = [style; 3];
@@ -497,13 +511,13 @@ fn classic_styles_are_the_default() {
 fn every_trace_style_draws_with_dots_persistence_and_interpolation() {
     for style in TraceStyle::ALL {
         let mut r = styled_rig(style);
-        let base = braille_dots(&r.screen(120, 30));
+        let base = ink(&r.screen(120, 30));
         assert!(base > 300, "{style:?}: only {base} dots");
         // Dots only.
         r.char('d');
         r.feed();
         assert!(r.app.scope.settings.display.dots);
-        let dots = braille_dots(&r.screen(120, 30));
+        let dots = ink(&r.screen(120, 30));
         assert!(dots > 100, "{style:?} dots: only {dots}");
         r.char('d');
         // Persistence: old traces too.
@@ -513,7 +527,7 @@ fn every_trace_style_draws_with_dots_persistence_and_interpolation() {
         }
         assert!(!r.app.scope.history.is_empty(), "{style:?}");
         assert!(
-            braille_dots(&r.screen(120, 30)) >= base * 9 / 10,
+            ink(&r.screen(120, 30)) >= base * 9 / 10,
             "{style:?} persistence"
         );
         r.char('P');
@@ -522,14 +536,14 @@ fn every_trace_style_draws_with_dots_persistence_and_interpolation() {
             r.key(KeyCode::Left);
         }
         r.feed();
-        let sinc = braille_dots(&r.screen(120, 30));
+        let sinc = ink(&r.screen(120, 30));
         r.char('z');
         r.feed();
         assert_eq!(
             r.app.scope.settings.display.interpolation,
             Interpolation::Linear
         );
-        let linear = braille_dots(&r.screen(120, 30));
+        let linear = ink(&r.screen(120, 30));
         assert!(sinc > 100 && linear > 100, "{style:?}: {sinc} {linear}");
         // The spectrum uses the style too, and small screens do not panic.
         r.char('f');
@@ -550,6 +564,26 @@ fn trace_styles_look_different() {
     // is at least as heavy as the thin line; bold is about twice as heavy.
     assert!(classic > thin, "classic {classic} thin {thin}");
     assert!(bold > thin * 3 / 2, "bold {bold} thin {thin}");
+}
+
+#[test]
+fn line_style_draws_without_braille() {
+    let r = styled_rig(TraceStyle::Line);
+    let lines = r.screen(120, 36);
+    let text = lines.join("\n");
+    assert_eq!(braille_dots(&lines), 0, "{text}");
+    // The square wave: `|` edges, flat tops and bottoms (`-` on the
+    // division lines). The sine: slopes, `_` in the dips.
+    let count = |c: char| text.chars().filter(|&x| x == c).count();
+    assert!(count('|') >= 10, "{text}");
+    assert!(count('_') + count('‾') + count('-') >= 30, "{text}");
+    assert!(count('/') >= 4 && count('\\') >= 4, "{text}");
+    // Mixed with a braille style, each trace keeps its own look.
+    let mut r = styled_rig(TraceStyle::Line);
+    r.app.scope.settings.display.trace_style[1] = TraceStyle::Classic;
+    let mixed = r.screen(120, 36);
+    assert!(braille_dots(&mixed) > 100);
+    assert!(mixed.join("").contains('/'));
 }
 
 /// Line of the screen where the cursor name `A` is, above the status lines.
