@@ -27,6 +27,9 @@ Features:
 - Uses the calibration in the scope EEPROM and the OpenHantek6022
   calibration file, if you have one (it never writes the EEPROM)
 - Export the screen as CSV or JSON; headless `--measure` mode for scripts
+- Envelope logger (chart recorder): records min, max and mean per time
+  step (2.5 µs to 1 min) without gaps, for hours or days, with a strip
+  chart log view and CSV export
 - Settings panel (`S`) with yazi-style keys: every setting in one place,
   with search and typed values
 - Clean braille plot: whole cells per division, so the grid lines up, and
@@ -71,6 +74,8 @@ Close OpenHantek6022 first: only one program can use the scope.
 --settings FILE     settings file (default ~/.config/openhantek-tui/settings.toml)
 --no-settings       do not load or save settings
 --export-dir DIR    folder for CSV and JSON exports (default: current folder)
+--log-dir DIR       folder for envelope logs (default ~/.local/share/openhantek-tui/logs)
+--open-log FILE     open this log in the log view
 --autoset           run autoset at start
 --measure           no screen: capture once, print the measurements, quit
 --csv FILE          with --measure: also save the capture as CSV
@@ -143,6 +148,8 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `E` | export the screen as CSV |
 | `W` | export the screen as JSON |
 | `R` | reset all settings |
+| `r` | start / stop the envelope logger (see below) |
+| `V` | log view on / off |
 | `Ctrl-C` | quit |
 
 On screen: `1▸` and `2▸` on the left show each channel's 0 V line. `◂` on
@@ -183,9 +190,9 @@ frequency steps through its fixed steps, and a typed frequency takes the
 nearest one. Settings with a fixed list (volts/div, styles, averaging)
 keep the list.
 
-The panel is only as high as its longest column needs: the 12
+The panel is only as high as its longest column needs: the 13
 categories, the most settings in any category, or the longest list of
-values, plus the title, the help line and the key hints (15 rows). It is
+values, plus the title, the help line and the key hints (16 rows). It is
 worked out over all settings, not the one under the cursor, so it never
 changes size while you move. Value lists longer than 20 rows (time/div)
 do not count; they scroll in the value column. On
@@ -259,6 +266,141 @@ colour and the older half also has the dim attribute. With box lines, old
 traces of different ages still join where they cross (the joined cell
 takes the newer colour), so they stay connected lines.
 
+## Envelope logger
+
+The logger is a chart recorder: it streams the scope without a break and
+saves, for each time step and each channel that is on, the lowest, the
+highest and the mean voltage. The volts are the ones the scope view
+shows: calibrated, with the probe factor and invert (AC coupling is not
+applied; the log is always DC). Press `r` to start and `r` again to stop
+(or Logger › Record in the settings panel). The log uses the volts/div
+(the input range), probe and channels set at the start.
+
+While it records, the scope streams at the ADC rate the logger needs and
+the scope view pauses (its title says `● REC: live view paused`);
+changes of volts/div or time/div only change the drawing, and reach the
+scope after the log stops. The log view (`V`) shows the log growing.
+
+**Step and ADC rate.** Steps from 2.5 µs to 1 min in 1-2-5 steps (and
+30 s). The ADC runs at the lowest of 20, 40, 100, 200 or 400 kS/s that
+gives at least 10 samples per step, and never faster than 400 kS/s, the
+rate the scope streams without losing samples. At 2.5 µs the step is one
+sample at 400 kS/s, so only the value is saved (min = max = mean); 5,
+10 and 20 µs have 2, 4 and 8 samples per step.
+
+| Step | ADC rate | Samples per step | File size per hour, CH1 + CH2 | one channel |
+|---|---|---|---|---|
+| 2.5 µs | 400 kS/s | 1 | 11.5 GB | 5.8 GB |
+| 10 µs | 400 kS/s | 4 | 8.6 GB | 4.3 GB |
+| 100 µs | 100 kS/s | 10 | 864 MB | 432 MB |
+| 1 ms | 20 kS/s | 20 | 86.4 MB | 43.2 MB |
+| 1 s | 20 kS/s | 20 000 | 86 kB | 43 kB |
+
+**Gaps.** The thread checks that the samples keep up with the clock. When
+they fall more than 0.3 s behind (the scope lost samples), or the stream
+had to start again (a USB error, the scope unplugged and back), the log
+gets a gap mark and goes on at the right time. Smaller losses add up
+until they reach 0.3 s. The log view draws a gap as a break with a red
+dashed line `┊`; the status line counts them.
+
+**Size limit.** Logger › Size limit (`log_limit`, 10 MB to 50 GB, or
+off) is the only limit: the log stops by itself when the file reaches
+it, and the message line says so. The panel shows how long that is,
+like `Limit 1 GB ≈ 11 h 34 min at 1 ms step` (from the step and the
+channels that are on), and warns when the disk has less free space than
+the limit.
+
+**Status line.** While recording:
+
+```
+ ● REC  412 MB / 1 GB   0:41:10, about 6:48:07 left   free 120 GB
+```
+
+the file size and limit, the time since the start, the time left at the
+log's data rate, and the free space of the log folder. When the disk would
+fill before the limit it says `disk full in about ...` on a yellow
+background. `N gaps` and `CLIP` (a sample at the end of the ADC range)
+show up when they happen.
+
+**Log view.** `V` switches between the scope and the log view (the last
+log, or the one being recorded). Settings › Logger › Open log (also in
+Files) lists the 10 newest logs of the log folder; `--open-log FILE`
+opens any log. For each channel the band from min to max is filled (a
+dim colour of the channel), and the mean is a line in the channel's
+trace style: braille thin or bold (dots), ascii lines (`:` fill) or box
+lines (`░` fill). The grid settings apply. Volts/div, positions and
+channels on/off work as in the scope view (`↑` `↓` `[` `]` `{` `}`
+`Tab` `1` `2`).
+
+| Key | What it does |
+|---|---|
+| `←` `→` | scroll one division |
+| `PgUp` `PgDn` | scroll one screen |
+| `Home` `End` | start of the log / the newest data (and follow it) |
+| `+` `-` | zoom in / out (1-2-5 steps per dot column) |
+| `F` `n` | the whole log / one step per dot column |
+| `v` | time cursors A and B on / off |
+| `h` `l`, `H` `L` | move cursor A, cursor B |
+| `t` | time labels: clock (UTC, with the date when the screen spans two days) or seconds since the start |
+| `E` | export CSV: between A and B when the cursors are on, else the whole log |
+
+With the cursors on, the first status line shows A, B, ΔT, and the min,
+max and mean of each channel between them. Zoomed out, each dot column
+is the min of the mins, the max of the maxes and the mean of the means of
+its steps. A summary (min/max/mean of every 1024 steps, and every 16
+entries above that) makes this fast for big files; it is built when a
+log opens (the title shows `summary 45%` meanwhile, at a few hundred MB
+per second) and saved next to the log as `<log>.idx`, so the next open
+is at once (a 2 GB log: 5 s to build, then 0.03 s to open and draw).
+
+**CSV export.** `E` in the log view, or Logger › Export log CSV / Export
+A–B CSV, writes `openhantek-log-YYYYMMDD-HHMMSS.csv` in the export
+folder. Columns: the time of the start of each step, then
+`ch1_min,ch1_max,ch1_mean,ch2_min,...` for the logged channels (a 2.5 µs
+log has `ch1,ch2`). Logger › CSV time picks `time_utc` (ISO 8601 UTC,
+like `2026-11-07T18:51:53.613Z`, with as many decimals as the step needs)
+or `time_s` (seconds since the start). Each gap is one row with the
+time where the data stops and empty value cells, like `8.000,,,,,,`, so
+plotting tools break the line there.
+
+**Settings** (the `[logger]` table of settings.toml):
+
+| Setting | Meaning |
+|---|---|
+| `step` | step in seconds (default 0.001) |
+| `log_limit` | size limit in bytes, 0 = off (default 1000000000) |
+| `log_dir` | log folder (default `$XDG_DATA_HOME/openhantek-tui/logs` or `~/.local/share/openhantek-tui/logs`; `--log-dir` wins) |
+| `time_axis` | `Clock` or `Seconds` |
+| `csv_time` | `Iso` or `Seconds` |
+
+**File format** (`.ohlog`, little-endian). Logs are named
+`log-YYYYMMDD-HHMMSS.ohlog` (UTC).
+
+```
+header   "OHTLOG\0\x01", version u16 (1), header length u16, flags u16,
+         channel mask u8 (bit 0 CH1, bit 1 CH2), reserved u8,
+         start time i64 (ns since 1970 UTC, the first sample),
+         step u64 (ns), ADC rate f64 (S/s), samples per step u32,
+         reserved u32,
+         per channel (CH1, CH2, 24 bytes): gain index u8, probe u8,
+         invert u8, DC u8, volts/div f32, ADC count of 0 V f32,
+         volts per ADC count f32 (at the BNC), reserved 8 bytes,
+         device name (u16 length + UTF-8), zeros up to the header length
+chunks   "CHNK", flags u32 (bit 0: data was lost before this chunk),
+         first step u64, record count u64 (u64::MAX: open, the records go
+         to the end of the file), then the records
+record   per logged channel: min, max, mean as f32 volts (one f32 when
+         there is one sample per step)
+```
+
+Step `i` starts at `start + i * step`. A new chunk starts only after a
+gap, so a log is usually one chunk. Missing step numbers between chunks
+are the gap. The writer thread buffers in memory, hands the data to the
+OS 4 times a second (the log view reads it from there) and fsyncs every
+2 s; the record count of the open chunk is written when it closes. A
+killed program leaves a file that reads up to the last write (a cut
+record at the end is ignored).
+
 ## How it works
 
 - `src/device/`: USB. `protocol.rs` has the vendor requests, sample rates,
@@ -268,6 +410,12 @@ takes the newer colour), so they stay connected lines.
 - `src/acquire.rs`: a thread that captures blocks and sends them to the UI.
 - `src/scope.rs`: trigger, averaging, math, roll mode, autoset.
 - `src/dsp/`: trigger search, measurements, FFT, math, interpolation.
+- `src/logger/`: the envelope logger: `format.rs` (file layout),
+  `binner.rs` (min/max/mean per step), `writer.rs` (writer thread, size
+  limit), `reader.rs` (reads growing files), `pyramid.rs` (summaries and
+  the `.idx` cache), `csv.rs`, `view.rs` (zoom, scroll, cursors).
+  `src/keys.rs` maps the logger keys to actions; `src/ui/log.rs` draws
+  the log view and the REC status.
 - `src/app.rs` and `src/ui.rs`: keys and drawing. `src/plot.rs` is the
   braille and text renderer (trace styles and cursor lines), `src/theme.rs` the colours, `src/panel.rs` the
   settings panel model.
@@ -275,14 +423,16 @@ takes the newer colour), so they stay connected lines.
 Like OpenHantek6022, it reads 20000 samples per channel per block, throws
 away the first samples after each start (the ADC is not stable yet), and
 averages several ADC samples into one at slow time bases. The fastest rates
-are 24 MS/s for CH1 alone and 12 MS/s with both channels. Roll mode runs the
-ADC at most at 400 kS/s, so the scope buffer does not overflow between USB
-reads.
+are 24 MS/s for CH1 alone and 12 MS/s with both channels. Roll mode and the
+logger run the ADC at most at 400 kS/s, so the scope buffer does not
+overflow between USB reads.
 
 ## Tests
 
 ```
 cargo test                    # unit, end-to-end (fake scope) and UI tests
+OHT_BIG_MB=2000 cargo test --release --test logger big -- --ignored --nocapture
+                              # speed of a big log (written to the temp folder)
 cargo test --test hardware -- --ignored --test-threads=1 --nocapture
 ```
 
