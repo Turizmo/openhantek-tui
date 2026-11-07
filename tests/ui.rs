@@ -327,6 +327,63 @@ fn grid_divisions_are_even_at_every_size() {
 }
 
 #[test]
+fn persistence_fades_old_frames_by_age() {
+    use openhantek_tui::theme::{ColorMode, Palette};
+    use ratatui::style::Color;
+    for style in TraceStyle::ALL {
+        let mut r = rig();
+        let s = &mut r.app.scope.settings;
+        s.display.colors = ColorMode::TrueColor;
+        s.display.persistence = 8;
+        s.display.trace_style = [style; 3];
+        s.channels[1].enabled = false;
+        s.channels[0].offset = 3.0;
+        // Old frames, oldest first, each lower on the screen than the
+        // newer one.
+        let live = r.app.scope.frame.clone().unwrap();
+        r.app.scope.history.clear();
+        for k in 0..8 {
+            let mut f = live.clone();
+            let shift = -0.8 * (8 - k) as f64;
+            if let Some(tr) = f.traces[0].as_mut() {
+                tr.iter_mut().for_each(|v| *v = *v * 0.2 + shift);
+            }
+            r.app.scope.history.push_back(f);
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| ui::draw(f, &r.app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let pal = Palette::new(ColorMode::TrueColor);
+        let colours: Vec<Color> = (0..8).map(|age| pal.persist(0, age, 8).0).collect();
+        for w in colours.windows(2) {
+            assert_ne!(w[0], w[1]);
+        }
+        // Mean row of each age's colour: older frames are lower.
+        let mut last = 0.0;
+        for (age, c) in colours.iter().enumerate() {
+            let rows: Vec<u16> = (0..40)
+                .flat_map(|y| (0..120).map(move |x| (x, y)))
+                .filter(|&p| buf[p].fg == *c && buf[p].symbol() != " ")
+                .map(|(_, y)| y)
+                .collect();
+            assert!(
+                rows.len() > 5,
+                "{style:?}: age {age} {c:?} has {} cells",
+                rows.len()
+            );
+            let mean = rows.iter().map(|&y| y as f64).sum::<f64>() / rows.len() as f64;
+            assert!(
+                mean > last,
+                "{style:?}: age {age} at row {mean}, newer at {last}"
+            );
+            last = mean;
+        }
+        // The live trace keeps the full colour.
+        assert!(buf.content().iter().any(|c| c.fg == pal.trace[0]));
+    }
+}
+
+#[test]
 fn trace_colours_follow_the_colour_setting() {
     use openhantek_tui::theme::ColorMode;
     use ratatui::style::Color;

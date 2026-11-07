@@ -21,7 +21,7 @@ Features:
 - Spectrum (FFT) view with Rectangular, Hann, Hamming, Blackman and flat top
   windows, in dBV, with peak readout and zoom
 - XY mode
-- Averaging, persistence (old traces stay dimmed), sin(x)/x interpolation
+- Averaging, persistence (old traces fade by age), sin(x)/x interpolation
 - Autoset
 - Calibration output frequency from 32 Hz to 100 kHz
 - Uses the calibration in the scope EEPROM and the OpenHantek6022
@@ -196,6 +196,16 @@ Display › Cursor style (also under Cursors) picks `classic` (grey dashes,
 `A`/`B` inside the plot, the default) or `fine dashes` (short dashes,
 names in the margin). Dots (`d`), persistence (`P`) and interpolation
 (`z`) work with every style.
+
+Persistence (`P`, time view only) keeps 2, 4, 8 or 16 old traces, and
+each fades by age: the newest old trace is at 85 % of the way from the
+background to the trace colour, the oldest at 12 %, in even perceptual
+steps. A newer trace wins a cell over an older one, and the live trace
+wins over all. In 256 colours the fade uses the nearest xterm colour of
+the same hue (about 5 steps); in 16 colours the newer half is the normal
+colour and the older half also has the dim attribute. With box lines, old
+traces of different ages still join where they cross (the joined cell
+takes the newer colour), so they stay connected lines.
 
 ## How it works
 

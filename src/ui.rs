@@ -343,11 +343,20 @@ fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     plot.grid(pal);
     draw_cursors(&mut plot, s, pal);
     let order = draw_order(s);
-    // Old frames first, dimmed.
-    for old in &sc.history {
+    // Old frames first, oldest first, fading by age: a newer frame is on
+    // a higher layer, so it wins a cell over an older one.
+    let n = sc.history.len();
+    let depth = s.display.persistence.max(n);
+    for (i, old) in sc.history.iter().enumerate() {
+        let age = n - 1 - i;
+        let layer = plot::persist_layer(i, n);
         for &t in &order {
             if trace_enabled(s, t) {
-                draw_trace(&mut plot, old, t, s, plot::LAYER_PERSIST, pal.dim[t]);
+                let (color, dim) = pal.persist(t, age, depth);
+                if dim {
+                    plot.dim_upto(layer);
+                }
+                draw_trace(&mut plot, old, t, s, layer, color);
             }
         }
     }

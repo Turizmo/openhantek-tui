@@ -15,12 +15,26 @@ use crate::theme::Palette;
 /// Draw layers, lowest first. A higher layer takes over a cell from a
 /// lower one, so trace colours never mix in one cell.
 pub const LAYER_CURSOR: u8 = 1;
+/// The oldest old trace of the persistence. Each newer old frame has the
+/// next layer, so a newer frame wins a cell over an older one.
 pub const LAYER_PERSIST: u8 = 2;
-pub const LAYER_MATH: u8 = 3;
-pub const LAYER_CH2: u8 = 4;
-pub const LAYER_CH1: u8 = 5;
+/// Layers for old frames: the deepest persistence.
+pub const PERSIST_LAYERS: u8 = 16;
+pub const LAYER_MATH: u8 = LAYER_PERSIST + PERSIST_LAYERS;
+pub const LAYER_CH2: u8 = LAYER_MATH + 1;
+pub const LAYER_CH1: u8 = LAYER_MATH + 2;
 /// The selected trace, drawn above all others.
-pub const LAYER_TOP: u8 = 6;
+pub const LAYER_TOP: u8 = LAYER_MATH + 3;
+
+/// Layer of old frame `i` of `n` (0 = oldest): newer frames higher.
+pub fn persist_layer(i: usize, n: usize) -> u8 {
+    let skip = n.saturating_sub(PERSIST_LAYERS as usize);
+    LAYER_PERSIST + i.saturating_sub(skip).min(PERSIST_LAYERS as usize - 1) as u8
+}
+
+fn is_persist(layer: u8) -> bool {
+    (LAYER_PERSIST..LAYER_PERSIST + PERSIST_LAYERS).contains(&layer)
+}
 
 /// Divisions across and up the screen.
 pub const H_DIVS: usize = 10;
@@ -105,6 +119,9 @@ pub struct Plot {
     pub cols: usize,
     pub rows: usize,
     cells: Vec<Cell>,
+    /// Layers up to this one render with the DIM modifier (the older old
+    /// traces in 16 colours). 0: none.
+    dim_upto: u8,
 }
 
 impl Plot {
@@ -119,7 +136,13 @@ impl Plot {
             cols,
             rows,
             cells: vec![Cell::default(); cols * rows],
+            dim_upto: 0,
         }
+    }
+
+    /// Show the cells of layers up to `layer` with the DIM modifier.
+    pub fn dim_upto(&mut self, layer: u8) {
+        self.dim_upto = layer;
     }
 
     /// Dot columns and dot rows.
@@ -598,15 +621,20 @@ impl Plot {
     }
 
     /// Put the box character for `sides` in a cell. On a cell that already
-    /// has a box character of the same layer and colour (an old trace of
-    /// the persistence), the sides of both are joined.
+    /// has a box character of the same layer and colour, the sides of both
+    /// are joined. Old traces of the persistence join each other too: the
+    /// joined character takes the layer and colour of the newer one, so
+    /// old traces stay connected lines instead of being cut where a newer
+    /// one crosses them.
     fn put_box(&mut self, col: usize, row: usize, sides: u8, layer: u8, color: Color) {
         if col >= self.cols || row >= self.rows {
             return;
         }
         let cell = &self.cells[row * self.cols + col];
+        let joins = (cell.layer == layer && cell.color == color)
+            || (is_persist(layer) && is_persist(cell.layer) && layer >= cell.layer);
         let old = match cell.glyph {
-            Some(g) if cell.layer == layer && cell.color == color => box_sides(g),
+            Some(g) if joins => box_sides(g),
             _ => 0,
         };
         self.put_glyph(col, row, box_char(sides | old), layer, color);
@@ -870,10 +898,17 @@ impl Plot {
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
         for row in 0..self.rows.min(area.height as usize) {
             for col in 0..self.cols.min(area.width as usize) {
-                if let Some((c, color)) = self.cell(col, row).symbol() {
+                let src = self.cell(col, row);
+                if let Some((c, color)) = src.symbol() {
                     let pos = (area.x + col as u16, area.y + row as u16);
                     if let Some(cell) = buf.cell_mut(pos) {
                         cell.set_char(c).set_fg(color);
+                        let faint = src.layer != 0
+                            && src.layer <= self.dim_upto
+                            && (src.dots != 0 || src.glyph.is_some());
+                        if faint {
+                            cell.modifier.insert(ratatui::style::Modifier::DIM);
+                        }
                     }
                 }
             }
@@ -980,6 +1015,7 @@ mod tests {
 
     const RED: Color = Color::Red;
     const BLUE: Color = Color::Blue;
+    const GREEN: Color = Color::Green;
 
     /// Dot rows set in dot column `x`.
     fn column(p: &Plot, x: usize) -> Vec<usize> {
@@ -1596,6 +1632,38 @@ mod tests {
     }
 
     #[test]
+    fn newer_old_frames_win_cells() {
+        assert_eq!(persist_layer(0, 8), LAYER_PERSIST);
+        assert_eq!(persist_layer(7, 8), LAYER_PERSIST + 7);
+        assert_eq!(persist_layer(15, 16), LAYER_PERSIST + 15);
+        assert!(persist_layer(15, 16) < LAYER_MATH);
+        let flat = samples(500, |_| 0.0);
+        for style in TraceStyle::ALL {
+            let mut p = Plot::new(4, 2);
+            p.styled(&flat, style, false, persist_layer(0, 2), BLUE);
+            p.styled(&flat, style, false, persist_layer(1, 2), RED);
+            let row = p.row_of(0.0);
+            assert_eq!(p.cell(5, row).color, RED, "{style:?}");
+            p.styled(&flat, style, false, LAYER_MATH, GREEN);
+            assert_eq!(p.cell(5, row).color, GREEN, "{style:?}");
+        }
+    }
+
+    #[test]
+    fn dim_layers_render_dim() {
+        use ratatui::style::Modifier;
+        let mut p = Plot::new(4, 2);
+        p.set(0, 0, LAYER_PERSIST, BLUE);
+        p.set(2, 0, LAYER_PERSIST + 1, RED);
+        p.dim_upto(LAYER_PERSIST);
+        let area = Rect::new(0, 0, p.cols as u16, p.rows as u16);
+        let mut buf = Buffer::empty(area);
+        p.render(&mut buf, area);
+        assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
+        assert!(!buf[(1, 0)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
     fn box_layers_and_dots() {
         let flat = samples(500, |_| 0.0);
         let mut p = Plot::new(4, 2);
@@ -1608,16 +1676,26 @@ mod tests {
         // A lower layer does not take the cell back.
         p.styled(&flat, TraceStyle::Box, false, LAYER_PERSIST, BLUE);
         assert_eq!(p.cell(5, row).color, RED);
-        // On one layer the later trace wins; with the same colour (old
-        // traces of the persistence) the sides are joined.
+        // On one layer the later trace wins; with the same colour the
+        // sides are joined.
         let mut q = Plot::new(4, 2);
         let step = samples(500, |x| if x < 0.0 { 0.0 } else { 1.0 });
-        q.styled(&flat, TraceStyle::Box, false, LAYER_PERSIST, BLUE);
-        q.styled(&step, TraceStyle::Box, false, LAYER_PERSIST, RED);
+        q.styled(&flat, TraceStyle::Box, false, LAYER_MATH, BLUE);
+        q.styled(&step, TraceStyle::Box, false, LAYER_MATH, RED);
         let c = q.col_of(0.0);
         assert_eq!(q.char_at(c, row), '╯', "{}", text_rows(&q));
-        q.styled(&flat, TraceStyle::Box, false, LAYER_PERSIST, RED);
+        q.styled(&flat, TraceStyle::Box, false, LAYER_MATH, RED);
         assert_eq!(q.char_at(c, row), '┴', "{}", text_rows(&q));
+        // Old traces of different ages (layers, colours) join too, and the
+        // joined cell takes the newer one.
+        let mut a = Plot::new(4, 2);
+        a.styled(&flat, TraceStyle::Box, false, LAYER_PERSIST, BLUE);
+        a.styled(&step, TraceStyle::Box, false, LAYER_PERSIST + 1, RED);
+        assert_eq!(a.char_at(c, row), '┴', "{}", text_rows(&a));
+        assert_eq!(a.cell(c, row).color, RED);
+        // An older one drawn later does not take the cell.
+        a.styled(&flat, TraceStyle::Box, false, LAYER_PERSIST, BLUE);
+        assert_eq!(a.cell(c, row).color, RED);
         // Dots: one character per point.
         let mut d = Plot::new(4, 2);
         d.styled(
