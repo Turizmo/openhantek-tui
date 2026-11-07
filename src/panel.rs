@@ -35,6 +35,8 @@ pub enum Action {
     ExportLogRange,
     /// Open recent log number `i` (newest first).
     OpenLog(usize),
+    /// Ask to delete recent log number `i` (newest first).
+    DeleteLog(usize),
 }
 
 /// One setting in the panel.
@@ -401,6 +403,7 @@ impl Field {
                 Action::ExportLog => "Export log CSV",
                 Action::ExportLogRange => "Export A–B CSV",
                 Action::OpenLog(_) => "Open log",
+                Action::DeleteLog(_) => "Delete log",
             },
         }
     }
@@ -460,7 +463,7 @@ impl Field {
             LogFree => "Free space on the disk of the log folder.",
             LogAxis => "Time labels of the log view: wall clock (UTC) or seconds since the start. Key t.",
             LogCsvTime => "Time column of the log CSV export.",
-            LogOpen => "Open a recent log in the log view (Enter). Also: --open-log FILE.",
+            LogOpen => "Open a recent log in the log view (Enter), d deletes it (asks first). Also: --open-log FILE.",
             Act(a) => match a {
                 Action::RunStop => "Start or stop the capture. Key space.",
                 Action::Single => "Arm the trigger for one capture. Key o.",
@@ -474,6 +477,7 @@ impl Field {
                 Action::ExportLog => "Save the whole open log as CSV in the export folder.",
                 Action::ExportLogRange => "Save the open log between cursors A and B as CSV. Key E in the log view.",
                 Action::OpenLog(_) => "Open a log.",
+                Action::DeleteLog(_) => "Delete a log and its .idx file.",
             },
         }
     }
@@ -1252,6 +1256,13 @@ impl Panel {
                 Outcome::None
             }
             Act::PanelBottom => self.jump(usize::MAX, s, d),
+            Act::PanelDeleteLog
+                if self.focus == Focus::Values
+                    && self.current() == Some(Field::LogOpen)
+                    && self.value < d.recent_logs.len() =>
+            {
+                Outcome::Action(Action::DeleteLog(self.value))
+            }
             Act::PanelDown => self.step(1, s, d),
             Act::PanelUp => self.step(-1, s, d),
             Act::PanelBack => self.back(),

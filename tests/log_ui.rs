@@ -290,3 +290,95 @@ fn record_key_without_scope_says_so() {
     assert!(app.current_message().unwrap().error);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Put the panel on Logger › Open log, in its list, at log `i`.
+fn open_log_list(app: &mut App, i: usize) {
+    use openhantek_tui::panel::{Field, Focus};
+    app.panel_open = true;
+    let groups = app.panel.groups();
+    let cat = groups.iter().position(|g| g.name == "Logger").unwrap();
+    let item = groups[cat]
+        .items
+        .iter()
+        .position(|(f, _)| *f == Field::LogOpen)
+        .unwrap();
+    app.panel.cat = cat;
+    app.panel.item = item;
+    app.panel.focus = Focus::Values;
+    app.panel.value = i;
+}
+
+#[test]
+fn d_deletes_a_log_and_its_idx_after_y() {
+    // Only temp dirs: the log folder is the test's own.
+    let (mut app, dir) = app_with_log("delete");
+    let open = dir.join("log-test.ohlog");
+    let idx = dir.join("log-test.ohlog.idx");
+    // The summary file next to it (the view writes it once it is done).
+    if !idx.exists() {
+        std::fs::write(&idx, b"summary").unwrap();
+    }
+    let other = dir.join("log-other.ohlog");
+    write_log(&other);
+    let old = std::time::SystemTime::now() - Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&other)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    assert_eq!(app.recent_logs(), vec![open.clone(), other.clone()]);
+    open_log_list(&mut app, 0);
+    // d asks, in the TUI, with the name and size.
+    app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+    let ask = app.confirm_delete.clone().expect("a question");
+    assert_eq!(ask.path, open);
+    let t = screen(&app, 120, 40).join("\n");
+    assert!(t.contains("Delete log-test.ohlog ("), "{t}");
+    assert!(t.contains("? y / n"), "{t}");
+    // n keeps it, and so does Esc.
+    key(&mut app, KeyCode::Char('n'));
+    assert!(app.confirm_delete.is_none() && open.exists() && idx.exists());
+    key(&mut app, KeyCode::Char('d'));
+    key(&mut app, KeyCode::Esc);
+    assert!(open.exists() && app.panel_open);
+    // y deletes the log and its .idx, and closes the view on it.
+    assert!(app.log_view.is_some());
+    key(&mut app, KeyCode::Char('d'));
+    key(&mut app, KeyCode::Char('y'));
+    assert!(!open.exists() && !idx.exists());
+    assert!(app.log_view.is_none() && !app.show_log);
+    assert!(other.exists());
+    assert_eq!(app.recent_logs(), vec![other.clone()]);
+    assert!(app.message.as_ref().unwrap().text.contains("Deleted log-test.ohlog"));
+    // The list still points at a log.
+    assert_eq!(app.panel.value, 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_log_being_recorded_is_never_deleted() {
+    let (mut app, dir) = app_with_log("delete-rec");
+    let path = dir.join("log-test.ohlog");
+    // Pretend this log is being recorded.
+    app.rec = Some(writer::shared(path.clone(), 0));
+    assert!(app.recording());
+    open_log_list(&mut app, 0);
+    key(&mut app, KeyCode::Char('d'));
+    assert!(app.confirm_delete.is_none());
+    assert!(app.message.as_ref().unwrap().text.contains("being recorded"));
+    // Not even when asked directly.
+    app.delete_log(&path);
+    assert!(path.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn delete_key_is_in_the_key_table() {
+    use openhantek_tui::keys::{Act, KeyMap};
+    let (m, w) = KeyMap::from_table(&[("delete_log".into(), vec!["x".into()])]);
+    assert!(w.is_empty(), "{w:?}");
+    assert_eq!(m.first(Act::PanelDeleteLog), "x");
+    assert_eq!(KeyMap::default().first(Act::PanelDeleteLog), "d");
+    assert!(openhantek_tui::config::generate(&Settings::default()).contains("delete_log = \"d\""));
+}

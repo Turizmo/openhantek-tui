@@ -502,7 +502,11 @@ show up when they happen.
 **Log view.** `V` switches between the scope and the log view (the last
 log, or the one being recorded). Settings › Logger › Open log (also in
 Files) lists the 10 newest logs of the log folder; `--open-log FILE`
-opens any log. For each channel the band from min to max is filled (a
+opens any log. In that list `d` (`[keys] delete_log`) deletes the log
+under the cursor: a box asks `Delete log-20261107-185153.ohlog (2.3 MB)?
+y / n`, and only `y` deletes the `.ohlog` and its `.idx` summary file
+(`n`, `Esc` or any other key keeps it). The log being recorded is never
+deleted (stop it first); a log open in the log view is closed first. For each channel the band from min to max is filled (a
 dim colour of the channel), and the mean is a line in the channel's
 trace style: braille thin or bold (dots), ascii lines (`:` fill) or box
 lines (`░` fill). The grid settings apply. Volts/div, positions and

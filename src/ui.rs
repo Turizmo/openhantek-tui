@@ -69,6 +69,7 @@ pub fn draw(f: &mut TermFrame, app: &App) {
         if app.help {
             draw_help(f, area, &log_help_rows(app), app);
         }
+        draw_confirm(f, app, area, &pal);
         return;
     }
 
@@ -103,6 +104,36 @@ pub fn draw(f: &mut TermFrame, app: &App) {
     if app.help {
         draw_help(f, area, &scope_help_rows(app), app);
     }
+    draw_confirm(f, app, area, &pal);
+}
+
+/// The y / n question before a log is deleted: a small box in the middle
+/// of the screen, over everything.
+fn draw_confirm(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
+    let Some(d) = &app.confirm_delete else {
+        return;
+    };
+    let q = d.question();
+    let w = (q.chars().count() as u16 + 4).min(area.width);
+    let h = 3.min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(" Delete log ")
+        .border_style(Style::default().fg(pal.trigger));
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            format!(" {q}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+        .block(block),
+        popup,
+    );
 }
 
 /// The help rows of the log view: its keys, then the scope keys that

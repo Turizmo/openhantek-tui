@@ -49,6 +49,25 @@ pub const RECENT_LOGS: usize = 10;
 /// How long a message stays on screen.
 pub const MESSAGE_TIME: Duration = Duration::from_secs(6);
 
+/// A log to delete once the user says yes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteLog {
+    pub path: PathBuf,
+    /// Size of the log and its .idx file, in bytes.
+    pub bytes: u64,
+}
+
+impl DeleteLog {
+    /// The question, like `Delete log-20261107-185153.ohlog (2.3 MB)? y / n`.
+    pub fn question(&self) -> String {
+        let name = self
+            .path
+            .file_name()
+            .map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().into());
+        format!("Delete {name} ({})? y / n", logger::fmt_bytes(self.bytes))
+    }
+}
+
 pub struct App {
     pub scope: Scope,
     acq: Option<Acquisition>,
@@ -58,6 +77,8 @@ pub struct App {
     pub status: Option<String>,
     pub message: Option<Message>,
     pub help: bool,
+    /// A log waiting for `y` / `n` before it is deleted.
+    pub confirm_delete: Option<DeleteLog>,
     /// First help line on screen, when the help scrolls.
     pub help_scroll: usize,
     /// Largest `help_scroll` for the screen, set when the help is drawn.
@@ -103,6 +124,7 @@ impl App {
             status: None,
             message: None,
             help: false,
+            confirm_delete: None,
             help_scroll: 0,
             help_max: std::cell::Cell::new(0),
             quit: false,
@@ -312,6 +334,63 @@ impl App {
         }
     }
 
+    /// True when `path` is the log being recorded (or waiting to start).
+    fn is_recording(&self, path: &std::path::Path) -> bool {
+        self.recording()
+            && self
+                .rec
+                .as_ref()
+                .is_some_and(|r| r.lock().unwrap().path == path)
+    }
+
+    /// Ask (y / n, in the message box) before deleting the log at `path`.
+    /// The log being recorded is never deleted.
+    pub fn ask_delete_log(&mut self, path: &std::path::Path) {
+        if self.is_recording(path) {
+            self.notify("That log is being recorded: stop it (r) before deleting it", true);
+            return;
+        }
+        let size = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        let bytes = size(path) + size(&logger::pyramid::Pyramid::sidecar(path));
+        self.confirm_delete = Some(DeleteLog {
+            path: path.to_path_buf(),
+            bytes,
+        });
+    }
+
+    /// Delete the log at `path` and its `.idx` summary file. A log open
+    /// in the log view is closed first; the log being recorded and files
+    /// that are not logs are never deleted.
+    pub fn delete_log(&mut self, path: &std::path::Path) {
+        if self.is_recording(path) {
+            self.notify("That log is being recorded: stop it (r) before deleting it", true);
+            return;
+        }
+        if path.extension().is_none_or(|e| e != logger::EXT) {
+            self.notify(format!("Not a log: {}", path.display()), true);
+            return;
+        }
+        if self.log_view.as_ref().is_some_and(|v| v.file.path == path) {
+            self.log_view = None;
+            self.show_log = false;
+        }
+        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into());
+        if let Err(e) = std::fs::remove_file(path) {
+            self.notify(format!("Could not delete {name}: {e}"), true);
+            return;
+        }
+        let idx = logger::pyramid::Pyramid::sidecar(path);
+        match std::fs::remove_file(&idx) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                self.notify(format!("Deleted {name}, but not its .idx: {e}"), true);
+            }
+            _ => self.notify(format!("Deleted {name}"), false),
+        }
+        // Keep the cursor of the panel's log list on a log.
+        let n = self.recent_logs().len();
+        self.panel.value = self.panel.value.min(n.saturating_sub(1));
+    }
+
     /// Logs in the log folder, newest first, for the panel.
     pub fn recent_logs(&self) -> Vec<PathBuf> {
         logger::recent_logs(&self.log_dir(), RECENT_LOGS)
@@ -469,6 +548,14 @@ impl App {
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
         if ctrl_c {
             self.quit = true;
+            return;
+        }
+        if let Some(d) = self.confirm_delete.take() {
+            // Only y deletes; n, Esc and any other key keep the log.
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.delete_log(&d.path),
+                _ => self.notify("Kept the log", false),
+            }
             return;
         }
         if self.help {
@@ -737,6 +824,11 @@ impl App {
                     if self.open_log(&p) {
                         self.panel_open = false;
                     }
+                }
+            }
+            Action::DeleteLog(i) => {
+                if let Some(p) = self.recent_logs().get(i).cloned() {
+                    self.ask_delete_log(&p);
                 }
             }
             Action::Reset => {

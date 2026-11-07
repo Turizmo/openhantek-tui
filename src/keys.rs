@@ -132,6 +132,7 @@ pub enum Act {
     /// Pressed twice: the first row.
     PanelTop,
     PanelBottom,
+    PanelDeleteLog,
 }
 
 /// One action: its name in the config file, its view, its default keys
@@ -278,6 +279,7 @@ pub const ACTIONS: &[ActionDef] = &[
     def(PanelType, "panel_type", P, &["=", "i"], "panel: type a number (from its value)"),
     def(PanelTop, "panel_top", P, &["g"], "panel: first row (press twice)"),
     def(PanelBottom, "panel_bottom", P, &["G"], "panel: last row"),
+    def(PanelDeleteLog, "delete_log", P, &["d"], "panel: delete the selected log in Logger › Open log (asks y / n)"),
 ];
 
 /// The definition of an action.
