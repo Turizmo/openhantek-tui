@@ -6,6 +6,7 @@ pub mod config;
 pub mod device;
 pub mod dsp;
 pub mod export;
+pub mod keys;
 pub mod logger;
 pub mod panel;
 pub mod plot;
