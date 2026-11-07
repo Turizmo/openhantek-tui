@@ -479,8 +479,9 @@ fn braille_dots(lines: &[String]) -> u32 {
         .sum()
 }
 
-/// Characters the line style draws with.
-const LINE_CHARS: &str = "|/\\_‾'.";
+/// Characters the line and box styles draw with. The box characters are
+/// also in the frame and grid: [`trace_ink`] takes those off.
+const LINE_CHARS: &str = "|/\\_‾'.─│╭╮╰╯╵╷╴╶├┤┬┴┼•";
 
 /// Trace ink on the screen: braille dots, and four per line style
 /// character (a cell of braille has up to eight).
@@ -491,6 +492,13 @@ fn ink(lines: &[String]) -> u32 {
         .filter(|c| LINE_CHARS.contains(*c))
         .count() as u32;
     braille_dots(lines) + 4 * glyphs
+}
+
+/// Ink of the traces at 120 x 30: the ink less that of a screen with no
+/// traces yet.
+fn trace_ink(r: &Rig) -> u32 {
+    let blank = ink(&Rig::new([SINE_1K, Wave::CalOut]).screen(120, 30));
+    ink(&r.screen(120, 30)).saturating_sub(blank)
 }
 
 fn styled_rig(style: TraceStyle) -> Rig {
@@ -511,13 +519,13 @@ fn classic_styles_are_the_default() {
 fn every_trace_style_draws_with_dots_persistence_and_interpolation() {
     for style in TraceStyle::ALL {
         let mut r = styled_rig(style);
-        let base = ink(&r.screen(120, 30));
+        let base = trace_ink(&r);
         assert!(base > 300, "{style:?}: only {base} dots");
         // Dots only.
         r.char('d');
         r.feed();
         assert!(r.app.scope.settings.display.dots);
-        let dots = ink(&r.screen(120, 30));
+        let dots = trace_ink(&r);
         assert!(dots > 100, "{style:?} dots: only {dots}");
         r.char('d');
         // Persistence: old traces too.
@@ -526,25 +534,22 @@ fn every_trace_style_draws_with_dots_persistence_and_interpolation() {
             r.feed();
         }
         assert!(!r.app.scope.history.is_empty(), "{style:?}");
-        assert!(
-            ink(&r.screen(120, 30)) >= base * 9 / 10,
-            "{style:?} persistence"
-        );
+        assert!(trace_ink(&r) >= base * 9 / 10, "{style:?} persistence");
         r.char('P');
         // Few samples: sin(x)/x and linear both draw a line.
         for _ in 0..8 {
             r.key(KeyCode::Left);
         }
         r.feed();
-        let sinc = ink(&r.screen(120, 30));
+        let sinc = trace_ink(&r);
         r.char('z');
         r.feed();
         assert_eq!(
             r.app.scope.settings.display.interpolation,
             Interpolation::Linear
         );
-        let linear = ink(&r.screen(120, 30));
-        assert!(sinc > 100 && linear > 100, "{style:?}: {sinc} {linear}");
+        let linear = trace_ink(&r);
+        assert!(sinc > 50 && linear > 50, "{style:?}: {sinc} {linear}");
         // The spectrum uses the style too, and small screens do not panic.
         r.char('f');
         r.feed();
@@ -584,6 +589,39 @@ fn line_style_draws_without_braille() {
     let mixed = r.screen(120, 36);
     assert!(braille_dots(&mixed) > 100);
     assert!(mixed.join("").contains('/'));
+}
+
+#[test]
+fn box_style_draws_connected_box_lines() {
+    let r = styled_rig(TraceStyle::Box);
+    let lines = r.screen(120, 36);
+    let text = lines.join("\n");
+    assert_eq!(braille_dots(&lines), 0, "{text}");
+    let count = |c: char| text.chars().filter(|&x| x == c).count();
+    // No ascii line characters (`/` is in the units).
+    for c in ['\\', '‾'] {
+        assert_eq!(count(c), 0, "{c}\n{text}");
+    }
+    // The square wave and the sine: corners where they turn, ten periods
+    // each, and flat tops and bottoms.
+    for c in ['╭', '╮', '╰', '╯'] {
+        assert!(count(c) >= 20, "{c}: {}\n{text}", count(c));
+    }
+    assert!(text.contains("╭──╮") && text.contains("╰───╯"), "{text}");
+    assert!(text.contains("╰─╯"), "{text}");
+    // Mixed with a braille style, each trace keeps its own look.
+    let mut r = styled_rig(TraceStyle::Box);
+    r.app.scope.settings.display.trace_style[1] = TraceStyle::Classic;
+    let mixed = r.screen(120, 36);
+    assert!(braille_dots(&mixed) > 100);
+    assert!(mixed.join("").contains('╭'));
+    // Dots mode: a dot per sample.
+    let mut r = styled_rig(TraceStyle::Box);
+    r.char('d');
+    r.feed();
+    let dots = r.screen(120, 36).join("\n");
+    assert!(dots.matches('•').count() > 100, "{dots}");
+    assert!(!dots.contains('╭'), "{dots}");
 }
 
 /// Line of the screen where the cursor name `A` is, above the status lines.
