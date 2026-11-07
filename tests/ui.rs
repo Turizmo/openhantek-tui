@@ -1545,3 +1545,86 @@ fn measure_cursors_heading_is_right_aligned_in_the_value_colour() {
     check(&r, 200, 40);
     assert_eq!(ui::cursor_section_color(&r.app.scope.settings, &pal), pal.cursor);
 }
+
+/// Lines inside the help popup on a `w` x `h` screen, all of them: the
+/// help is scrolled with `j` to its end. Each line is the text between
+/// the popup's borders.
+fn help_popup_lines(r: &mut Rig, w: u16, h: u16) -> Vec<String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut last_top = None;
+    loop {
+        let lines = r.screen(w, h);
+        let first = r.app.help_scroll.min(r.app.help_max.get());
+        let top = lines.iter().position(|l| l.contains("┌ Keys")).unwrap();
+        let x0 = lines[top].chars().position(|c| c == '┌').unwrap();
+        let bottom = top + lines[top..].iter().position(|l| l.chars().nth(x0) == Some('└')).unwrap();
+        let x1 = x0 + lines[top].chars().skip(x0).position(|c| c == '┐').unwrap();
+        let title = lines[top].clone();
+        for (i, l) in lines[top + 1..bottom].iter().enumerate() {
+            let inner: String = l.chars().skip(x0 + 1).take(x1 - x0 - 1).collect();
+            out.insert(first + i, inner);
+        }
+        if !title.contains("scroll") || last_top.as_ref() == Some(&title) {
+            break;
+        }
+        last_top = Some(title);
+        // One page on.
+        for _ in 0..(bottom - top - 1) {
+            r.char('j');
+        }
+    }
+    out.into_values().collect()
+}
+
+#[test]
+fn help_fits_at_80x24_and_120x40_without_alt_rows_or_cut_words() {
+    for (w, h) in [(80u16, 24u16), (120, 40)] {
+        let mut r = rig();
+        r.char('?');
+        let lines = help_popup_lines(&mut r, w, h);
+        assert!(r.app.help, "{w}x{h}: scrolling closed the help");
+        let alt: Vec<&String> = lines.iter().filter(|l| l.contains("Alt")).collect();
+        // One Alt row (it may wrap onto a second line without "Alt").
+        assert_eq!(alt.len(), 1, "{w}x{h}: {alt:?}");
+        assert!(alt[0].contains("Alt + key") && alt[0].contains("fine step"), "{alt:?}");
+        assert!(lines.iter().all(|l| !l.contains("Alt-")), "{w}x{h}");
+        // Every word of every row is on the screen whole.
+        let words: std::collections::HashSet<&str> =
+            lines.iter().flat_map(|l| l.split_whitespace()).collect();
+        for (k, d) in ui::scope_help_rows(&r.app) {
+            for word in k.split_whitespace().chain(d.split_whitespace()) {
+                assert!(words.contains(word), "{w}x{h}: {word:?} of {d:?} cut\n{}", lines.join("\n"));
+            }
+        }
+        // Lines end inside the popup with a free column (no text runs
+        // into the border or the next column).
+        for l in &lines {
+            assert!(l.ends_with(' '), "{w}x{h}: {l:?}");
+            // Two columns: the left one ends with a free column too.
+            let n = l.chars().count();
+            if n >= 80 {
+                assert_eq!(l.chars().nth(n / 2 - 1), Some(' '), "{w}x{h}: {l:?}");
+            }
+        }
+    }
+    // 120x40 shows it all at once, 80x24 scrolls.
+    let mut r = rig();
+    r.char('?');
+    assert!(r.text(120, 40).contains("Keys · any key closes"));
+    assert!(r.text(80, 24).contains("j k PgUp PgDn scroll"));
+    // Scrolling keys do not close the help, other keys do.
+    r.char('j');
+    r.key(KeyCode::PageDown);
+    assert!(r.app.help && r.app.help_scroll > 1);
+    r.char('x');
+    assert!(!r.app.help && !r.app.scope.settings.display.xy);
+}
+
+#[test]
+fn log_help_has_one_alt_row() {
+    let mut r = rig();
+    r.app.show_log = true;
+    r.char('?');
+    let lines = help_popup_lines(&mut r, 120, 40);
+    assert_eq!(lines.iter().filter(|l| l.contains("Alt")).count(), 1, "{lines:?}");
+}

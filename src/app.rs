@@ -58,6 +58,10 @@ pub struct App {
     pub status: Option<String>,
     pub message: Option<Message>,
     pub help: bool,
+    /// First help line on screen, when the help scrolls.
+    pub help_scroll: usize,
+    /// Largest `help_scroll` for the screen, set when the help is drawn.
+    pub help_max: std::cell::Cell<usize>,
     pub quit: bool,
     pub export_dir: PathBuf,
     /// Settings file, when settings are saved on quit.
@@ -99,6 +103,8 @@ impl App {
             status: None,
             message: None,
             help: false,
+            help_scroll: 0,
+            help_max: std::cell::Cell::new(0),
             quit: false,
             export_dir: PathBuf::from("."),
             settings_path: None,
@@ -466,7 +472,30 @@ impl App {
             return;
         }
         if self.help {
-            // Any key closes the help; the quit keys still quit.
+            // A long help scrolls; any other key closes it, and the quit
+            // keys still quit.
+            let max = self.help_max.get();
+            if max > 0 {
+                let page = 10;
+                let s = self.help_scroll.min(max);
+                let to = if self.keys.is(Act::PanelDown, &key) {
+                    Some(s + 1)
+                } else if self.keys.is(Act::PanelUp, &key) {
+                    Some(s.saturating_sub(1))
+                } else {
+                    match key.code {
+                        KeyCode::PageDown => Some(s + page),
+                        KeyCode::PageUp => Some(s.saturating_sub(page)),
+                        KeyCode::Home => Some(0),
+                        KeyCode::End => Some(max),
+                        _ => None,
+                    }
+                };
+                if let Some(to) = to {
+                    self.help_scroll = to.min(max);
+                    return;
+                }
+            }
             if self.keys.is(Act::Quit, &key) {
                 self.quit = true;
             }
@@ -517,7 +546,10 @@ impl App {
         let s = &mut self.scope.settings;
         match a {
             Act::Quit => self.quit = true,
-            Act::Help => self.help = true,
+            Act::Help => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
             Act::Settings => {
                 self.panel_open = true;
                 return;

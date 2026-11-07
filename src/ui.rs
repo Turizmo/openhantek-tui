@@ -67,7 +67,7 @@ pub fn draw(f: &mut TermFrame, app: &App) {
         }
         log::draw_log_status(f, app, [status1, status2, status3], &pal);
         if app.help {
-            draw_help(f, area, &log_help_rows(app));
+            draw_help(f, area, &log_help_rows(app), app);
         }
         return;
     }
@@ -101,7 +101,7 @@ pub fn draw(f: &mut TermFrame, app: &App) {
     }
     draw_message_line(f, app, status3);
     if app.help {
-        draw_help(f, area, &scope_help_rows(app));
+        draw_help(f, area, &scope_help_rows(app), app);
     }
 }
 
@@ -109,6 +109,7 @@ pub fn draw(f: &mut TermFrame, app: &App) {
 /// work there, with the user's bindings.
 fn log_help_rows(app: &App) -> Vec<(String, String)> {
     let mut rows = keys::help_rows(&app.keys, keys::LOG_HELP);
+    rows.push((keys::LOG_ALT_NOTE.0.into(), keys::LOG_ALT_NOTE.1.into()));
     rows.push((String::new(), String::new()));
     rows.extend(keys::help_rows(&app.keys, keys::LOG_SCOPE_HELP));
     rows
@@ -117,6 +118,7 @@ fn log_help_rows(app: &App) -> Vec<(String, String)> {
 /// The help rows of the scope view, with the user's bindings.
 pub fn scope_help_rows(app: &App) -> Vec<(String, String)> {
     let mut rows = keys::help_rows(&app.keys, keys::SCOPE_HELP);
+    rows.push((keys::ALT_NOTE.0.into(), keys::ALT_NOTE.1.into()));
     rows.push(("Ctrl-C".into(), "quit".into()));
     rows.push((String::new(), String::new()));
     rows.push((String::new(), "The calibration output pins give a".into()));
@@ -1586,28 +1588,101 @@ fn panel_foot(
     foot_line
 }
 
-fn draw_help(f: &mut TermFrame, area: Rect, keys: &[(String, String)]) {
-    let w = keys
+/// Words of `text` in lines of at most `width` characters. Only a word
+/// longer than the line is cut.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        while word.len() > width {
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            out.push(word.drain(..width).collect());
+        }
+        let word: String = word.into_iter().collect();
+        let n = line.chars().count();
+        if n > 0 && n + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&word);
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+/// Screen lines of the help rows in a column `width` wide: the keys in a
+/// column of their own, the text word-wrapped beside them.
+fn help_lines(keys: &[(String, String)], width: usize) -> Vec<Vec<Line<'static>>> {
+    let kw = keys
         .iter()
         .map(|(k, _)| k.chars().count())
         .max()
         .unwrap_or(0)
-        .max(10);
-    let rows: Vec<Line> = keys
-        .iter()
+        .clamp(6, (width / 3).max(6));
+    // One free column at the right, so two columns do not touch.
+    let dw = width.saturating_sub(kw + 4);
+    let key_style = Style::default().fg(Color::LightYellow);
+    keys.iter()
         .map(|(k, d)| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {k:<w$} "),
-                    Style::default().fg(Color::LightYellow),
-                ),
-                Span::raw(d.clone()),
-            ])
+            let ks = wrap_words(k, kw);
+            let ds = wrap_words(d, dw);
+            (0..ks.len().max(ds.len()))
+                .map(|i| {
+                    let k = ks.get(i).map_or("", |s| s.as_str());
+                    let d = ds.get(i).map_or("", |s| s.as_str());
+                    Line::from(vec![
+                        Span::styled(format!(" {k:<kw$}  "), key_style),
+                        Span::raw(d.to_string()),
+                    ])
+                })
+                .collect()
         })
-        .collect();
-    let half = rows.len().div_ceil(2);
-    let w = 104.min(area.width);
-    let h = (half as u16 + 3).min(area.height);
+        .collect()
+}
+
+/// The help popup. Two columns when the screen is wide enough and all
+/// rows fit; else one column that scrolls (j k, arrows, PgUp PgDn) when
+/// it is longer than the screen. Rows are word-wrapped, never cut.
+fn draw_help(f: &mut TermFrame, area: Rect, keys: &[(String, String)], app: &App) {
+    let w = 110.min(area.width);
+    let inner_w = w.saturating_sub(2) as usize;
+    let max_h = area.height.saturating_sub(2) as usize;
+    let two = (inner_w >= 80).then(|| {
+        let col = inner_w / 2;
+        let rows = help_lines(keys, col);
+        let total: usize = rows.iter().map(|r| r.len()).sum();
+        // Split at the row boundary nearest the middle.
+        let mut acc = 0;
+        let mut split = rows.len();
+        for (i, r) in rows.iter().enumerate() {
+            if acc * 2 >= total {
+                split = i;
+                break;
+            }
+            acc += r.len();
+        }
+        let left: Vec<Line> = rows[..split].concat();
+        let right: Vec<Line> = rows[split..].concat();
+        (left, right)
+    });
+    let (body, right) = match two {
+        Some((l, r)) if l.len().max(r.len()) <= max_h => (l, Some(r)),
+        _ => (help_lines(keys, inner_w).concat(), None),
+    };
+    let need = body.len().max(right.as_ref().map_or(0, |r| r.len()));
+    let view_h = need.min(max_h);
+    let max_scroll = need - view_h;
+    app.help_max.set(max_scroll);
+    let scroll = app.help_scroll.min(max_scroll);
+    let h = view_h as u16 + 2;
     let popup = Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + (area.height - h) / 2,
@@ -1615,17 +1690,31 @@ fn draw_help(f: &mut TermFrame, area: Rect, keys: &[(String, String)]) {
         height: h,
     };
     f.render_widget(Clear, popup);
-    let block = Block::bordered().title(" Keys · any key closes ");
+    let title = if max_scroll > 0 {
+        format!(
+            " Keys · {}–{} of {} · j k PgUp PgDn scroll · other keys close ",
+            scroll + 1,
+            scroll + view_h,
+            need
+        )
+    } else {
+        " Keys · any key closes ".to_string()
+    };
+    let block = Block::bordered().title(title);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    if inner.width >= 80 {
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(inner);
-        f.render_widget(Paragraph::new(rows[..half].to_vec()), left);
-        f.render_widget(Paragraph::new(rows[half..].to_vec()), right);
-    } else {
-        f.render_widget(Paragraph::new(rows).wrap(Wrap { trim: false }), inner);
+    let shown = |lines: Vec<Line<'static>>| -> Vec<Line<'static>> {
+        lines.into_iter().skip(scroll).take(view_h).collect()
+    };
+    match right {
+        Some(r) => {
+            let [left_a, right_a] =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(inner);
+            f.render_widget(Paragraph::new(shown(body)), left_a);
+            f.render_widget(Paragraph::new(shown(r)), right_a);
+        }
+        None => f.render_widget(Paragraph::new(shown(body)), inner),
     }
 }
 

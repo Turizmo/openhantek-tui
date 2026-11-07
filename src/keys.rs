@@ -605,7 +605,9 @@ pub const SCOPE_HELP: &[(&[Act], &str)] = &[
     (&[TriggerUp, TriggerDown], "trigger level"),
     (&[TriggerToMiddle], "trigger level to the middle of the signal"),
     (&[TriggerLeft, TriggerRight], "trigger position left / right"),
-    (&[TraceDownAlt, TraceUpAlt, TriggerDownFine, TriggerLeftFine], "a tenth of the step (also Alt-{ } + . >)"),
+    (&[TraceDownAlt, TraceUpAlt, TraceDownFineAlt, TraceUpFineAlt], "move the selected trace, fine"),
+    (&[TriggerDownFine, TriggerUpFine], "trigger level, fine"),
+    (&[TriggerLeftFine, TriggerRightFine], "trigger position, fine"),
     (&[Spectrum], "spectrum (FFT) view"),
     (&[SpectrumZoom], "spectrum zoom (span / 2)"),
     (&[FftWindow], "FFT window"),
@@ -616,8 +618,10 @@ pub const SCOPE_HELP: &[(&[Act], &str)] = &[
     (&[CursorMove(1, false), CursorMove(1, true)], "move time cursor B (when on)"),
     (&[CursorMove(2, false), CursorMove(2, true)], "move voltage cursor A (when on)"),
     (&[CursorMove(3, false), CursorMove(3, true)], "move voltage cursor B (when on)"),
-    (&[CursorFine(0, false), CursorFine(0, true)], "time cursor A, fine (B: Alt-H Alt-L)"),
-    (&[CursorFine(2, false), CursorFine(2, true)], "voltage cursor A, fine (B: Alt-J Alt-K)"),
+    (&[CursorFine(0, false), CursorFine(0, true)], "move time cursor A, fine"),
+    (&[CursorFine(1, false), CursorFine(1, true)], "move time cursor B, fine"),
+    (&[CursorFine(2, false), CursorFine(2, true)], "move voltage cursor A, fine"),
+    (&[CursorFine(3, false), CursorFine(3, true)], "move voltage cursor B, fine"),
     (&[Averaging], "averaging: 1 2 4 8 16 32 64"),
     (&[Persistence], "persistence: 0 2 4 8 16 traces"),
     (&[Dots], "dots / lines"),
@@ -643,7 +647,8 @@ pub const LOG_HELP: &[(&[Act], &str)] = &[
     (&[LogCursors], "time cursors on / off"),
     (&[LogCursor(0, false), LogCursor(0, true)], "move cursor A"),
     (&[LogCursor(1, false), LogCursor(1, true)], "move cursor B"),
-    (&[LogCursorFine(0, false), LogCursorFine(0, true)], "move cursor A, fine (B: Alt-H Alt-L)"),
+    (&[LogCursorFine(0, false), LogCursorFine(0, true)], "move cursor A, fine"),
+    (&[LogCursorFine(1, false), LogCursorFine(1, true)], "move cursor B, fine"),
     (&[LogTimeLabels], "time labels: clock / seconds"),
     (&[LogExport], "export CSV (A–B when the cursors are on)"),
 ];
@@ -662,12 +667,41 @@ pub const LOG_SCOPE_HELP: &[(&[Act], &str)] = &[
     (&[TraceCenter], "selected trace to the center"),
 ];
 
-/// Help rows with the user's keys.
+/// Help rows with the user's keys. Alt keys are not listed one by one
+/// (see [`ALT_NOTE`]): a row whose keys are all Alt keys is left out,
+/// and Alt keys are left out of the other rows.
 pub fn help_rows(map: &KeyMap, rows: &[(&[Act], &str)]) -> Vec<(String, String)> {
     rows.iter()
-        .map(|(acts, text)| (map.label(acts), text.to_string()))
+        .filter_map(|(acts, text)| {
+            let all: Vec<KeySpec> = acts.iter().flat_map(|a| map.keys(*a).to_vec()).collect();
+            let plain: Vec<String> = all
+                .iter()
+                .filter(|k| !k.mods.contains(KeyModifiers::ALT))
+                .map(key_label)
+                .fold(Vec::new(), |mut v, l| {
+                    if !v.contains(&l) {
+                        v.push(l);
+                    }
+                    v
+                });
+            match (all.is_empty(), plain.is_empty()) {
+                (true, _) => Some(("--".into(), text.to_string())),
+                (false, true) => None,
+                (false, false) => Some((plain.join(" "), text.to_string())),
+            }
+        })
         .collect()
 }
+
+/// The help row for all Alt keys: Alt with a move or step key moves or
+/// steps finely.
+pub const ALT_NOTE: (&str, &str) = (
+    "Alt + key",
+    "= fine step of that move/step key (cursors, volts/div, time/div, position, level)",
+);
+
+/// The Alt row of the log view help.
+pub const LOG_ALT_NOTE: (&str, &str) = ("Alt + key", "= fine step of that cursor key");
 
 #[cfg(test)]
 mod tests {

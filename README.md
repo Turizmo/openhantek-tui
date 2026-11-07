@@ -260,7 +260,13 @@ from the file come after the ones in it). `Ctrl-C` always quits. Typing
 a number or a search text in the panel uses fixed keys (characters,
 `Enter`, `Esc`, `Backspace`, the arrows); in the value column of a
 number, digits, `.` and `-` always start typing. The help screen (`?`)
-and the key hints show the keys in use.
+and the key hints show the keys in use. The help lists the plain keys;
+the Alt keys get one row, `Alt + key = fine step of that move/step
+key`. Long texts wrap at word boundaries in their column. When the
+help is taller than the screen (80x24) it is one column that scrolls
+with `j` `k` (or `↓` `↑`), `PgUp` `PgDn`, `Home` `End`; the title shows
+which rows are on screen, and any other key closes it. On a big
+screen (120x40) it shows all keys in two columns.
 
 **Ctrl and Alt in terminals.** `Alt` works in every terminal (the fine
 cursor keys use it). `Ctrl` with a letter works too, but a terminal
@@ -278,8 +284,9 @@ live trace stays above it, so you see each change at once. It has three
 columns, like the file manager yazi: categories, the settings in that
 category with their values, and the possible values (or help) of the
 setting under the cursor. The line above the key hints explains the
-setting under the cursor; it has the bold gray of the panel heading, so
-it does not look like a setting row. Number settings (positions, trigger level and
+setting under the cursor. It sits on a thin rule across the panel
+(`├── Show this channel ───┤`) in italic blue gray (cyan with 16
+colours), so it looks like neither a setting row nor the title. Number settings (positions, trigger level and
 position, cursor positions, calibration frequency) show their value in a
 box in the third column instead of a list:
 
@@ -377,7 +384,10 @@ takes the newer colour), so they stay connected lines.
 
 `m` shows the panel at the right of the plot: every measurement of each
 trace that is on (CH1, CH2, MATH), and a Cursors section when a cursor is
-on. Its layout depends only on the screen size and on which traces and
+on. The Cursors heading is right-aligned over the values like the CH1 /
+CH2 headings, and heading and values have one colour: the cursor colour
+when all cursors that are on share it, else the palette cursor gray.
+Its layout depends only on the screen size and on which traces and
 cursors are on, never on the values, so it does not jump:
 
 - The narrowest layout that shows every row of every trace wins, so the
