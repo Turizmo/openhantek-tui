@@ -310,11 +310,39 @@ impl Ring {
 
     /// [`Ring::read`] by byte positions.
     pub fn read_bytes<R>(&self, bytes: Range<u64>, f: impl FnOnce(&[u8], &[u8]) -> R) -> R {
-        let (a, b) = (bytes.start, bytes.end);
         assert!(
-            a <= b && b <= self.written() && a >= self.keep.load(Ordering::Acquire),
+            self.holds(&bytes),
             "ring read of bytes {bytes:?} outside the kept ones"
         );
+        self.read_held(bytes, f)
+    }
+
+    /// [`Ring::read`], or None when the frames are not all kept and
+    /// written (for reads that may come late, after the reader moved
+    /// `keep` on: the caller drops them instead of panicking).
+    pub fn try_read<R>(&self, frames: Range<u64>, f: impl FnOnce(&[u8], &[u8]) -> R) -> Option<R> {
+        let ch = self.channels() as u64;
+        self.try_read_bytes(frames.start * ch..frames.end * ch, f)
+    }
+
+    /// [`Ring::try_read`] by byte positions.
+    pub fn try_read_bytes<R>(
+        &self,
+        bytes: Range<u64>,
+        f: impl FnOnce(&[u8], &[u8]) -> R,
+    ) -> Option<R> {
+        self.holds(&bytes).then(|| self.read_held(bytes, f))
+    }
+
+    /// The bytes are between `keep` and `write`.
+    fn holds(&self, bytes: &Range<u64>) -> bool {
+        let (a, b) = (bytes.start, bytes.end);
+        a <= b && b <= self.written() && a >= self.keep.load(Ordering::Acquire)
+    }
+
+    /// Read bytes [`Ring::holds`] said are there.
+    fn read_held<R>(&self, bytes: Range<u64>, f: impl FnOnce(&[u8], &[u8]) -> R) -> R {
+        let (a, b) = (bytes.start, bytes.end);
         let size = self.buf.len();
         let start = (a & self.mask) as usize;
         let n = (b - a) as usize;
@@ -361,6 +389,22 @@ mod tests {
         let marks = r.take_marks();
         assert_eq!(marks.iter().map(|m| m.end).collect::<Vec<_>>(), [10, 20]);
         assert!(r.take_marks().is_empty());
+    }
+
+    #[test]
+    fn try_read_refuses_what_is_not_kept_or_written() {
+        let (r, w) = ring(16, 2);
+        assert!(w.write(&(0..12).collect::<Vec<u8>>(), Instant::now(), 0));
+        r.keep_from(2);
+        assert_eq!(
+            r.try_read(2..6, |a, b| [a, b].concat()),
+            Some((4..12).collect())
+        );
+        // Below the kept frames, or past the written ones.
+        assert_eq!(r.try_read(1..4, |a, _| a.len()), None);
+        assert_eq!(r.try_read(3..7, |a, _| a.len()), None);
+        assert_eq!(r.try_read_bytes(5..8, |a, _| a.len()), Some(3));
+        assert_eq!(r.try_read_bytes(3..8, |a, _| a.len()), None);
     }
 
     #[test]

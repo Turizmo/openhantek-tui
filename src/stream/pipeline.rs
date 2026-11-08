@@ -601,6 +601,9 @@ pub struct Pipeline {
     /// Single: the first point a trigger may be at.
     single_from: Option<f64>,
     single_done: bool,
+    /// Captures dropped as the ring no longer held their start (none
+    /// should be; see [`Pipeline::set_proc`]).
+    lost: u64,
     roll: Roll,
     /// Shortest time between two publishes ([`FRAME_TIME`]; tests 0).
     pub min_publish: Duration,
@@ -651,11 +654,12 @@ impl Pipeline {
             last_publish: None,
             single_from: None,
             single_done: false,
+            lost: 0,
             roll: Roll::default(),
             min_publish: FRAME_TIME,
             trigger_log: None,
         };
-        me.set_proc(pgen, p, newest);
+        me.set_proc(pgen, p, newest, 0);
         me
     }
 
@@ -664,8 +668,11 @@ impl Pipeline {
     }
 
     /// New processing settings: start the trigger search, the average and
-    /// the trigger count over (the stream goes on).
-    pub fn set_proc(&mut self, pgen: u64, p: ProcSettings, newest: u64) {
+    /// the trigger count over (the stream goes on). `kept` is the first
+    /// frame the ring still holds ([`Ring::kept`]): a longer screen or
+    /// more time before the trigger needs points the ring may have let go,
+    /// so the search starts where a capture's start is kept.
+    pub fn set_proc(&mut self, pgen: u64, p: ProcSettings, newest: u64, kept: u64) {
         let arm_changed = p.arm != self.p.arm;
         self.pgen = pgen;
         self.p = p;
@@ -677,6 +684,12 @@ impl Pipeline {
         self.src = if src < self.ch { src } else { 0 };
         let at = self.pts[self.src];
         self.scanner = EdgeScanner::new(0.0, Slope::Rising, 0.0, at);
+        let (_, pre, _) = self.p.window(self.hw.rate.rate);
+        // A trigger at t cuts from floor(t) - pre - MARGIN.
+        let from = kept.div_ceil(self.os) + (pre + MARGIN) as u64;
+        if from > at {
+            self.scanner.hold_until(from as f64);
+        }
         self.retune();
         self.pending.clear();
         self.avg.reset();
@@ -750,6 +763,11 @@ impl Pipeline {
     /// The single trigger fired: stop the stream.
     pub fn single_done(&self) -> bool {
         self.single_done
+    }
+
+    /// Captures dropped as their start was no longer in the ring.
+    pub fn lost(&self) -> u64 {
+        self.lost
     }
 
     /// Process what the ring holds now. `out` gets each published frame.
@@ -854,7 +872,10 @@ impl Pipeline {
                 break;
             }
             self.pending.pop_front();
-            let mut block = self.block(ring, c.start, len as usize);
+            let Some(mut block) = self.block(ring, c.start, len as usize) else {
+                self.lost += 1;
+                continue;
+            };
             let rel = c.t - c.start as f64;
             block.trigger = Some(rel);
             let cut = cut(&block, &self.p, self.ac_mean(), Some(rel));
@@ -871,10 +892,11 @@ impl Pipeline {
         }
     }
 
-    /// The points `start .. start + len` as a block in volts at the BNC.
-    fn block(&self, ring: &Ring, start: u64, len: usize) -> Block {
+    /// The points `start .. start + len` as a block in volts at the BNC;
+    /// None when the ring no longer holds them all.
+    fn block(&self, ring: &Ring, start: u64, len: usize) -> Option<Block> {
         let frames = start * self.os..(start + len as u64) * self.os;
-        ring.read(frames, |a, b| {
+        ring.try_read(frames, |a, b| {
             decimate_block([a, b], &self.hw, self.lines, self.range, self.gen)
         })
     }
@@ -963,7 +985,9 @@ impl Pipeline {
         if start < ring.kept().div_ceil(self.os) {
             return;
         }
-        let block = self.block(ring, start, len as usize);
+        let Some(block) = self.block(ring, start, len as usize) else {
+            return;
+        };
         self.last_status = pts;
         self.last_publish = Some(now);
         let (frame, state) = if auto {
@@ -1297,5 +1321,95 @@ mod tests {
         }
         eprintln!("pipeline: {:.0} MS/s", best / 1e6);
         assert!(best > 60e6, "{:.1} MS/s", best / 1e6);
+    }
+
+    /// A ring, its writer and a pipeline over the 100 kHz cal wave.
+    fn cal_stream(
+        cfg: HwConfig,
+        p: ProcSettings,
+    ) -> (Arc<Ring>, crate::stream::ring::Writer, Pipeline) {
+        let ring = Arc::new(Ring::new(1 << 24));
+        let w = ring.reset(cfg.channels);
+        let mut pl = Pipeline::new(1, 1, cfg, &fake_cal(), p, 0);
+        pl.min_publish = Duration::ZERO;
+        (ring, w, pl)
+    }
+
+    /// Write `bytes` in pieces and step after each; the published frames.
+    fn feed(
+        ring: &Ring,
+        w: &crate::stream::ring::Writer,
+        pl: &mut Pipeline,
+        bytes: &[u8],
+    ) -> Vec<Box<Published>> {
+        let mut got = Vec::new();
+        for c in bytes.chunks(16_384) {
+            assert!(w.write(c, Instant::now(), 0), "ring overrun");
+            pl.step(ring, &mut |p| got.push(p));
+        }
+        got
+    }
+
+    fn triggered(out: &[Box<Published>]) -> usize {
+        out.iter()
+            .filter(|p| p.state == TrigState::Triggered)
+            .count()
+    }
+
+    #[test]
+    fn a_longer_screen_mid_stream_cuts_only_kept_points() {
+        // The stream goes on (same hardware) while the screen grows: the
+        // first captures after it need points from before the change.
+        for chans in [1u8, 2] {
+            for (from, to) in [(1e-6, 1e-5), (1e-5, 1e-4), (1e-4, 1e-3)] {
+                let s = settings(from, 1);
+                let mut cfg = hw(s.coarse_screen_time(), chans);
+                cfg.cal_freq = 100_000;
+                let bytes = raw(&cal_fake(), &cfg, 4 << 20);
+                let (half, rest) = bytes.split_at(bytes.len() / 2);
+                let (ring, w, mut pl) = cal_stream(cfg, ProcSettings::of(&s, 0));
+                feed(&ring, &w, &mut pl, half);
+                let p = ProcSettings::of(&settings(to, 1), 0);
+                pl.set_proc(2, p, ring.frames(), ring.kept());
+                let out = feed(&ring, &w, &mut pl, rest);
+                assert_eq!(pl.lost(), 0, "{chans} ch {from} -> {to}");
+                assert!(triggered(&out) > 0, "{chans} ch {from} -> {to}");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_changes_mid_stream_never_lose_a_capture() {
+        // Fixed-seed xorshift: screen time (time/div and fine), trigger
+        // position and averaging change at random while the stream goes on.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for chans in [1u8, 2] {
+            let s = settings(1e-6, 1);
+            let mut cfg = hw(s.coarse_screen_time(), chans);
+            cfg.cal_freq = 100_000;
+            let segment = 60_000;
+            let bytes = raw(&cal_fake(), &cfg, 200 * segment);
+            let mut p = ProcSettings::of(&s, 0);
+            let (ring, w, mut pl) = cal_stream(cfg, p.clone());
+            let seg = segment * chans as usize;
+            for (k, c) in bytes.chunks(seg).enumerate() {
+                let out = feed(&ring, &w, &mut pl, c);
+                if k > 0 {
+                    assert!(triggered(&out) > 0, "{chans} ch, segment {k}");
+                }
+                // 1 us .. 200 us across the screen (up to 6000 points).
+                p.screen_time = 1e-6 * 200f64.powf(rnd());
+                p.position = rnd();
+                p.averaging = 1 + (rnd() * 4.0) as usize;
+                pl.set_proc(k as u64 + 2, p.clone(), ring.frames(), ring.kept());
+            }
+            assert_eq!(pl.lost(), 0, "{chans} ch");
+        }
     }
 }

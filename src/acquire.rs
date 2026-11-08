@@ -494,19 +494,25 @@ struct LogLive {
 
 impl LogLive {
     /// Give the log every transfer that came since the last call, each
-    /// with its bus time.
-    fn take(&mut self, log: &mut LogSession, conn: &Connection) {
+    /// with its bus time. False when the ring no longer held a transfer
+    /// (the log needs a gap and the stream again).
+    fn take(&mut self, log: &mut LogSession, conn: &Connection) -> bool {
         for m in self.ring.take_marks() {
             let from = self.mark_end.max(self.cursor);
             self.mark_end = m.end;
             if m.end > from {
-                self.ring
-                    .read_bytes(from..m.end, |a, b| log.piece([a, b], 0, m.at, conn));
+                let read = self
+                    .ring
+                    .try_read_bytes(from..m.end, |a, b| log.piece([a, b], 0, m.at, conn));
+                if read.is_none() {
+                    return false;
+                }
                 self.cursor = m.end;
             }
         }
         let ch = self.cfg.channels.clamp(1, 2) as u64;
         self.ring.keep_from(self.cursor / ch);
+        true
     }
 }
 
@@ -548,7 +554,8 @@ impl Worker {
                 }
                 if let Some(l) = &mut self.live {
                     let newest = l.ring.frames();
-                    l.pipeline.set_proc(pgen, (*p).clone(), newest);
+                    let kept = l.ring.kept();
+                    l.pipeline.set_proc(pgen, (*p).clone(), newest, kept);
                 }
                 self.process = Some((pgen, *p));
             }
@@ -841,13 +848,14 @@ impl Worker {
         let ring = live.ring.clone();
         let failed = ring.failure();
         // What came before a loss is whole: log it first.
-        live.take(log, conn);
+        let whole = live.take(log, conn);
         self.last_error = None;
         if let Some(Failure::Usb(e)) = failed {
             self.log_error(anyhow::Error::new(e).context("reading samples failed"));
             return;
         }
-        if ring.overrun() > 0 {
+        // An overrun, or data the ring no longer held: a gap.
+        if ring.overrun() > 0 || !whole {
             // The PC could not keep up: a gap, and the stream again.
             log.restart = true;
             self.log_live = None;
