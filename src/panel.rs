@@ -105,6 +105,8 @@ pub enum Field {
     LogFree,
     LogAxis,
     LogCsvTime,
+    /// Trace mode of the log view.
+    LogTraceMode,
     /// Pick one of the recent logs to open.
     LogOpen,
     Act(Action),
@@ -207,7 +209,7 @@ pub fn categories() -> Vec<Category> {
             ],
         },
         Category {
-            name: "Timebase",
+            name: "Acquisition",
             fields: vec![
                 TimeDiv,
                 Roll,
@@ -285,6 +287,7 @@ pub fn categories() -> Vec<Category> {
                 LogDir,
                 LogAxis,
                 LogCsvTime,
+                LogTraceMode,
                 Act(Action::LogView),
                 LogOpen,
                 Act(Action::ExportLog),
@@ -432,6 +435,7 @@ impl Field {
             LogFree => "Free space",
             LogAxis => "Time labels",
             LogCsvTime => "CSV time",
+            LogTraceMode => "Trace mode",
             LogOpen => "Open log",
             Act(a) => match a {
                 Action::RunStop => "Run / stop",
@@ -508,6 +512,7 @@ impl Field {
             LogFree => "Free space on the disk of the log folder.",
             LogAxis => "Time labels of the log view: wall clock (UTC) or seconds since the start. Key t.",
             LogCsvTime => "Time column of the log CSV export.",
+            LogTraceMode => "Log view: average: the mean line. peak: the min..max area of each step (raw logs: the samples). average + peak: the line over the area, muted. Key D in the log view.",
             LogOpen => "Open a recent log in the log view (Enter), d deletes it (asks first). Also: --open-log FILE.",
             Act(a) => match a {
                 Action::RunStop => "Start or stop the capture. Key space.",
@@ -641,6 +646,10 @@ impl Field {
                 .collect(),
             LogAxis => TimeAxis::ALL.iter().map(|m| m.name().to_string()).collect(),
             LogCsvTime => CsvTime::ALL.iter().map(|m| m.name().to_string()).collect(),
+            LogTraceMode => crate::settings::TraceMode::ALL
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect(),
             LogOpen => d.recent_logs.clone(),
             _ => Vec::new(),
         }
@@ -751,6 +760,7 @@ impl Field {
             LogLimit => s.logger.limit_idx(),
             LogAxis => index_of(&TimeAxis::ALL, &s.logger.time_axis),
             LogCsvTime => index_of(&CsvTime::ALL, &s.logger.csv_time),
+            LogTraceMode => index_of(&crate::settings::TraceMode::ALL, &s.logger.trace_mode),
             _ => 0,
         }
     }
@@ -858,6 +868,10 @@ impl Field {
             }
             LogAxis => s.logger.time_axis = TimeAxis::ALL[i.min(1)],
             LogCsvTime => s.logger.csv_time = CsvTime::ALL[i.min(1)],
+            LogTraceMode => {
+                let all = crate::settings::TraceMode::ALL;
+                s.logger.trace_mode = all[i.min(all.len() - 1)]
+            }
             _ => {}
         }
     }
@@ -1855,7 +1869,8 @@ mod tests {
         };
         let cats = categories();
         let lg = cats.iter().find(|c| c.name == "Logger").unwrap();
-        assert!(lg.fields.len() <= 11);
+        // No more rows than the categories.
+        assert!(lg.fields.len() <= categories().len());
         assert_eq!(Field::LogLimit.value(&s, &d), "1 GB ≈ 11 h 34 min");
         assert_eq!(
             Field::LogLimit.help_text(&s, &d),
@@ -1877,6 +1892,34 @@ mod tests {
         assert!(Field::LogStep
             .help_text(&s, &d)
             .contains("ADC at 16 MS/s, 8 samples per step, 173 GB/h for 2 channels."));
+        // The raw step: first in the list, with its limits in the help.
+        assert_eq!(Field::LogStep.options(&s, &d)[0], "raw (62.5 ns)");
+        Field::LogStep.set_index(&mut s, 0);
+        assert_eq!(s.logger.step, crate::logger::RAW);
+        assert_eq!(Field::LogStep.value(&s, &d), "raw (62.5 ns)");
+        let help = Field::LogStep.help_text(&s, &d);
+        for part in [
+            "at 16 MS/s",
+            "no min/max",
+            "32 MB/s, so 1 GB lasts ≈ 31 s",
+            "disk must keep up",
+            "20 MHz",
+            "CH2 alone",
+            "Max ADC rate",
+        ] {
+            assert!(help.contains(part), "{part}: {help}");
+        }
+        s.channels[1].enabled = false;
+        assert_eq!(Field::LogStep.value(&s, &d), "raw (33.3 ns)");
+        assert!(Field::LogLimit.value(&s, &d).starts_with("1 GB ≈ 33 s"));
+        // A lower max ADC rate: the steps follow it.
+        s.acquisition.max_adc_rate = 1e6;
+        assert_eq!(Field::LogStep.value(&s, &d), "raw (1 µs)");
+        s.logger.step = 0.5e-6;
+        assert_eq!(Field::LogStep.value(&s, &d), "1 µs");
+        s.acquisition.max_adc_rate = 16e6;
+        s.channels[1].enabled = true;
+        s.logger.step = 1e-3;
         assert_eq!(Field::LogOpen.value(&s, &d), "2 logs");
         d.log_dir = "/home/someone/.local/share/openhantek-tui/logs".into();
         assert_eq!(Field::LogDir.value(&s, &d), "…are/openhantek-tui/logs");
@@ -2215,7 +2258,7 @@ mod tests {
     fn actions_and_info() {
         let mut p = Panel::new();
         let mut s = Settings::default();
-        goto(&mut p, &mut s, "Timebase", "Autoset");
+        goto(&mut p, &mut s, "Acquisition", "Autoset");
         assert_eq!(
             key(&mut p, &mut s, KeyCode::Enter),
             Outcome::Action(Action::Autoset)

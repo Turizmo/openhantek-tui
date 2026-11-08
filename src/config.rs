@@ -105,6 +105,7 @@ pub const COMMENTS: &[(&str, &str)] = &[
     ("logger.log_dir", "log folder (default ~/.local/share/openhantek-tui/logs)"),
     ("logger.time_axis", "log view time labels: \"Clock\" (UTC) or \"Seconds\""),
     ("logger.csv_time", "log CSV time column: \"Iso\" (UTC) or \"Seconds\""),
+    ("logger.trace_mode", "log view: \"Average\" (mean line), \"Peak\" (min..max area) or \"Both\""),
 ];
 
 /// Comments above the tables.

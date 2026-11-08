@@ -130,11 +130,16 @@ fn records_without_gaps_at_1_ms() {
 /// with its bus time, so the logger's clock check sees a whole stream and
 /// must not report a gap.
 fn fast_log(name: &str, channels: [bool; 2], raw: f64, per_step: u32) {
+    fast_log_step(name, 0.5e-6, channels, raw, per_step)
+}
+
+/// [`fast_log`] at any step; [`lg::RAW`] is one u8 sample per step.
+fn fast_log_step(name: &str, step: f64, channels: [bool; 2], raw: f64, per_step: u32) {
     let dir = temp_dir(name);
     let path = dir.join("b.ohlog");
     let fake = FakeScope::new([SINE_1K, Wave::Dc(-0.5)]);
     let acq = Acquisition::spawn(opener(fake.clone()));
-    let (req, sh) = request(&path, 0.5e-6, channels, 0);
+    let (req, sh) = request(&path, step, channels, 0);
     let hw = if channels == [true, false] { 1 } else { 2 };
     acq.send(Command::StartLog(req));
     wait_state(&acq, &sh, 10.0, |s| *s == LogState::Recording);
@@ -163,8 +168,16 @@ fn fast_log(name: &str, channels: [bool; 2], raw: f64, per_step: u32) {
         got < all + per_step as u64 && got + 2048 > all,
         "{got} of {all}"
     );
-    // The 1 kHz sine shows: one period is 2 ms / 0.5 µs = 2000 steps.
-    let r = f.read(10_000..12_000).unwrap();
+    assert_eq!(f.header.raw, lg::is_raw(step));
+    if f.header.raw {
+        // One byte per logged channel and sample.
+        let n = channels.iter().filter(|c| **c).count() as u64;
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len >= f.end() * n && len < f.end() * n + 4096, "{len}");
+    }
+    // The 1 kHz sine shows: one period is 1 ms (2000 steps of 0.5 µs).
+    let period = (1e-3 * raw / per_step as f64) as u64;
+    let r = f.read(10_000..10_000 + period).unwrap();
     if channels[0] {
         let max = r.iter().map(|x| x.1[0][1]).fold(f32::MIN, f32::max);
         let min = r.iter().map(|x| x.1[0][0]).fold(f32::MAX, f32::min);
@@ -184,6 +197,47 @@ fn records_at_16_ms_per_s_with_two_channels() {
 #[test]
 fn records_at_30_ms_per_s_with_ch1_alone() {
     fast_log("fast1", [true, false], 30e6, 15);
+}
+
+#[test]
+fn raw_log_at_16_ms_per_s_with_two_channels() {
+    fast_log_step("raw2", lg::RAW, [true, true], 16e6, 1);
+}
+
+#[test]
+fn raw_log_at_30_ms_per_s_with_ch1_alone() {
+    fast_log_step("raw1", lg::RAW, [true, false], 30e6, 1);
+}
+
+#[test]
+fn raw_log_of_ch2_alone_streams_both_channels() {
+    fast_log_step("raw_ch2", lg::RAW, [false, true], 16e6, 1);
+}
+
+#[test]
+fn raw_log_at_a_lower_max_adc_rate() {
+    let dir = temp_dir("raw_cap");
+    let path = dir.join("r.ohlog");
+    let fake = FakeScope::new([SINE_1K, Wave::Dc(0.0)]);
+    let acq = Acquisition::spawn(opener(fake.clone()));
+    let (mut req, sh) = request(&path, lg::RAW, [true, true], 0);
+    req.max_adc = 1e6;
+    acq.send(Command::StartLog(req));
+    wait_state(&acq, &sh, 10.0, |s| *s == LogState::Recording);
+    let t0 = Instant::now();
+    while fake.lock().bulk_bytes < 400_000 {
+        drain(&acq);
+        assert!(t0.elapsed().as_secs() < 30);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    acq.send(Command::StopLog);
+    wait_state(&acq, &sh, 30.0, |s| matches!(s, LogState::Done(_)));
+    assert_eq!(fake.lock().rate_id, 1);
+    let f = LogFile::open(&path).unwrap();
+    assert!(f.header.raw);
+    assert_eq!(f.header.adc_rate, 1e6);
+    assert!((f.header.step() - 1e-6).abs() < 1e-15);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// CH2 alone cannot use 1-channel mode (that is CH1): both are sampled.

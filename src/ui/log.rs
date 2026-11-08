@@ -19,14 +19,6 @@ use crate::settings::*;
 use crate::si::fmt_si;
 use crate::theme::Palette;
 
-/// Fill character between min and max in the text styles.
-fn fill_char(style: TraceStyle) -> char {
-    match style {
-        TraceStyle::Line => ':',
-        _ => '░',
-    }
-}
-
 /// Value labels of the log view: volts of the selected channel.
 fn log_labels(s: &Settings) -> Vec<String> {
     let sel = s.selected.min(1);
@@ -197,7 +189,9 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         }
     }
 
-    // Envelopes: filled from min to max, the mean as a line.
+    // Envelopes in the trace mode: the mean as a line, the min..max
+    // area, or the line over the muted area.
+    let mode = s.logger.trace_mode;
     for t in draw_order(s) {
         if t > 1 || !h.channels[t].enabled || !s.channels[t].enabled {
             continue;
@@ -205,12 +199,8 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         let style = s.display.trace_style[t];
         let (scale, offset) = trace_scale(s, t);
         let yd = |x: f32| (x as f64 / scale + offset).clamp(-half_v, half_v);
-        let (fill, dim) = pal.persist(t, 2, 4);
         let layer = layer_of(s, t);
-        let fill_layer = plot::LAYER_PERSIST + t as u8;
-        if dim {
-            plot.dim_upto(fill_layer);
-        }
+        let band_layer = plot::LAYER_BAND + if t == s.selected { 3 } else { 2 - t as u8 };
         // The mean: a point per dot column, or (zoomed in past one step
         // per dot column) a point in the middle of each step, joined.
         let pts: Vec<(f64, f64)> = cols
@@ -226,51 +216,40 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
                 (x_of(dc), if a.is_empty() { f64::NAN } else { yd(a.mean) })
             })
             .collect();
-        // Single samples have no band: the line joins the samples.
-        let band = !(k > 1 && h.single());
-        let braille = matches!(style, TraceStyle::BrailleThin | TraceStyle::BrailleBold);
-        if braille {
-            // The mean first: the fill on the same layer joins its cells
-            // (one colour per braille cell), so the band has no holes.
+        // Single samples (raw logs, zoomed in) have no area: the peak is
+        // the line through the samples.
+        let band = mode.peak() && !(k > 1 && h.single());
+        if mode.line() || !band {
             plot.styled(&pts, style, false, layer, pal.trace[t]);
         }
+        if !band {
+            continue;
+        }
+        // The area per dot column: one entry, or a whole step as a flat
+        // band when zoomed in past one step per dot column.
+        let mut ranges: Vec<Option<(f64, f64)>> = vec![None; w];
         for (j, a) in cols.iter().enumerate() {
             let a = a[t];
-            if a.is_empty() || !band {
+            if a.is_empty() {
                 continue;
             }
-            // The dot columns of this entry: one, or a whole step as a
-            // flat band.
             let dcs = if k > 1 {
                 let c0 = v.col_of(w, (first + j as u64) as f64).max(0.0) as usize;
                 let c1 = (v.col_of(w, (first + j as u64 + 1) as f64).max(0.0) as usize).min(w);
                 c0..c1
             } else {
-                j..j + 1
+                j..(j + 1).min(w)
             };
-            if braille {
-                let y0 = plot.py(yd(a.max)).floor() as i64;
-                let y1 = plot.py(yd(a.min)).floor() as i64;
-                for dc in dcs {
-                    plot.vrun(dc as i64, y0, y1, layer, fill);
-                }
-            } else {
-                let r0 = plot.row_of(yd(a.max));
-                let r1 = plot.row_of(yd(a.min));
-                let mut last = usize::MAX;
-                for dc in dcs {
-                    if dc / 2 == last {
-                        continue;
-                    }
-                    last = dc / 2;
-                    for row in r0..=r1 {
-                        plot.put_glyph(dc / 2, row, fill_char(style), fill_layer, fill);
-                    }
-                }
+            for dc in dcs {
+                ranges[dc] = Some((yd(a.max), yd(a.min)));
             }
         }
-        if !braille {
-            plot.styled(&pts, style, false, layer, pal.trace[t]);
+        let braille = matches!(style, TraceStyle::BrailleThin | TraceStyle::BrailleBold);
+        match mode {
+            TraceMode::Peak => plot.band(&ranges, style, layer, pal.trace[t]),
+            // The braille area on the line's layer: the cells join.
+            _ if braille => plot.band(&ranges, style, layer, pal.muted(t)),
+            _ => plot.band(&ranges, style, band_layer, pal.muted(t)),
         }
     }
 

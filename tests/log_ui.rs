@@ -469,3 +469,102 @@ fn log_view_zooms_in_past_one_step_per_dot_column() {
     assert!(t.contains("ΔT"), "{t}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn log_view_trace_modes() {
+    let (mut app, dir) = app_with_log("modes");
+    app.scope.settings.display.trace_style = [TraceStyle::Box; 3];
+    // Both is the log view default: the area and the line.
+    assert_eq!(app.scope.settings.logger.trace_mode, TraceMode::Both);
+    let both = plot_rows(&screen(&app, 120, 40));
+    assert!(both.matches('░').count() > 100 && both.contains('─'));
+    // D in the log view: average, only the line.
+    key(&mut app, KeyCode::Char('D'));
+    assert_eq!(app.scope.settings.logger.trace_mode, TraceMode::Average);
+    let avg = plot_rows(&screen(&app, 120, 40));
+    assert_eq!(avg.matches('░').count(), 0);
+    assert!(avg.contains('─'));
+    // Peak: the area only, in the trace colour.
+    key(&mut app, KeyCode::Char('D'));
+    assert_eq!(app.scope.settings.logger.trace_mode, TraceMode::Peak);
+    let peak = plot_rows(&screen(&app, 120, 40));
+    assert!(peak.matches('░').count() > 100);
+    // The scope view's mode did not change.
+    assert_eq!(app.scope.settings.display.trace_mode, TraceMode::Average);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A raw CH1 log at 30 MS/s: one u8 sample per step, a 1 MHz sine.
+fn write_raw_log(path: &Path, n: u64) -> Header {
+    let mut h = header(33, 1);
+    h.raw = true;
+    h.adc_rate = 30e6;
+    h.channels[1].enabled = false;
+    h.channels[0].zero_count = 128.0;
+    h.channels[0].volts_per_count = 0.04;
+    let sh = writer::shared(path.to_path_buf(), 0);
+    let w = Writer::spawn(sh.clone());
+    w.send(Msg::Begin(h.clone()));
+    let data: Vec<u8> = (0..n)
+        .map(|i| (128.0 + 50.0 * (i as f64 / 30.0 * std::f64::consts::TAU).sin()).round() as u8)
+        .collect();
+    w.send(Msg::Raw { first: 0, data });
+    w.finish();
+    h
+}
+
+#[test]
+fn raw_log_in_the_log_view_and_csv() {
+    let dir = temp_dir("raw");
+    let path = dir.join("log-raw.ohlog");
+    write_raw_log(&path, 3_000_000);
+    let mut app = App::new(Settings::default(), None);
+    app.export_dir = dir.clone();
+    app.log_dir_override = Some(dir.clone());
+    assert!(app.open_log(&path));
+    for _ in 0..20 {
+        app.tick();
+    }
+    let v = app.log_view.as_ref().unwrap();
+    assert!(v.file.header.raw);
+    assert_eq!(v.end(), 3_000_000);
+    assert!(v.summary_progress() >= 1.0);
+    let all = screen(&app, 120, 40).join("\n");
+    assert!(all.contains("step 33.3 ns"), "{all}");
+    // 0.1 s long: 3 M steps of 33.3 ns.
+    assert!(all.contains("0:00:00 long"), "{all}");
+    // Zoomed out: the pyramid's min/max is the ±2 V of the sine.
+    let cols = v.columns(100).unwrap();
+    assert!((cols[50][0].max - 2.0).abs() < 0.05 && (cols[50][0].min + 2.0).abs() < 0.05);
+    // Zoomed in to single samples: peak is the line through them, in
+    // every mode.
+    for _ in 0..30 {
+        key(&mut app, KeyCode::Char('+'));
+    }
+    for mode in TraceMode::ALL {
+        app.scope.settings.logger.trace_mode = mode;
+        for style in TraceStyle::ALL {
+            app.scope.settings.display.trace_style = [style; 3];
+            let plot = plot_rows(&screen(&app, 120, 40));
+            let ink = plot
+                .chars()
+                .filter(|c| ('\u{2801}'..='\u{28FF}').contains(c) || "─│╭╮╰╯|/\\_-‾".contains(*c))
+                .count();
+            assert!(ink > 10, "{mode:?} {style:?}\n{plot}");
+        }
+    }
+    // CSV export converts to volts.
+    let f = &app.log_view.as_ref().unwrap().file;
+    let mut out = Vec::new();
+    openhantek_tui::logger::csv::write_log_csv(&mut out, f, 0..31, CsvTime::Seconds).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "time_s,ch1");
+    assert_eq!(lines[1], "0.0000000000,0.000000");
+    // A quarter period (7.5 samples) on: near the top.
+    assert!(lines[9].starts_with("0.0000002667,"), "{}", lines[9]);
+    let v9: f64 = lines[9].split(',').nth(1).unwrap().parse().unwrap();
+    assert!(v9 > 1.9, "{v9}");
+    assert_eq!(lines.len(), 32);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

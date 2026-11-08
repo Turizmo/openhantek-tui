@@ -459,6 +459,12 @@ pub enum TraceMode {
 impl TraceMode {
     pub const ALL: [TraceMode; 3] = [TraceMode::Average, TraceMode::Peak, TraceMode::Both];
 
+    /// The next mode (key D).
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             TraceMode::Average => "average",
@@ -781,6 +787,8 @@ pub struct LoggerSettings {
     pub log_dir: Option<std::path::PathBuf>,
     pub time_axis: TimeAxis,
     pub csv_time: CsvTime,
+    /// Mean line, min..max area or both, in the log view.
+    pub trace_mode: TraceMode,
 }
 
 impl Default for LoggerSettings {
@@ -791,6 +799,7 @@ impl Default for LoggerSettings {
             log_dir: None,
             time_axis: TimeAxis::Clock,
             csv_time: CsvTime::Iso,
+            trace_mode: TraceMode::Both,
         }
     }
 }

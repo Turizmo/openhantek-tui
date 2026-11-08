@@ -23,7 +23,12 @@ pub const LAYER_CURSOR: u8 = 1;
 pub const LAYER_PERSIST: u8 = 2;
 /// Layers for old frames: the deepest persistence.
 pub const PERSIST_LAYERS: u8 = 16;
-pub const LAYER_MATH: u8 = LAYER_PERSIST + PERSIST_LAYERS;
+/// Peak areas (the trace mode): under every trace line, over the old
+/// traces. One layer each for MATH, CH2, CH1 and the selected trace
+/// (`LAYER_BAND + 3`). In the braille styles a peak area of the newest
+/// frame is drawn on the layer of its line instead, so they share cells.
+pub const LAYER_BAND: u8 = LAYER_PERSIST + PERSIST_LAYERS;
+pub const LAYER_MATH: u8 = LAYER_BAND + 4;
 pub const LAYER_CH2: u8 = LAYER_MATH + 1;
 pub const LAYER_CH1: u8 = LAYER_MATH + 2;
 /// The selected trace, drawn above all others.
@@ -37,6 +42,14 @@ pub fn persist_layer(i: usize, n: usize) -> u8 {
 
 fn is_persist(layer: u8) -> bool {
     (LAYER_PERSIST..LAYER_PERSIST + PERSIST_LAYERS).contains(&layer)
+}
+
+/// Fill character of a peak area in the text styles.
+pub fn band_char(style: TraceStyle) -> char {
+    match style {
+        TraceStyle::Line => ':',
+        _ => '░',
+    }
 }
 
 /// Divisions across and up the screen.
@@ -435,6 +448,67 @@ impl Plot {
             (TraceStyle::Line, true) => self.text_points(points, layer, color),
             (TraceStyle::Box, false) => self.box_line(points, layer, color),
             (TraceStyle::Box, true) => self.box_points(points, layer, color),
+        }
+    }
+
+    /// Fill a peak area (the trace mode): `ranges[c]` is the high and low
+    /// value (in divisions) of the area in dot column `c`, `None` where
+    /// there is none. Braille styles set every dot from high to low;
+    /// next columns that do not overlap are stretched to touch, so a
+    /// steep edge has no gap. Text styles fill whole cells with
+    /// [`band_char`].
+    pub fn band(
+        &mut self,
+        ranges: &[Option<(f64, f64)>],
+        style: TraceStyle,
+        layer: u8,
+        color: Color,
+    ) {
+        let h = self.dots_h() as i64;
+        let braille = matches!(style, TraceStyle::BrailleThin | TraceStyle::BrailleBold);
+        // Dot rows (top, bottom) per dot column, joined to the column before.
+        let mut rows: Vec<Option<(i64, i64)>> = vec![None; ranges.len().min(self.dots_w())];
+        let mut prev: Option<(i64, i64)> = None;
+        for (c, r) in ranges.iter().take(rows.len()).enumerate() {
+            let Some((hi, lo)) = *r else {
+                prev = None;
+                continue;
+            };
+            if !hi.is_finite() || !lo.is_finite() {
+                prev = None;
+                continue;
+            }
+            let (a, b) = (self.py(hi).floor() as i64, self.py(lo).floor() as i64);
+            let (mut top, mut bot) = (a.min(b).clamp(0, h - 1), a.max(b).clamp(0, h - 1));
+            if let Some((pt, pb)) = prev {
+                if top > pb + 1 {
+                    top = pb + 1;
+                } else if bot < pt - 1 {
+                    bot = pt - 1;
+                }
+            }
+            rows[c] = Some((top, bot));
+            prev = Some((top, bot));
+        }
+        if braille {
+            for (c, r) in rows.iter().enumerate() {
+                if let Some((top, bot)) = *r {
+                    self.vrun(c as i64, top, bot, layer, color);
+                }
+            }
+            return;
+        }
+        let ch = band_char(style);
+        for col in 0..self.cols {
+            let pair = [2 * col, 2 * col + 1].map(|c| rows.get(c).copied().flatten());
+            let Some((top, bot)) = pair.iter().flatten().fold(None, |acc: Option<(i64, i64)>, r| {
+                Some(acc.map_or(*r, |(t, b)| (t.min(r.0), b.max(r.1))))
+            }) else {
+                continue;
+            };
+            for row in (top / 4)..=(bot / 4) {
+                self.put_glyph(col, row as usize, ch, layer, color);
+            }
         }
     }
 
@@ -1902,6 +1976,43 @@ mod tests {
             RED,
         );
         assert_eq!(used_columns(&q).len(), 2);
+    }
+
+    #[test]
+    fn band_fills_from_high_to_low_and_joins_steep_edges() {
+        let mut p = Plot::new(4, 2);
+        let w = p.dots_w();
+        // A band from -1 to 1 division in the left half, a thin one at
+        // +3 in the right half: a jump with no overlap.
+        let ranges: Vec<Option<(f64, f64)>> = (0..w)
+            .map(|c| Some(if c < w / 2 { (1.0, -1.0) } else { (3.0, 3.0) }))
+            .collect();
+        p.band(&ranges, TraceStyle::BrailleThin, LAYER_CH1, Color::Yellow);
+        let col = |x: usize| (0..p.dots_h()).filter(|&y| p.dot(x, y)).count();
+        // 2 divisions of 2 rows of 4 dots: about 16 dots per column.
+        assert!((15..=18).contains(&col(1)), "{}", col(1));
+        // The first thin column reaches down to the band: no gap.
+        let first = w / 2;
+        let rows: Vec<usize> = (0..p.dots_h()).filter(|&y| p.dot(first, y)).collect();
+        let top_of_band = (0..p.dots_h()).find(|&y| p.dot(first - 1, y)).unwrap();
+        assert_eq!(*rows.last().unwrap() + 1, top_of_band, "{rows:?}");
+        assert!(col(first + 1) <= 2);
+        // Text styles fill cells with a shade (box) or ':' (ascii).
+        for (style, ch) in [(TraceStyle::Box, '░'), (TraceStyle::Line, ':')] {
+            let mut p = Plot::new(4, 2);
+            p.band(&ranges, style, LAYER_CH1, Color::Yellow);
+            let n = (0..p.rows)
+                .flat_map(|r| (0..p.cols).map(move |c| (c, r)))
+                .filter(|&(c, r)| p.char_at(c, r) == ch)
+                .count();
+            assert!(n >= 20, "{style:?} {n}");
+        }
+        // A lower layer does not paint over a line.
+        let mut p = Plot::new(4, 2);
+        p.text_line(&[(-5.0, 0.0), (5.0, 0.0)], LAYER_CH1, Color::Yellow);
+        let before = p.char_at(5, p.row_of(0.0));
+        p.band(&ranges, TraceStyle::Line, LAYER_BAND, Color::Gray);
+        assert_eq!(p.char_at(5, p.row_of(0.0)), before);
     }
 
     #[test]

@@ -892,7 +892,7 @@ fn settings_panel_height_is_fixed_and_fits_its_content() {
     // the help line and key hints stay.
     let mut r = rig();
     r.char('s');
-    while r.app.panel.groups()[r.app.panel.cat].name != "Timebase" {
+    while r.app.panel.groups()[r.app.panel.cat].name != "Acquisition" {
         r.char('j');
     }
     r.char('l');
@@ -1627,4 +1627,94 @@ fn log_help_has_one_alt_row() {
     r.char('?');
     let lines = help_popup_lines(&mut r, 120, 40);
     assert_eq!(lines.iter().filter(|l| l.contains("Alt")).count(), 1, "{lines:?}");
+}
+
+/// Braille cells with at least 3 dots in the screen text.
+fn dense_cells(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .flat_map(|l| l.chars())
+        .filter(|c| ('\u{2800}'..='\u{28FF}').contains(c) && (*c as u32 - 0x2800).count_ones() >= 3)
+        .count()
+}
+
+/// A 1 MHz square of ±1 V at 1 ms/div: 16 raw samples per point at
+/// 16 MS/s see both levels, so the mean is a flat line at 0 V and the
+/// peak area covers -1 V .. 1 V.
+fn square_rig() -> Rig {
+    let sq = Wave::Square {
+        freq: 1e6,
+        low: -1.0,
+        high: 1.0,
+        duty: 0.5,
+    };
+    let mut r = Rig::new([sq, Wave::Dc(0.0)]);
+    r.app.scope.settings.channels[1].enabled = false;
+    r.app.scope.settings.channels[0].offset = 0.0;
+    r.feed();
+    r.feed();
+    r
+}
+
+#[test]
+fn trace_mode_draws_the_peak_area() {
+    let mut r = square_rig();
+    assert_eq!(r.app.scope.settings.display.trace_mode, TraceMode::Average);
+    let line = dense_cells(&r.screen(120, 30));
+    // D: peak.
+    r.char('D');
+    assert_eq!(r.app.scope.settings.display.trace_mode, TraceMode::Peak);
+    let peak = dense_cells(&r.screen(120, 30));
+    // The area is 2 divisions high across the screen; the line is thin.
+    assert!(peak > 4 * line.max(10), "line {line} peak {peak}");
+    // D: both. The line is bright, the area muted.
+    r.char('D');
+    assert_eq!(r.app.scope.settings.display.trace_mode, TraceMode::Both);
+    let buf = r.buffer(120, 30);
+    let pal = openhantek_tui::theme::Palette::for_setting(r.app.scope.settings.display.colors);
+    let count = |c: ratatui::style::Color| {
+        buf.content()
+            .iter()
+            .filter(|x| x.fg == c && x.symbol().chars().any(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch)))
+            .count()
+    };
+    assert!(count(pal.muted(0)) > 50, "muted {}", count(pal.muted(0)));
+    assert!(count(pal.trace[0]) > 10, "bright {}", count(pal.trace[0]));
+    // Every style and the persistence draw it.
+    r.app.scope.settings.display.persistence = 4;
+    for style in TraceStyle::ALL {
+        r.app.scope.settings.display.trace_style[0] = style;
+        for mode in TraceMode::ALL {
+            r.app.scope.settings.display.trace_mode = mode;
+            r.feed();
+            let t = r.text(120, 30);
+            if mode.peak() {
+                match style {
+                    TraceStyle::Line => assert!(t.contains(':'), "{t}"),
+                    TraceStyle::Box => assert!(t.contains('░'), "{t}"),
+                    _ => assert!(dense_cells(&r.screen(120, 30)) > 4 * line.max(10)),
+                }
+            }
+        }
+    }
+    // D cycles back to average.
+    r.app.scope.settings.display.trace_mode = TraceMode::Both;
+    r.char('D');
+    assert_eq!(r.app.scope.settings.display.trace_mode, TraceMode::Average);
+}
+
+#[test]
+fn max_adc_rate_setting_caps_the_scope() {
+    let mut r = rig();
+    assert_eq!(r.app.scope.hw.unwrap().rate.raw, 16e6);
+    r.app.scope.settings.acquisition.max_adc_rate = 2e6;
+    r.feed();
+    let hw = r.app.scope.hw.unwrap();
+    assert_eq!((hw.rate.raw, hw.rate.rate), (2e6, 1e6));
+    assert!(r.app.scope.frame.is_some());
+    // The panel shows the choices with the CH1 rate.
+    let s = &r.app.scope.settings;
+    let opts = openhantek_tui::panel::Field::MaxAdc.options(s, &Default::default());
+    assert_eq!(opts[0], "16 MS/s · CH1 alone 30 MS/s");
+    assert_eq!(openhantek_tui::panel::Field::MaxAdc.value(s, &Default::default()), "2 MS/s");
 }

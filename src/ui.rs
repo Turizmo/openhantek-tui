@@ -143,8 +143,22 @@ fn log_help_rows(app: &App) -> Vec<(String, String)> {
     rows.push((keys::LOG_ALT_NOTE.0.into(), keys::LOG_ALT_NOTE.1.into()));
     rows.push((String::new(), String::new()));
     rows.extend(keys::help_rows(&app.keys, keys::LOG_SCOPE_HELP));
+    rows.push((String::new(), String::new()));
+    rows.extend(RAW_STEP_HELP.iter().map(|t| (String::new(), t.to_string())));
     rows
 }
+
+/// The limits of the raw log step, in plain words (log view help).
+pub const RAW_STEP_HELP: [&str; 8] = [
+    "Raw log step (Settings › Logger › Step):",
+    "one 8-bit ADC sample per step, no min/max.",
+    "The file grows about 30-32 MB/s: a 1 GB",
+    "limit lasts about 30 s. The disk must keep up.",
+    "Analog bandwidth is about 20 MHz: finer",
+    "detail is not real. CH2 alone still uses",
+    "2-channel mode (16 MS/s). Acquisition ›",
+    "Max ADC rate lowers the rate.",
+];
 
 /// The help rows of the scope view, with the user's bindings.
 pub fn scope_help_rows(app: &App) -> Vec<(String, String)> {
@@ -154,6 +168,8 @@ pub fn scope_help_rows(app: &App) -> Vec<(String, String)> {
     rows.push((String::new(), String::new()));
     rows.push((String::new(), "The calibration output pins give a".into()));
     rows.push((String::new(), "2 Vpp square wave at this frequency.".into()));
+    rows.push((String::new(), String::new()));
+    rows.extend(RAW_STEP_HELP.iter().map(|t| (String::new(), t.to_string())));
     rows
 }
 
@@ -276,13 +292,107 @@ fn grid(plot: &mut Plot, s: &Settings, pal: &Palette) {
     );
 }
 
-fn draw_trace(plot: &mut Plot, frame: &Frame, t: usize, s: &Settings, layer: u8, color: Color) {
+fn draw_line(plot: &mut Plot, frame: &Frame, t: usize, s: &Settings, layer: u8, color: Color) {
     let style = s.display.trace_style[t];
     // Braille thin shows the same points with and without dots, like the
     // first version did: sin(x)/x points too.
     let dots = s.display.dots && style != TraceStyle::BrailleThin;
     let pts = trace_points(frame, t, s, plot.dots_w(), dots);
     plot.styled(&pts, style, s.display.dots, layer, color);
+}
+
+/// The peak area of trace `t` per dot column: the high and low value in
+/// divisions. Each dot column takes the band of its samples; a column
+/// between two samples (a zoomed-in screen) takes the band between them,
+/// in a straight line.
+pub fn peak_columns(
+    plot: &Plot,
+    frame: &Frame,
+    t: usize,
+    s: &Settings,
+) -> Option<Vec<Option<(f64, f64)>>> {
+    let (lo, hi) = frame.peak[t].as_ref()?;
+    let (scale, offset) = trace_scale(s, t);
+    let half_v = V_DIVS / 2.0;
+    let y = |v: f64| (v / scale + offset).clamp(-half_v, half_v);
+    let n = lo.len().min(hi.len());
+    let r = frame.visible(s, n);
+    if r.is_empty() {
+        return None;
+    }
+    let w = plot.dots_w();
+    let mut cols: Vec<Option<(f64, f64)>> = vec![None; w];
+    let mut add = |c: i64, top: f64, bot: f64| {
+        if (0..w as i64).contains(&c) {
+            let e = &mut cols[c as usize];
+            *e = Some(e.map_or((top, bot), |(a, b)| (a.max(top), b.min(bot))));
+        }
+    };
+    // One sample more on each side, so the area reaches the edges.
+    let pts: Vec<(f64, f64, f64)> = (r.start.saturating_sub(1)..(r.end + 1).min(n))
+        .filter(|&i| hi[i].is_finite() && lo[i].is_finite())
+        .map(|i| (plot.px(frame.x(i as f64, s)), y(hi[i]), y(lo[i])))
+        .collect();
+    for p in &pts {
+        add(p.0.floor() as i64, p.1, p.2);
+    }
+    for pair in pts.windows(2) {
+        let (p, q) = (pair[0], pair[1]);
+        let first = (p.0.floor() as i64 + 1).max(0);
+        let last = (q.0.floor() as i64 - 1).min(w as i64 - 1);
+        for c in first..=last {
+            let f = ((c as f64 + 0.5 - p.0) / (q.0 - p.0)).clamp(0.0, 1.0);
+            add(c, p.1 + (q.1 - p.1) * f, p.2 + (q.2 - p.2) * f);
+        }
+    }
+    Some(cols)
+}
+
+/// Draw trace `t` in the trace mode: the mean line, the peak area in the
+/// trace colour, or the line over the area in `muted`. The area goes on
+/// `band_layer` under the lines, or for the braille styles on the line's
+/// layer (one colour per braille cell: the cells join, no holes).
+#[allow(clippy::too_many_arguments)]
+fn draw_trace(
+    plot: &mut Plot,
+    frame: &Frame,
+    t: usize,
+    s: &Settings,
+    layer: u8,
+    band_layer: u8,
+    color: Color,
+    muted: Color,
+) {
+    let mode = s.display.trace_mode;
+    let style = s.display.trace_style[t];
+    if mode.line() {
+        draw_line(plot, frame, t, s, layer, color);
+    }
+    if !mode.peak() {
+        return;
+    }
+    let Some(cols) = peak_columns(plot, frame, t, s) else {
+        if !mode.line() {
+            // No band (XY or no data): the line.
+            draw_line(plot, frame, t, s, layer, color);
+        }
+        return;
+    };
+    let braille = matches!(style, TraceStyle::BrailleThin | TraceStyle::BrailleBold);
+    match mode {
+        TraceMode::Peak => plot.band(&cols, style, layer, color),
+        _ if braille => plot.band(&cols, style, layer, muted),
+        _ => plot.band(&cols, style, band_layer, muted),
+    }
+}
+
+/// Peak area layer of trace `t`: under all lines, the selected on top.
+fn band_layer_of(s: &Settings, t: usize) -> u8 {
+    if t == s.selected {
+        plot::LAYER_BAND + 3
+    } else {
+        plot::LAYER_BAND + [2, 1, 0][t]
+    }
 }
 
 /// Colour of the trigger mark and text when the level is outside the
@@ -518,14 +628,24 @@ fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
                 if dim {
                     plot.dim_upto(layer);
                 }
-                draw_trace(&mut plot, old, t, s, layer, color);
+                // Old frames: the line and the area in one faded colour.
+                draw_trace(&mut plot, old, t, s, layer, layer, color, color);
             }
         }
     }
     if let Some(frame) = &sc.frame {
         for &t in &order {
             if trace_enabled(s, t) {
-                draw_trace(&mut plot, frame, t, s, layer_of(s, t), pal.trace[t]);
+                draw_trace(
+                    &mut plot,
+                    frame,
+                    t,
+                    s,
+                    layer_of(s, t),
+                    band_layer_of(s, t),
+                    pal.trace[t],
+                    pal.muted(t),
+                );
             }
         }
     }

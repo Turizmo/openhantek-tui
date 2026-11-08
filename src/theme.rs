@@ -265,6 +265,16 @@ impl Palette {
         }
     }
 
+    /// The muted colour of trace `t`: its peak area under the bright mean
+    /// line (trace mode both). Halfway to the background; in 16 colours
+    /// the plain (not light) colour.
+    pub fn muted(&self, t: usize) -> Color {
+        match self.mode {
+            ColorMode::Ansi16 => [Color::Yellow, Color::Cyan, Color::Magenta][t.min(2)],
+            _ => self.persist(t, 2, 4).0,
+        }
+    }
+
     /// Grid and center cross colours at grid brightness `percent` (10 to
     /// 100), and whether the grid needs the DIM modifier. At
     /// [`GRID_BRIGHTNESS_DEFAULT`] they are [`Palette::grid`] and

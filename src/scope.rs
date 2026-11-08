@@ -935,6 +935,117 @@ mod tests {
         assert!(averaged < 0.04, "averaged {averaged}");
     }
 
+    /// A block whose CH1 is 0 V on average with raw extremes of ±(1 +
+    /// `k`) V, CH2 the sine.
+    fn peaky_block(gen: u64, k: f64) -> Block {
+        let mut b = sine_block(gen, 1e6, 1000.0, 1.0, 0.0);
+        let n = b.data[0].len();
+        b.min = [
+            b.data[0].iter().map(|v| v - 1.0 - k).collect(),
+            b.data[1].clone(),
+        ];
+        b.max = [
+            b.data[0].iter().map(|v| v + 1.0 + k).collect(),
+            b.data[1].clone(),
+        ];
+        assert_eq!(b.min[0].len(), n);
+        b
+    }
+
+    #[test]
+    fn peak_band_from_the_raw_extremes() {
+        let mut s = scope();
+        s.push(peaky_block(1, 0.0));
+        let f = s.frame.as_ref().unwrap();
+        let tr = f.traces[0].as_ref().unwrap();
+        let (lo, hi) = f.peak[0].as_ref().unwrap();
+        assert_eq!((lo.len(), hi.len()), (tr.len(), tr.len()));
+        for i in 0..tr.len() {
+            assert!((hi[i] - tr[i] - 1.0).abs() < 1e-9 && (tr[i] - lo[i] - 1.0).abs() < 1e-9);
+        }
+        // Without min and max (one raw sample per point) the band is the
+        // trace.
+        let (lo2, hi2) = f.peak[1].as_ref().unwrap();
+        assert_eq!(lo2, f.traces[1].as_ref().unwrap());
+        assert_eq!(hi2, f.traces[1].as_ref().unwrap());
+        // Invert and probe: high and low swap and scale.
+        s.settings.channels[0].invert = true;
+        s.settings.channels[0].probe = 10;
+        s.push(peaky_block(1, 0.0));
+        let f = s.frame.as_ref().unwrap();
+        let tr = f.traces[0].as_ref().unwrap();
+        let (lo, hi) = f.peak[0].as_ref().unwrap();
+        assert!((hi[100] - tr[100] - 10.0).abs() < 1e-9, "{} {}", hi[100], tr[100]);
+        assert!((tr[100] - lo[100] - 10.0).abs() < 1e-9);
+        // The math band holds every value: CH1 - CH2.
+        s.settings.channels[0].invert = false;
+        s.settings.channels[0].probe = 1;
+        s.settings.math.enabled = true;
+        s.settings.math.mode = MathMode::Sub;
+        s.sync_hw();
+        s.push(peaky_block(s.gen, 0.0));
+        let f = s.frame.as_ref().unwrap();
+        let (lo, hi) = f.peak[MATH].as_ref().unwrap();
+        let m = f.traces[MATH].as_ref().unwrap();
+        assert!((hi[50] - m[50] - 1.0).abs() < 1e-9 && (m[50] - lo[50] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn averaged_peak_keeps_the_extremes_of_the_last_captures() {
+        let mut s = scope();
+        s.settings.display.averaging = 4;
+        // One capture with a big spike, then small ones.
+        s.push(peaky_block(1, 2.0));
+        for _ in 0..3 {
+            s.push(peaky_block(1, 0.0));
+        }
+        let band = |s: &Scope| {
+            let f = s.frame.as_ref().unwrap();
+            let (lo, hi) = f.peak[0].as_ref().unwrap();
+            let tr = f.traces[0].as_ref().unwrap();
+            (hi[200] - tr[200], tr[200] - lo[200])
+        };
+        // The spike capture is one of the last 4: its ±3 V stay, not
+        // averaged down.
+        let (up, down) = band(&s);
+        assert!((up - 3.0).abs() < 1e-6 && (down - 3.0).abs() < 1e-6, "{up} {down}");
+        // A fifth capture: the spike drops out of the window.
+        s.push(peaky_block(1, 0.0));
+        let (up, _) = band(&s);
+        assert!((up - 1.0).abs() < 1e-6, "{up}");
+        // A settings change resets it with the average.
+        s.push(peaky_block(1, 2.0));
+        s.settings.time_idx += 1;
+        let (gen, _) = s.sync_hw().unwrap();
+        let mut b = peaky_block(gen, 0.0);
+        b.cfg = s.hw.unwrap();
+        s.push(b);
+        let (up, _) = band(&s);
+        assert!((up - 1.0).abs() < 1e-6, "{up}");
+    }
+
+    #[test]
+    fn roll_mode_keeps_the_peak_band() {
+        let mut s = Scope::new(Settings::default());
+        s.settings.time_idx = time_index(100e-3);
+        let (gen, cfg) = s.sync_hw().unwrap();
+        let piece = Block {
+            gen,
+            cfg,
+            data: [vec![1.0; 100], vec![0.0; 100]],
+            min: [vec![0.5; 100], vec![0.0; 100]],
+            max: [vec![2.0; 100], vec![0.0; 100]],
+            clipped: [false; 2],
+            range: nominal_range(&cfg),
+            rate: cfg.rate.rate,
+            roll: true,
+        };
+        s.push(piece);
+        let f = s.frame.as_ref().unwrap();
+        let (lo, hi) = f.peak[0].as_ref().unwrap();
+        assert_eq!((lo.len(), lo[0], hi[99]), (100, 0.5, 2.0));
+    }
+
     #[test]
     fn persistence_keeps_old_frames() {
         let mut s = scope();

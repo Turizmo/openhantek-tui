@@ -737,6 +737,8 @@ impl App {
                 self.scope.history.clear();
             }
             Act::Dots => s.display.dots ^= true,
+            Act::TraceMode => s.display.trace_mode = s.display.trace_mode.next(),
+            Act::LogTraceMode => s.logger.trace_mode = s.logger.trace_mode.next(),
             Act::Interpolation => {
                 s.display.interpolation = match s.display.interpolation {
                     Interpolation::Sinc => Interpolation::Linear,
