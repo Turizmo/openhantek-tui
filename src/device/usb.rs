@@ -91,10 +91,7 @@ fn load_firmware(dev: &Device<GlobalContext>, firmware: Option<&Path>) -> Result
     handle
         .claim_interface(INTERFACE)
         .map_err(|e| explain(e, "cannot claim the scope to load firmware"))?;
-    let mut t = UsbTransport {
-        handle,
-        timeout: Duration::from_millis(1000),
-    };
+    let mut t = UsbTransport::new(handle, Duration::from_millis(1000));
     firmware::upload(&mut t, &records)
         .with_context(|| format!("firmware upload from {} failed", path.display()))?;
     let _ = t.handle.release_interface(INTERFACE);
@@ -159,10 +156,7 @@ pub fn open(firmware: Option<&Path>, status: &mut dyn FnMut(&str)) -> Result<Ope
         .claim_interface(INTERFACE)
         .map_err(|e| explain(e, "cannot claim the scope"))?;
     Ok(Opened {
-        transport: UsbTransport {
-            handle,
-            timeout: Duration::from_millis(500),
-        },
+        transport: UsbTransport::new(handle, Duration::from_millis(500)),
         serial,
         bcd,
         loaded_firmware,

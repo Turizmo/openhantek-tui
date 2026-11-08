@@ -296,9 +296,13 @@ fn tail(text: &str, max: usize) -> String {
     format!("…{end}")
 }
 
-/// Channels a log would record now (at least 1, for the estimates).
-fn logged_channels(s: &Settings) -> usize {
-    s.channels.iter().filter(|c| c.enabled).count().max(1)
+/// Channels a log would record now (CH1 when none is on, for the
+/// estimates).
+fn logged_channels(s: &Settings) -> [bool; 2] {
+    match [s.channels[0].enabled, s.channels[1].enabled] {
+        [false, false] => [true, false],
+        on => on,
+    }
 }
 
 /// A size limit with how long it lasts: `1 GB ≈ 11 h 34 min`.
@@ -612,7 +616,8 @@ impl Field {
                 t
             }
             Field::LogStep => {
-                let (r, n) = lg::adc_for_step(lg::step_ns(s.logger.step));
+                let (r, n) = lg::adc_for_step(lg::step_ns(s.logger.step), lg::hw_channels(ch));
+                let count = ch.iter().filter(|&&c| c).count();
                 format!(
                     "{} ADC at {}, {} sample{} per step, {}/h for {} channel{}.",
                     self.help(),
@@ -620,8 +625,8 @@ impl Field {
                     n,
                     if n == 1 { "" } else { "s" },
                     lg::fmt_bytes((lg::bytes_per_second(s.logger.step, ch) * 3600.0) as u64),
-                    ch,
-                    if ch == 1 { "" } else { "s" }
+                    count,
+                    if count == 1 { "" } else { "s" }
                 )
             }
             Field::LogDir => format!("{} · {}", d.log_dir, self.help()),
@@ -1784,11 +1789,16 @@ mod tests {
             "Limit 1 GB ≈ 11 h 34 min at 1 ms step"
         );
         s.channels[1].enabled = false;
-        s.logger.step = 2.5e-6;
-        assert_eq!(Field::LogLimit.value(&s, &d), "1 GB ≈ 10 min");
+        s.logger.step = 0.5e-6;
+        assert_eq!(Field::LogLimit.value(&s, &d), "1 GB ≈ 42 s");
+        // CH1 alone: 1-channel mode at 30 MS/s.
         assert!(Field::LogStep
             .help_text(&s, &d)
-            .contains("ADC at 400 kS/s, 1 sample per step"));
+            .contains("ADC at 30 MS/s, 15 samples per step, 86.4 GB/h for 1 channel."));
+        s.channels[1].enabled = true;
+        assert!(Field::LogStep
+            .help_text(&s, &d)
+            .contains("ADC at 16 MS/s, 8 samples per step, 173 GB/h for 2 channels."));
         assert_eq!(Field::LogOpen.value(&s, &d), "2 logs");
         d.log_dir = "/home/someone/.local/share/openhantek-tui/logs".into();
         assert_eq!(Field::LogDir.value(&s, &d), "…are/openhantek-tui/logs");

@@ -8,11 +8,16 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::protocol::{
-    cal_freq_of_code, raw_rate_of_id, REQ_EEPROM, REQ_RW_INTERNAL, REQ_SET_CAL_FREQ,
+    cal_freq_of_code, raw_rate_of_id, PACKET_SIZE, REQ_EEPROM, REQ_RW_INTERNAL, REQ_SET_CAL_FREQ,
     REQ_SET_CHANNELS, REQ_SET_COUPLING, REQ_SET_GAIN_CH1, REQ_SET_GAIN_CH2, REQ_SET_SAMPLERATE,
     REQ_START,
 };
-use super::transport::{ControlCall, Transport, VENDOR_IN, VENDOR_OUT};
+use super::transport::{Chunk, ControlCall, StreamSetup, Transport, VENDOR_IN, VENDOR_OUT};
+
+/// Bytes per second the fake's USB link moves at most, like a real USB 2
+/// bulk pipe (about 40 MB/s). Faster streams lose whole packets on the
+/// scope side, without a report.
+pub const USB_MAX_BYTES: f64 = 40e6;
 
 /// A test signal at the BNC input, in volts.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -103,7 +108,18 @@ pub struct FakeState {
     /// come.
     pub drop_samples: usize,
     pub calls: Vec<ControlCall>,
+    /// Bytes sent so far, by bulk reads and by the stream.
     pub bulk_bytes: usize,
+    /// The queued async stream, if any (see [`Transport::stream_start`]).
+    pub stream: Option<StreamSetup>,
+    /// Bytes per second the link moves at most (real time only).
+    pub usb_max: f64,
+    /// The last start command came while a stream was queued.
+    pub started_with_stream: bool,
+    /// Bytes the stream made since the start command.
+    streamed: u64,
+    /// The next stream transfer, made but not yet due.
+    pending: Option<Chunk>,
     /// Signal time, in seconds. Runs on with every sample.
     t: f64,
     since_start: usize,
@@ -155,6 +171,11 @@ impl FakeScope {
                 drop_samples: 0,
                 calls: Vec::new(),
                 bulk_bytes: 0,
+                stream: None,
+                usb_max: USB_MAX_BYTES,
+                started_with_stream: false,
+                streamed: 0,
+                pending: None,
                 t: 0.0,
                 since_start: 0,
                 rng: 0x9E37_79B9_7F4A_7C15,
@@ -208,6 +229,51 @@ impl FakeState {
         let raw = self.zero[ch] as f64 + v * counts_per_volt(self.gain_byte[ch]) + n;
         raw.round().clamp(0.0, 255.0) as u8
     }
+
+    fn raw_rate(&self) -> f64 {
+        raw_rate_of_id(self.rate_id).max(1.0)
+    }
+
+    fn channels(&self) -> usize {
+        self.channels.clamp(1, 2) as usize
+    }
+
+    /// Let `frames` samples per channel pass without sending them.
+    fn skip(&mut self, frames: usize) {
+        let dt = 1.0 / self.raw_rate();
+        for _ in 0..frames {
+            self.t += dt;
+            self.since_start += 1;
+        }
+    }
+
+    /// Fill `buf` with samples (whole frames). Returns the bytes used.
+    fn fill(&mut self, buf: &mut [u8]) -> usize {
+        let channels = self.channels();
+        let dt = 1.0 / self.raw_rate();
+        let n = buf.len() - buf.len() % channels;
+        let lost = std::mem::take(&mut self.drop_samples);
+        self.skip(lost);
+        for frame in buf[..n].chunks_mut(channels) {
+            for (c, b) in frame.iter_mut().enumerate() {
+                *b = self.sample(c);
+            }
+            self.t += dt;
+            self.since_start += 1;
+        }
+        self.bulk_bytes += n;
+        n
+    }
+
+    /// In real time: how long until the samples made so far are due.
+    fn due(&mut self, limit: Duration) -> Option<Duration> {
+        if !self.realtime {
+            return None;
+        }
+        let clock = *self.clock.get_or_insert_with(Instant::now);
+        let due = Duration::from_secs_f64(self.since_start as f64 / self.raw_rate());
+        due.checked_sub(clock.elapsed()).map(|d| d.min(limit))
+    }
 }
 
 impl Transport for FakeScope {
@@ -225,6 +291,7 @@ impl Transport for FakeScope {
         });
         // Like the firmware: every vendor command stops sampling first.
         s.sampling = false;
+        s.pending = None;
         let b = data.first().copied().unwrap_or(0);
         match request {
             REQ_SET_GAIN_CH1 => s.gain_byte[0] = b,
@@ -235,7 +302,11 @@ impl Transport for FakeScope {
             REQ_SET_CAL_FREQ => s.cal_code = b,
             REQ_START => {
                 s.sampling = b == 1;
+                if s.sampling {
+                    s.started_with_stream = s.stream.is_some();
+                }
                 s.since_start = 0;
+                s.streamed = 0;
                 s.clock = None;
             }
             REQ_EEPROM => anyhow::bail!("fake scope: EEPROM writes are not allowed"),
@@ -272,41 +343,118 @@ impl Transport for FakeScope {
             if s.unplugged {
                 return Err(rusb::Error::NoDevice.into());
             }
+            if s.stream.is_some() {
+                anyhow::bail!("bulk read while a stream is running");
+            }
             if !s.sampling {
                 drop(s);
                 std::thread::sleep(timeout.min(Duration::from_millis(50)));
                 return Err(rusb::Error::Timeout.into());
             }
-            let raw_rate = raw_rate_of_id(s.rate_id).max(1.0);
-            let channels = s.channels.clamp(1, 2) as usize;
-            let dt = 1.0 / raw_rate;
-            let n = buf.len() - buf.len() % channels;
-            for _ in 0..std::mem::take(&mut s.drop_samples) {
-                s.t += dt;
-                s.since_start += 1;
-            }
-            for frame in buf[..n].chunks_mut(channels) {
-                for (c, b) in frame.iter_mut().enumerate() {
-                    *b = s.sample(c);
-                }
-                s.t += dt;
-                s.since_start += 1;
-            }
-            s.bulk_bytes += n;
+            let n = s.fill(buf);
             // Real time: the data cannot come faster than the ADC makes it.
-            let pause = if s.realtime {
-                let clock = *s.clock.get_or_insert_with(Instant::now);
-                let due = Duration::from_secs_f64(s.since_start as f64 * dt);
-                due.checked_sub(clock.elapsed()).map(|d| d.min(timeout))
-            } else {
-                None
-            };
-            (pause, n)
+            (s.due(timeout), n)
         };
         if let Some(p) = pause {
             std::thread::sleep(p);
         }
         Ok(n)
+    }
+
+    fn stream_start(&mut self, setup: StreamSetup) -> Result<()> {
+        let mut s = self.lock();
+        if s.unplugged {
+            return Err(rusb::Error::NoDevice.into());
+        }
+        s.stream = Some(setup);
+        s.pending = None;
+        Ok(())
+    }
+
+    /// Like the async stream on real USB: the scope makes data from the
+    /// start command on, at the ADC rate. The host has room for the
+    /// transfers in flight plus its queue; when the consumer is further
+    /// behind than that, whole transfers are dropped and reported in
+    /// [`Chunk::lost`]. A stream faster than [`FakeState::usb_max`] loses
+    /// packets on the scope side, without a report, like the real one.
+    fn stream_next(&mut self, timeout: Duration) -> Result<Option<Chunk>> {
+        let (pause, chunk) = {
+            let mut s = self.lock();
+            if s.unplugged {
+                return Err(rusb::Error::NoDevice.into());
+            }
+            let Some(setup) = s.stream else {
+                anyhow::bail!("no stream is running");
+            };
+            if !s.sampling {
+                drop(s);
+                std::thread::sleep(timeout.min(Duration::from_millis(50)));
+                return Ok(None);
+            }
+            let channels = s.channels();
+            let byte_rate = s.raw_rate() * channels as f64;
+            // What the link carries: the scope's rate, at most `usb_max`.
+            let link = byte_rate.min(s.usb_max);
+            if s.pending.is_none() {
+                let xfer = setup.transfer - setup.transfer % channels;
+                // Samples lost in the scope: their time passes, they never come.
+                let dropped = std::mem::take(&mut s.drop_samples);
+                s.skip(dropped);
+                s.streamed += (dropped * channels) as u64;
+                let mut lost = 0u64;
+                if s.realtime {
+                    let clock = *s.clock.get_or_insert_with(Instant::now);
+                    let made = clock.elapsed().as_secs_f64() * link;
+                    let room = (setup.transfers * setup.transfer + setup.queue_max) as f64;
+                    let behind = made - s.streamed as f64;
+                    if behind > room + xfer as f64 {
+                        let n = ((behind - room) as u64 / xfer as u64) * xfer as u64;
+                        s.skip(n as usize / channels);
+                        s.streamed += n;
+                        lost = n;
+                    }
+                    if byte_rate > s.usb_max {
+                        // Packets the link had no time for.
+                        let gone = xfer as f64 * (byte_rate / s.usb_max - 1.0);
+                        let packets = (gone / PACKET_SIZE as f64).round() as usize;
+                        s.skip(packets * PACKET_SIZE / channels);
+                    }
+                }
+                let mut data = vec![0u8; xfer];
+                let n = s.fill(&mut data);
+                data.truncate(n);
+                s.streamed += n as u64;
+                // When the transfer is done on the bus: when its last byte
+                // is made. Not when the consumer gets it, and not when the
+                // fake made it (that can be slower than real time).
+                let clock = *s.clock.get_or_insert_with(Instant::now);
+                let at = clock + Duration::from_secs_f64(s.streamed as f64 / link);
+                s.pending = Some(Chunk { data, lost, at });
+            }
+            // Real time: the transfer is done when its last byte is made.
+            let pause = if s.realtime {
+                let clock = *s.clock.get_or_insert_with(Instant::now);
+                let due = Duration::from_secs_f64(s.streamed as f64 / link);
+                due.saturating_sub(clock.elapsed())
+            } else {
+                Duration::ZERO
+            };
+            if pause > timeout {
+                (timeout, None)
+            } else {
+                (pause, s.pending.take())
+            }
+        };
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
+        Ok(chunk)
+    }
+
+    fn stream_stop(&mut self) {
+        let mut s = self.lock();
+        s.stream = None;
+        s.pending = None;
     }
 }
 
@@ -376,6 +524,79 @@ mod tests {
         assert_eq!(buf[0], 0x00);
         assert_eq!(buf[1], 0xFF);
         assert!(buf[1600..].iter().all(|b| (120..=132).contains(b)));
+    }
+
+    fn setup(transfer: usize, transfers: usize, queue_max: usize) -> StreamSetup {
+        StreamSetup {
+            endpoint: 0x86,
+            transfer,
+            transfers,
+            queue_max,
+        }
+    }
+
+    #[test]
+    fn stream_gives_transfers_with_bus_times() {
+        let mut f = FakeScope::new([Wave::Dc(0.0); 2]);
+        f.control_out(REQ_SET_SAMPLERATE, 0, 0, &[1, 0]).unwrap();
+        f.stream_start(setup(4096, 4, 4096)).unwrap();
+        // Queued, but no data before the start command.
+        assert_eq!(f.stream_next(Duration::from_millis(1)).unwrap(), None);
+        f.control_out(REQ_START, 0, 0, &[1]).unwrap();
+        assert!(f.lock().started_with_stream);
+        let a = f.stream_next(Duration::from_millis(1)).unwrap().unwrap();
+        let b = f.stream_next(Duration::from_millis(1)).unwrap().unwrap();
+        assert_eq!((a.data.len(), a.lost), (4096, 0));
+        // 2048 frames at 1 MS/s: 2.048 ms apart on the bus.
+        let dt = b.at.duration_since(a.at).as_secs_f64();
+        assert!((dt - 2.048e-3).abs() < 1e-6, "{dt}");
+        // A bulk read while the stream is queued is a bug.
+        let mut buf = [0u8; 512];
+        assert!(f.bulk_in(0x86, &mut buf, Duration::from_millis(1)).is_err());
+        f.stream_stop();
+        assert!(f.bulk_in(0x86, &mut buf, Duration::from_millis(1)).is_ok());
+    }
+
+    #[test]
+    fn slow_consumer_loses_whole_transfers_and_is_told() {
+        let mut f = FakeScope::new([Wave::Dc(0.0); 2]);
+        f.lock().realtime = true;
+        // 1 MS/s, CH1 only: 1 MB/s. Room for 4 kB in flight + 4 kB queued.
+        f.control_out(REQ_SET_CHANNELS, 0, 0, &[1]).unwrap();
+        f.control_out(REQ_SET_SAMPLERATE, 0, 0, &[1, 0]).unwrap();
+        f.stream_start(setup(2048, 2, 4096)).unwrap();
+        f.control_out(REQ_START, 0, 0, &[1]).unwrap();
+        let a = f.stream_next(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(a.lost, 0);
+        std::thread::sleep(Duration::from_millis(100));
+        let b = f.stream_next(Duration::from_secs(1)).unwrap().unwrap();
+        // About 100 kB came while nobody read; 8 kB of it had room.
+        assert!(b.lost > 80_000 && b.lost < 100_000, "{}", b.lost);
+        assert_eq!(b.lost % 2048, 0);
+        let c = f.stream_next(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(c.lost, 0);
+    }
+
+    #[test]
+    fn too_fast_for_usb_loses_packets_silently() {
+        let mut f = FakeScope::new([Wave::Dc(0.0); 2]);
+        f.lock().realtime = true;
+        // 24 MS/s with both channels: 48 MB/s, more than the link's 40.
+        f.control_out(REQ_SET_SAMPLERATE, 0, 0, &[24, 0]).unwrap();
+        f.stream_start(setup(256 << 10, 32, 64 << 20)).unwrap();
+        f.control_out(REQ_START, 0, 0, &[1]).unwrap();
+        let mut bytes = 0;
+        for _ in 0..4 {
+            let c = f.stream_next(Duration::from_secs(1)).unwrap().unwrap();
+            assert_eq!(c.lost, 0);
+            bytes += c.data.len();
+        }
+        // The signal time ran on by 48/40 of the data sent.
+        let frames = f.lock().since_start;
+        assert!(
+            frames as f64 > bytes as f64 / 2.0 * 1.15,
+            "{frames} {bytes}"
+        );
     }
 
     #[test]

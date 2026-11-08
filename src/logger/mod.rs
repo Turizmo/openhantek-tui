@@ -13,6 +13,7 @@
 pub mod binner;
 pub mod csv;
 pub mod format;
+pub mod gapcheck;
 pub mod pyramid;
 pub mod reader;
 pub mod view;
@@ -22,10 +23,11 @@ use std::path::{Path, PathBuf};
 
 use crate::device::protocol::Rate;
 
-/// Log steps in seconds: one raw sample at 400 kS/s up to one minute.
-pub const STEPS: [f64; 24] = [
-    2.5e-6, 5e-6, 10e-6, 20e-6, 50e-6, 100e-6, 200e-6, 500e-6, 1e-3, 2e-3, 5e-3, 10e-3, 20e-3,
-    50e-3, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0,
+/// Log steps in seconds: 0.5 µs (the fastest ADC rate, see
+/// [`ADC_RATES`]) up to one minute.
+pub const STEPS: [f64; 26] = [
+    0.5e-6, 1e-6, 2e-6, 5e-6, 10e-6, 20e-6, 50e-6, 100e-6, 200e-6, 500e-6, 1e-3, 2e-3, 5e-3, 10e-3,
+    20e-3, 50e-3, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0,
 ];
 /// The default step: 1 ms.
 pub const STEP_DEFAULT: f64 = 1e-3;
@@ -51,15 +53,39 @@ pub const LIMITS: [u64; 13] = [
 pub const LIMIT_DEFAULT: u64 = 1_000_000_000;
 
 /// ADC rates the logger uses (rate id for request 0xE2, and samples per
-/// second). The scope streams without loss up to 400 kS/s (see
-/// [`crate::device::protocol::MAX_ROLL_RAW`]).
-pub const ADC_RATES: [(u8, f64); 5] = [
+/// second). The async USB stream is gapless up to 32 MB/s: 16 MS/s with
+/// both channels ([`MAX_RAW_2CH`]), 30 MS/s with CH1 only
+/// ([`MAX_RAW_1CH`]). 24 MS/s with two channels (48 MB/s) loses about
+/// 0.5 % of the packets, so it is not used.
+pub const ADC_RATES: [(u8, f64); 12] = [
     (102, 20e3),
     (104, 40e3),
     (110, 100e3),
     (120, 200e3),
     (140, 400e3),
+    (150, 500e3),
+    (1, 1e6),
+    (2, 2e6),
+    (5, 5e6),
+    (10, 10e6),
+    (16, 16e6),
+    (30, 30e6),
 ];
+/// Fastest logger ADC rate with both channels sampled.
+pub const MAX_RAW_2CH: f64 = 16e6;
+/// Fastest logger ADC rate with only CH1 sampled.
+pub const MAX_RAW_1CH: f64 = 30e6;
+
+/// Channels the scope samples for a log of `logged` channels: CH1 alone
+/// can use 1-channel mode (twice the rate); CH2 alone cannot (the
+/// firmware's 1-channel mode is CH1).
+pub fn hw_channels(logged: [bool; 2]) -> u8 {
+    if logged == [true, false] {
+        1
+    } else {
+        2
+    }
+}
 
 /// Samples per step the logger aims for, when the ADC is fast enough.
 pub const SAMPLES_PER_STEP_MIN: u64 = 10;
@@ -69,27 +95,33 @@ pub fn step_ns(step: f64) -> u64 {
     (step * 1e9).round().max(1.0) as u64
 }
 
-/// The ADC rate for a step: the lowest rate that gives at least
+/// The ADC rate for a step, with `channels` (1 or 2, see
+/// [`hw_channels`]) sampled: the lowest rate that gives at least
 /// [`SAMPLES_PER_STEP_MIN`] whole samples per step, else the fastest
 /// rate that gives a whole number of samples. Returns the rate (no
 /// oversampling: the logger bins the raw samples itself) and the
 /// samples per step.
-pub fn adc_for_step(step_ns: u64) -> (Rate, u32) {
+pub fn adc_for_step(step_ns: u64, channels: u8) -> (Rate, u32) {
+    let max = if channels == 1 {
+        MAX_RAW_1CH
+    } else {
+        MAX_RAW_2CH
+    };
+    let rates: Vec<(u8, f64)> = ADC_RATES
+        .iter()
+        .copied()
+        .filter(|(_, raw)| *raw <= max)
+        .collect();
     let whole = |raw: f64| {
         let n = raw * step_ns as f64 / 1e9;
         ((n - n.round()).abs() < 1e-6 && n >= 1.0).then_some(n.round() as u64)
     };
-    let pick = ADC_RATES
+    let pick = rates
         .iter()
         .find(|(_, raw)| whole(*raw).is_some_and(|n| n >= SAMPLES_PER_STEP_MIN))
-        .or_else(|| {
-            ADC_RATES
-                .iter()
-                .rev()
-                .find(|(_, raw)| whole(*raw).is_some())
-        })
+        .or_else(|| rates.iter().rev().find(|(_, raw)| whole(*raw).is_some()))
         .copied()
-        .unwrap_or(ADC_RATES[ADC_RATES.len() - 1]);
+        .unwrap_or(rates[rates.len() - 1]);
     let (id, raw) = pick;
     let n = whole(raw).unwrap_or(1).min(u32::MAX as u64) as u32;
     (
@@ -109,10 +141,21 @@ pub fn record_bytes(channels: usize, samples_per_step: u32) -> usize {
     channels * if samples_per_step == 1 { 1 } else { 3 } * 4
 }
 
-/// File bytes per second for a step and a number of channels.
-pub fn bytes_per_second(step: f64, channels: usize) -> f64 {
-    let (_, n) = adc_for_step(step_ns(step));
-    record_bytes(channels.max(1), n) as f64 / step
+/// The channels to log, for the estimates: CH1 when none is on.
+fn or_ch1(logged: [bool; 2]) -> [bool; 2] {
+    if logged == [false, false] {
+        [true, false]
+    } else {
+        logged
+    }
+}
+
+/// File bytes per second for a step and the logged channels.
+pub fn bytes_per_second(step: f64, logged: [bool; 2]) -> f64 {
+    let logged = or_ch1(logged);
+    let (_, n) = adc_for_step(step_ns(step), hw_channels(logged));
+    let count = logged.iter().filter(|&&c| c).count();
+    record_bytes(count, n) as f64 / step
 }
 
 /// Bytes like `412 MB` or `1 GB` (powers of 1000, like disk makers).
@@ -170,16 +213,16 @@ pub fn fmt_step(step: f64) -> String {
 }
 
 /// How long a log of `limit` bytes lasts, like `Limit 1 GB ≈ 11 h 34 min
-/// at 1 ms step`. `channels` is the number of logged channels.
-pub fn limit_estimate(limit: u64, step: f64, channels: usize) -> String {
+/// at 1 ms step`. `logged` are the logged channels.
+pub fn limit_estimate(limit: u64, step: f64, logged: [bool; 2]) -> String {
     if limit == 0 {
         return format!(
             "no limit · {}/h at {} step",
-            fmt_bytes((bytes_per_second(step, channels) * 3600.0) as u64),
+            fmt_bytes((bytes_per_second(step, logged) * 3600.0) as u64),
             fmt_step(step)
         );
     }
-    let secs = limit as f64 / bytes_per_second(step, channels);
+    let secs = limit as f64 / bytes_per_second(step, logged);
     format!(
         "Limit {} ≈ {} at {} step",
         fmt_bytes(limit),
@@ -276,48 +319,69 @@ mod tests {
 
     #[test]
     fn adc_rate_per_step() {
-        let cases: [(f64, f64, u32); 9] = [
-            (2.5e-6, 400e3, 1),
-            (5e-6, 400e3, 2),
-            (20e-6, 400e3, 8),
+        let cases: [(f64, f64, u32); 11] = [
+            (0.5e-6, 16e6, 8),
+            (1e-6, 10e6, 10),
+            (2e-6, 5e6, 10),
+            (5e-6, 2e6, 10),
+            (10e-6, 1e6, 10),
+            (20e-6, 500e3, 10),
             (50e-6, 200e3, 10),
             (100e-6, 100e3, 10),
             (200e-6, 100e3, 20),
-            (500e-6, 20e3, 10),
             (1e-3, 20e3, 20),
             (60.0, 20e3, 1_200_000),
         ];
         for (step, raw, n) in cases {
-            let (r, got) = adc_for_step(step_ns(step));
+            let (r, got) = adc_for_step(step_ns(step), 2);
             assert_eq!((r.raw, got), (raw, n), "{step}");
             assert_eq!(r.oversample, 1);
         }
-        for step in STEPS {
-            let (r, n) = adc_for_step(step_ns(step));
-            assert!(r.raw <= crate::device::protocol::MAX_ROLL_RAW);
-            assert!((r.raw * step - n as f64).abs() < 1e-6, "{step}");
+        // CH1 alone: 1-channel mode, up to 30 MS/s.
+        assert_eq!(adc_for_step(step_ns(0.5e-6), 1).0.raw, 30e6);
+        assert_eq!(adc_for_step(step_ns(0.5e-6), 1).1, 15);
+        assert_eq!(adc_for_step(step_ns(1e-6), 1).0.raw, 10e6);
+        for ch in [1, 2] {
+            let max = if ch == 1 { MAX_RAW_1CH } else { MAX_RAW_2CH };
+            for step in STEPS {
+                let (r, n) = adc_for_step(step_ns(step), ch);
+                assert!(r.raw <= max);
+                assert!((r.raw * step - n as f64).abs() < 1e-6, "{step}");
+                assert_eq!(crate::device::protocol::raw_rate_of_id(r.id), r.raw);
+            }
         }
+        assert_eq!(hw_channels([true, false]), 1);
+        assert_eq!(hw_channels([false, true]), 2);
+        assert_eq!(hw_channels([true, true]), 2);
     }
 
     #[test]
     fn sizes_and_estimates() {
+        const BOTH: [bool; 2] = [true, true];
+        const CH1: [bool; 2] = [true, false];
         assert_eq!(record_bytes(2, 1), 8);
         assert_eq!(record_bytes(2, 20), 24);
         assert_eq!(record_bytes(1, 20), 12);
         // 2 channels at 1 ms: 24 B per ms = 86.4 MB per hour.
-        assert!((bytes_per_second(1e-3, 2) - 24_000.0).abs() < 1e-6);
-        // 2 channels at 2.5 µs: 8 B per 2.5 µs = 3.2 MB/s.
-        assert!((bytes_per_second(2.5e-6, 2) - 3.2e6).abs() < 1e-3);
+        assert!((bytes_per_second(1e-3, BOTH) - 24_000.0).abs() < 1e-6);
+        // 2 channels at 0.5 µs: 24 B per 0.5 µs = 48 MB/s.
+        assert!((bytes_per_second(0.5e-6, BOTH) - 48e6).abs() < 1e-3);
+        assert!((bytes_per_second(0.5e-6, CH1) - 24e6).abs() < 1e-3);
+        // No channel on: estimated for CH1.
         assert_eq!(
-            limit_estimate(1_000_000_000, 1e-3, 2),
+            bytes_per_second(1e-3, [false, false]),
+            bytes_per_second(1e-3, CH1)
+        );
+        assert_eq!(
+            limit_estimate(1_000_000_000, 1e-3, BOTH),
             "Limit 1 GB ≈ 11 h 34 min at 1 ms step"
         );
         assert_eq!(
-            limit_estimate(1_000_000_000, 1e-3, 1),
+            limit_estimate(1_000_000_000, 1e-3, CH1),
             "Limit 1 GB ≈ 23 h 8 min at 1 ms step"
         );
         assert_eq!(
-            limit_estimate(0, 1e-3, 2),
+            limit_estimate(0, 1e-3, BOTH),
             "no limit · 86.4 MB/h at 1 ms step"
         );
         assert_eq!(fmt_bytes(412_300_000), "412 MB");
@@ -326,8 +390,8 @@ mod tests {
         assert_eq!(fmt_hms(2470.0), "0:41:10");
         assert_eq!(fmt_hms(90_061.0), "1 d 1:01:01");
         assert_eq!(fmt_step(60.0), "1 min");
-        assert_eq!(fmt_step(2.5e-6), "2.5 µs");
-        assert_eq!(nearest(&STEPS, 0.0011), 8);
+        assert_eq!(fmt_step(0.5e-6), "500 ns");
+        assert_eq!(nearest(&STEPS, 0.0011), 10);
     }
 
     #[test]

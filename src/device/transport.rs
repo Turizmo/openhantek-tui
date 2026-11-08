@@ -3,7 +3,10 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+
+use super::stream::UsbStream;
+pub use super::stream::{Chunk, StreamSetup};
 
 /// Vendor request to the device, host to device (bmRequestType 0x40).
 pub const VENDOR_OUT: u8 = 0x40;
@@ -17,12 +20,38 @@ pub trait Transport: Send {
     fn control_in(&mut self, request: u8, value: u16, index: u16, buf: &mut [u8]) -> Result<usize>;
     /// Bulk read. Returns bytes read.
     fn bulk_in(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize>;
+
+    /// Queue bulk reads that stay in flight until [`Transport::stream_stop`]
+    /// (an async stream). Start the scope only after this returns.
+    fn stream_start(&mut self, _setup: StreamSetup) -> Result<()> {
+        bail!("this transport cannot stream")
+    }
+    /// The next piece of a running stream, waiting up to `timeout`.
+    /// `Ok(None)` when nothing came in that time.
+    fn stream_next(&mut self, _timeout: Duration) -> Result<Option<Chunk>> {
+        bail!("no stream is running")
+    }
+    /// Cancel the stream's transfers. Does nothing without a stream.
+    fn stream_stop(&mut self) {}
 }
 
 /// libusb transport for an opened, claimed device.
 pub struct UsbTransport {
+    /// The running stream. Declared before `handle`, so it is dropped (its
+    /// transfers cancelled and freed) before the handle closes.
+    stream: Option<UsbStream>,
     pub handle: rusb::DeviceHandle<rusb::GlobalContext>,
     pub timeout: Duration,
+}
+
+impl UsbTransport {
+    pub fn new(handle: rusb::DeviceHandle<rusb::GlobalContext>, timeout: Duration) -> Self {
+        Self {
+            stream: None,
+            handle,
+            timeout,
+        }
+    }
 }
 
 impl Transport for UsbTransport {
@@ -46,7 +75,31 @@ impl Transport for UsbTransport {
     }
 
     fn bulk_in(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        if self.stream.is_some() {
+            bail!("bulk read while a stream is running");
+        }
         Ok(self.handle.read_bulk(endpoint, buf, timeout)?)
+    }
+
+    fn stream_start(&mut self, setup: StreamSetup) -> Result<()> {
+        use rusb::UsbContext;
+        self.stream = None;
+        let ctx = self.handle.context().as_raw();
+        // SAFETY: the handle is open with the interface claimed, and it
+        // outlives the stream (the stream is dropped first, see above).
+        self.stream = Some(unsafe { UsbStream::start(ctx, self.handle.as_raw(), setup)? });
+        Ok(())
+    }
+
+    fn stream_next(&mut self, timeout: Duration) -> Result<Option<Chunk>> {
+        match &mut self.stream {
+            Some(s) => s.next(timeout),
+            None => bail!("no stream is running"),
+        }
+    }
+
+    fn stream_stop(&mut self) {
+        self.stream = None;
     }
 }
 
@@ -107,6 +160,18 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
 
     fn bulk_in(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
         (**self).bulk_in(endpoint, buf, timeout)
+    }
+
+    fn stream_start(&mut self, setup: StreamSetup) -> Result<()> {
+        (**self).stream_start(setup)
+    }
+
+    fn stream_next(&mut self, timeout: Duration) -> Result<Option<Chunk>> {
+        (**self).stream_next(timeout)
+    }
+
+    fn stream_stop(&mut self) {
+        (**self).stream_stop()
     }
 }
 

@@ -225,7 +225,8 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("oht-reader-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("g.ohlog");
-        let h = test_header([true, false], 2.5e-6);
+        let mut h = test_header([true, false], 2.5e-6);
+        h.samples_per_step = 1;
         write_log(&path, &h, &[(0, vec![1.0, 2.0], false)]);
         let mut f = LogFile::open(&path).unwrap();
         assert_eq!(f.end(), 2);

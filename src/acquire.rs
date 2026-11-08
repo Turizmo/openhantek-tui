@@ -12,10 +12,11 @@ use anyhow::Result;
 
 use crate::device::hantek::{Captured, Scope6022};
 use crate::device::protocol::{HwConfig, Rate};
-use crate::device::transport::{is_gone, is_timeout};
+use crate::device::transport::{is_gone, is_timeout, Transport};
 use crate::device::Connection;
 use crate::logger::binner::Binner;
 use crate::logger::format::{ChannelInfo, Header};
+use crate::logger::gapcheck::GapCheck;
 use crate::logger::writer::{self, LogState, Msg, Shared, Writer};
 
 pub enum Command {
@@ -52,13 +53,15 @@ pub struct LogRequest {
 }
 
 impl LogRequest {
-    /// Hardware settings: both channels, no oversampling, streaming.
+    /// Hardware settings: no oversampling, streaming; 1-channel mode when
+    /// only CH1 is logged (twice the ADC rate), else both channels.
     pub fn hw_config(&self) -> (HwConfig, u32) {
-        let (rate, n) = crate::logger::adc_for_step(self.step_ns);
+        let channels = crate::logger::hw_channels(self.channels);
+        let (rate, n) = crate::logger::adc_for_step(self.step_ns, channels);
         (
             HwConfig {
                 rate,
-                channels: 2,
+                channels,
                 gains: self.gains,
                 dc: self.dc,
                 cal_freq: self.cal_freq,
@@ -69,19 +72,14 @@ impl LogRequest {
     }
 }
 
-/// Lost samples are flagged when the data is this far behind the clock
-/// (or two reads, if that is more).
-pub const GAP_THRESHOLD: Duration = Duration::from_millis(300);
-
 /// A running log, in the acquisition thread.
 struct LogSession {
     req: LogRequest,
     cfg: HwConfig,
     binner: Binner,
     writer: Writer,
-    /// When the first piece came, and the samples since then (lost ones
-    /// included).
-    clock: Option<(Instant, u64)>,
+    /// Checks the stream against the clock; `None` until the first piece.
+    check: Option<GapCheck>,
     /// The stream started again (after an error): flag a gap.
     restart: bool,
     clip_at: Option<Instant>,
@@ -98,7 +96,7 @@ impl LogSession {
             cfg,
             binner: Binner::new(n, logged, k),
             writer,
-            clock: None,
+            check: None,
             restart: false,
             clip_at: None,
         }
@@ -107,9 +105,11 @@ impl LogSession {
     fn header(&self, conn: &Connection, start_ns: i64) -> Header {
         let r = &self.req;
         let cal = &conn.driver.cal;
+        let (cfg, n) = r.hw_config();
+        let hs = cfg.high_speed();
         let ch = [0, 1].map(|c| {
             let g = r.gains[c];
-            let zero = cal.raw(0.0, g, c, false);
+            let zero = cal.raw(0.0, g, c, hs);
             ChannelInfo {
                 enabled: r.channels[c],
                 gain: g as u8,
@@ -118,11 +118,10 @@ impl LogSession {
                 dc: r.dc[c],
                 volts_per_div: r.volts_per_div[c] as f32,
                 zero_count: zero as f32,
-                volts_per_count: (cal.volts(zero + 1.0, g, c, false) - cal.volts(zero, g, c, false))
+                volts_per_count: (cal.volts(zero + 1.0, g, c, hs) - cal.volts(zero, g, c, hs))
                     as f32,
             }
         });
-        let (cfg, n) = r.hw_config();
         Header {
             start_ns,
             step_ns: r.step_ns,
@@ -141,29 +140,32 @@ impl LogSession {
     /// Take one piece of the stream.
     fn piece(&mut self, cap: &Captured, conn: &Connection) {
         let raw = self.cfg.rate.raw;
-        let n = cap.data[0].len().min(cap.data[1].len()) as u64;
+        // CH1 is always sampled; CH2 only in 2-channel mode.
+        let n = cap.data[0].len() as u64;
+        if n == 0 && cap.lost == 0 {
+            // The samples thrown away at the start of a stream: no data,
+            // so nothing to check (a restart stays pending).
+            return;
+        }
         let now = Instant::now();
-        match &mut self.clock {
+        let at = cap.at.unwrap_or(now);
+        match &mut self.check {
             None => {
                 let start = writer::start_time(SystemTime::now(), n as usize, raw);
                 self.writer.send(Msg::Begin(self.header(conn, start)));
-                self.clock = Some((now, 0));
+                let mut check = GapCheck::new(
+                    raw,
+                    Scope6022::<Box<dyn Transport>>::transfer_secs(&self.cfg),
+                );
+                check.piece(at, n, 0, false);
+                self.check = Some(check);
+                self.restart = false;
             }
-            Some((t0, got)) => {
-                let piece = Scope6022::<Box<dyn crate::device::transport::Transport>>::roll_piece(
-                    &self.cfg,
-                ) as f64
-                    / (2.0 * raw);
-                let limit = GAP_THRESHOLD.as_secs_f64().max(2.0 * piece) * raw;
-                let expected = now.duration_since(*t0).as_secs_f64() * raw;
-                let behind = expected - (*got + n) as f64;
-                if self.restart || behind > limit {
-                    let lost = behind.max(0.0) as u64;
+            Some(check) => {
+                if let Some(lost) = check.piece(at, n, cap.lost, self.restart) {
                     self.binner.gap(lost);
-                    *got += lost;
-                    self.restart = false;
                 }
-                *got += n;
+                self.restart = false;
             }
         }
         self.binner.push(&cap.data);
@@ -189,9 +191,10 @@ impl LogSession {
     }
 }
 
-/// The rate the logger streams at for a step (for the UI).
-pub fn log_rate(step_ns: u64) -> Rate {
-    crate::logger::adc_for_step(step_ns).0
+/// The rate the logger streams at for a step and the logged channels
+/// (for the UI).
+pub fn log_rate(step_ns: u64, channels: [bool; 2]) -> Rate {
+    crate::logger::adc_for_step(step_ns, crate::logger::hw_channels(channels)).0
 }
 
 /// One block of samples, in volts at the BNC.

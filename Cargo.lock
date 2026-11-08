@@ -415,6 +415,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "libusb1-sys",
  "ratatui",
  "rusb",
  "serde",

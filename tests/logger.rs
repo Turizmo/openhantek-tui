@@ -122,65 +122,72 @@ fn records_without_gaps_at_1_ms() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[test]
-fn records_single_samples_at_2_5_us() {
-    let dir = temp_dir("fast");
+/// A log at the fastest step, 0.5 µs: 16 MS/s with both channels, or
+/// 30 MS/s in 1-channel mode with CH1 alone. The fake runs as fast as it
+/// can (slower than real time in a debug build) and stamps each transfer
+/// with its bus time, so the logger's clock check sees a whole stream and
+/// must not report a gap.
+fn fast_log(name: &str, channels: [bool; 2], raw: f64, per_step: u32) {
+    let dir = temp_dir(name);
     let path = dir.join("b.ohlog");
-    let fake = realtime_fake([SINE_1K, Wave::Dc(-0.5)]);
+    let fake = FakeScope::new([SINE_1K, Wave::Dc(-0.5)]);
     let acq = Acquisition::spawn(opener(fake.clone()));
-    let (req, sh) = request(&path, 2.5e-6, [true, true], 0);
-    // Measure against the fake's own sample clock, not the wall clock:
-    // on a busy machine (tests run in parallel) the fake makes fewer
-    // than 400 kS/s, and that is not a logger fault. Count the frames
-    // (two bytes each) it gave while the log recorded.
-    let frames = || fake.lock().bulk_bytes as f64 / 2.0;
-    let f_start = frames();
+    let (req, sh) = request(&path, 0.5e-6, channels, 0);
+    let hw = if channels == [true, false] { 1 } else { 2 };
     acq.send(Command::StartLog(req));
     wait_state(&acq, &sh, 10.0, |s| *s == LogState::Recording);
-    let f0 = frames();
+    // 0.1 s of data (5 ms periods of a 1 kHz sine are 100 of them).
+    let want = (raw * 0.1) as usize * hw;
     let t0 = Instant::now();
-    while t0.elapsed().as_secs_f64() < 2.0 {
+    while fake.lock().bulk_bytes < want {
         drain(&acq);
-        std::thread::sleep(Duration::from_millis(10));
+        assert!(t0.elapsed().as_secs() < 60, "the fake is too slow");
+        std::thread::sleep(Duration::from_millis(5));
     }
     acq.send(Command::StopLog);
-    let took = t0.elapsed().as_secs_f64();
-    let f_stop = frames();
-    wait_state(&acq, &sh, 10.0, |s| matches!(s, LogState::Done(_)));
-    let f_done = frames();
+    wait_state(&acq, &sh, 30.0, |s| matches!(s, LogState::Done(_)));
+    assert_eq!(fake.lock().channels as usize, hw);
+    let frames = (fake.lock().bulk_bytes / hw) as u64;
     let f = LogFile::open(&path).unwrap();
-    assert!(f.header.single());
-    assert_eq!(f.header.adc_rate, 400e3);
+    assert_eq!(f.header.adc_rate, raw);
+    assert_eq!(f.header.samples_per_step, per_step);
     assert!(f.gaps().is_empty(), "{:?}", f.gaps());
-    let got = f.end() as f64;
-    println!(
-        "2.5 µs: {got} samples in {took:.3} s = {:.1} kS/s (fake gave {:.0}..{:.0}), file {} bytes",
-        got / took / 1e3,
-        f_stop - f0,
-        f_done - f_start,
-        std::fs::metadata(&path).unwrap().len()
-    );
-    // The file has no more samples than the fake gave from the start
-    // command to the end, and every sample it gave from the Recording
-    // state (seen a little late on a busy machine) to the stop, less
-    // one bulk read (about 0.1 s) that may still be on its way.
-    let slack = 0.15 * 400e3;
+    // Every sample the fake gave is in the file, except the 2048 thrown
+    // away at the start and the last partial step.
+    let got = f.end() * per_step as u64;
+    println!("0.5 µs at {raw} S/s: {got} samples logged, fake gave {frames}");
+    let all = frames - 2048;
     assert!(
-        got > f_stop - f0 - slack && got <= f_done - f_start,
-        "{got} samples, fake gave {}..{}",
-        f_stop - f0,
-        f_done - f_start
+        got < all + per_step as u64 && got + 2048 > all,
+        "{got} of {all}"
     );
-    // And it is not far off real time (loose: only catches a logger
-    // that drops most of the stream).
-    assert!(got > 0.25 * took * 400e3, "{got} in {took} s");
-    // The sine shows: 400 samples per period.
-    let r = f.read(10_000..10_400).unwrap();
-    let max = r.iter().map(|x| x.1[0][1]).fold(f32::MIN, f32::max);
-    let min = r.iter().map(|x| x.1[0][0]).fold(f32::MAX, f32::min);
-    assert!(max > 1.4 && min < -1.4, "{min} {max}");
-    assert!(r.iter().all(|x| (x.1[1][2] + 0.5).abs() < 0.08));
+    // The 1 kHz sine shows: one period is 2 ms / 0.5 µs = 2000 steps.
+    let r = f.read(10_000..12_000).unwrap();
+    if channels[0] {
+        let max = r.iter().map(|x| x.1[0][1]).fold(f32::MIN, f32::max);
+        let min = r.iter().map(|x| x.1[0][0]).fold(f32::MAX, f32::min);
+        assert!(max > 1.4 && min < -1.4, "{min} {max}");
+    }
+    if channels[1] {
+        assert!(r.iter().all(|x| (x.1[1][2] + 0.5).abs() < 0.08));
+    }
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn records_at_16_ms_per_s_with_two_channels() {
+    fast_log("fast2", [true, true], 16e6, 8);
+}
+
+#[test]
+fn records_at_30_ms_per_s_with_ch1_alone() {
+    fast_log("fast1", [true, false], 30e6, 15);
+}
+
+/// CH2 alone cannot use 1-channel mode (that is CH1): both are sampled.
+#[test]
+fn ch2_alone_streams_both_channels() {
+    fast_log("fast_ch2", [false, true], 16e6, 8);
 }
 
 #[test]
@@ -239,17 +246,18 @@ fn unplugging_makes_a_gap_and_logging_goes_on() {
 fn size_limit_stops_the_log() {
     let dir = temp_dir("limit");
     let path = dir.join("e.ohlog");
-    let fake = realtime_fake([Wave::Dc(0.5), Wave::Dc(0.0)]);
+    // 24 B per 1 µs step (10 MS/s, 10 samples each): 400 kB is
+    // about 16 000 steps.
+    let fake = FakeScope::new([Wave::Dc(0.5), Wave::Dc(0.0)]);
     let acq = Acquisition::spawn(opener(fake.clone()));
-    // 3.2 MB/s: 400 kB is about 0.12 s.
-    let (req, sh) = request(&path, 2.5e-6, [true, true], 400_000);
+    let (req, sh) = request(&path, 1e-6, [true, true], 400_000);
     acq.send(Command::StartLog(req));
     wait_state(&acq, &sh, 10.0, |s| *s == LogState::Done(StopReason::Limit));
     let len = std::fs::metadata(&path).unwrap().len();
     assert!(len <= 400_000 && len > 399_000, "{len}");
     assert_eq!(sh.lock().unwrap().bytes, len);
     let f = LogFile::open(&path).unwrap();
-    assert!(f.end() > 49_000);
+    assert!(f.end() > 16_000, "{}", f.end());
     // The thread goes back to normal capture: a Configure gives blocks.
     let app = openhantek_tui::app::App::new(Default::default(), None);
     let cfg = app.scope.hw_config();

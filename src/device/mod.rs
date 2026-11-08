@@ -5,6 +5,7 @@ pub mod firmware;
 pub mod hantek;
 pub mod hex;
 pub mod protocol;
+pub mod stream;
 pub mod transport;
 pub mod usb;
 

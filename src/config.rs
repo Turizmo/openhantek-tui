@@ -98,7 +98,7 @@ pub const COMMENTS: &[(&str, &str)] = &[
     ("display.axis_style", "center cross (axes): Dots Dashed Solid Crosses None"),
     ("display.axis_extent", "\"Points\" (marks at divisions and ticks) or \"Full\" (whole lines)"),
     ("display.axis_brightness", "center cross brightness in percent: 10 .. 100 in steps of 10"),
-    ("logger.step", "log step in seconds (2.5e-6 .. 60, 1-2-5 steps)"),
+    ("logger.step", "log step in seconds (5e-7 .. 60, 1-2-5 steps)"),
     ("logger.log_limit", "stop the log at this file size in bytes, 0 = no limit"),
     ("logger.log_dir", "log folder (default ~/.local/share/openhantek-tui/logs)"),
     ("logger.time_axis", "log view time labels: \"Clock\" (UTC) or \"Seconds\""),
@@ -549,8 +549,7 @@ pub fn load(path: &Path, old: Option<&Path>) -> Loaded {
                     .and_then(|mut t| {
                         axis_from_old_grid(&mut t);
                         Settings::deserialize(t).map_err(Into::into)
-                    })
-                {
+                    }) {
                     Ok(s) => {
                         settings = s;
                         notes.push(format!(
@@ -886,7 +885,11 @@ mod tests {
         // No axis settings: the center cross of the first versions.
         let s = load("[display]\ndots = true\n");
         assert_eq!(
-            (s.display.axis_style, s.display.axis_extent, s.display.axis_brightness),
+            (
+                s.display.axis_style,
+                s.display.axis_extent,
+                s.display.axis_brightness
+            ),
             (GridStyle::Dashed, GridExtent::Full, 30)
         );
         // It went with the grid style: solid with solid, none with none.

@@ -267,7 +267,7 @@ pub fn decode_records(h: &Header, bytes: &[u8], out: &mut Vec<Rec>) {
 
 #[cfg(test)]
 pub(crate) fn test_header(channels: [bool; 2], step: f64) -> Header {
-    let (rate, n) = super::adc_for_step(super::step_ns(step));
+    let (rate, n) = super::adc_for_step(super::step_ns(step), super::hw_channels(channels));
     let mut ch = [ChannelInfo::default(), ChannelInfo::default()];
     ch[0].enabled = channels[0];
     ch[1].enabled = channels[1];
@@ -313,7 +313,9 @@ mod tests {
         };
         assert_eq!(ChunkHead::decode(&c.encode()), Some(c));
         assert!(c.gap());
-        let h = test_header([false, true], 2.5e-6);
+        let mut h = test_header([false, true], 2.5e-6);
+        // One sample per step, as at 2.5 µs and 400 kS/s in older logs.
+        h.samples_per_step = 1;
         assert!(h.single());
         let bytes: Vec<u8> = [1.5f32, -2.0]
             .iter()
