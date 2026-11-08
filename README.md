@@ -652,8 +652,12 @@ samples are lost:
 - The scope lost samples (its buffer overflowed: the time passes, the data
   never comes). The thread compares the samples with the time each USB
   transfer arrived: when they stay more than 20 ms plus two transfers
-  (at most about 40 ms) behind for 0.1 s plus four transfers, it marks
-  the missing time. Clock drift up to 0.05 % (500 ppm) is allowed.
+  (at most about 40 ms) behind for longer than the USB queue holds
+  (about 0.5 s, at least 0.1 s plus four transfers), it marks the
+  missing time. A shorter delay is no loss: the queued transfers keep
+  filling and come at once afterwards (a disk flush in a VM held the USB
+  completions back for up to 300 ms). Clock drift up to 0.05 % (500 ppm)
+  is allowed.
 - The stream had to start again (a USB error, the scope unplugged and
   back): the time without data is the gap.
 

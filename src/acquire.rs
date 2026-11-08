@@ -93,6 +93,10 @@ impl LogRequest {
     }
 }
 
+/// Most late pieces a log holds back (a gap check window is at most about
+/// 70 transfers).
+const HELD_MAX: usize = 256;
+
 /// A running log, in the acquisition thread.
 struct LogSession {
     req: LogRequest,
@@ -106,6 +110,10 @@ struct LogSession {
     /// The stream started again (after an error): flag a gap.
     restart: bool,
     clip_at: Option<Instant>,
+    /// Pieces that came late, held back until the gap check knows whether
+    /// samples were lost before them (then the gap goes first) or only
+    /// delayed. At most a window of the gap check (about 0.6 s).
+    held: Vec<Vec<u8>>,
 }
 
 impl LogSession {
@@ -121,6 +129,7 @@ impl LogSession {
             check: None,
             restart: false,
             clip_at: None,
+            held: Vec::new(),
         }
     }
 
@@ -212,6 +221,7 @@ impl LogSession {
                 let mut check = GapCheck::new(
                     raw,
                     Scope6022::<Box<dyn Transport>>::transfer_secs(&self.cfg),
+                    Scope6022::<Box<dyn Transport>>::queue_secs(&self.cfg),
                 );
                 check.piece(at, n, 0, false);
                 self.check = Some(check);
@@ -220,12 +230,28 @@ impl LogSession {
                 binner.push(data[1]);
             }
             Some(check) => {
+                let exact = lost > 0 || self.restart;
+                if exact {
+                    // Known at once, just before this piece.
+                    for p in self.held.drain(..) {
+                        binner.push(&p);
+                    }
+                }
                 if let Some(lost) = check.piece(at, n, lost, self.restart) {
+                    // A loss by the clock is before the first late piece.
                     binner.gap(lost);
                 }
                 self.restart = false;
-                binner.push(data[0]);
-                binner.push(data[1]);
+                let late = check.late() && self.held.len() < HELD_MAX;
+                if !late {
+                    for p in self.held.drain(..) {
+                        binner.push(&p);
+                    }
+                    binner.push(data[0]);
+                    binner.push(data[1]);
+                } else {
+                    self.held.push([data[0], data[1]].concat());
+                }
             }
         }
         let binner = self.binner.as_mut().expect("binner is set");
@@ -243,6 +269,9 @@ impl LogSession {
 
     fn finish(mut self) {
         if let Some(b) = &mut self.binner {
+            for p in self.held.drain(..) {
+                b.push(&p);
+            }
             b.finish();
             for m in b.take() {
                 self.writer.send(m);
@@ -693,6 +722,7 @@ impl Worker {
             check: GapCheck::new(
                 cfg.rate.raw,
                 Scope6022::<Box<dyn Transport>>::transfer_secs(&cfg),
+                Scope6022::<Box<dyn Transport>>::queue_secs(&cfg),
             ),
             mark_end: 0,
             data_at: Instant::now(),
