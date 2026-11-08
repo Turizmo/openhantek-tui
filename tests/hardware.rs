@@ -7,6 +7,8 @@
 //! on the calibration pin: they count the 1 kHz periods. They run for
 //! `OHT_HW_SECS` seconds each (default 20). The log tests write their log
 //! to the system temp folder (up to 48 MB/s) and delete it afterwards.
+//! `hw_blocks_*` capture blocks for the trigger from the stream at the top
+//! rates, `hw_raw_log_*` log raw samples (32 / 30 MB/s to the disk).
 
 use std::time::{Duration, Instant};
 
@@ -130,21 +132,35 @@ fn hw_fast_single_channel_and_gains() {
 #[ignore = "needs the real DSO-6022BE"]
 fn hw_roll_stream() {
     let mut c = open();
-    // 200 ms/div: 5 kS/s. A 100 Hz calibration signal has 50 samples per period.
+    // 200 ms/div: 5 kS/s out of the ADC at 16 MS/s (3200 raw samples
+    // per point). A 100 Hz calibration signal has 50 samples per period.
     let mut cfg = config(200e-3, 1.0, 2, 100);
     cfg.roll = true;
+    assert_eq!((cfg.rate.raw, cfg.rate.oversample), (16e6, 3200));
     let mut ch1 = Vec::new();
+    let (mut lost, mut wide) = (0, 0);
+    let cpu0 = cpu_secs();
     let t0 = std::time::Instant::now();
-    while t0.elapsed().as_secs_f64() < 2.0 {
+    while t0.elapsed().as_secs_f64() < hw_secs().min(10.0) {
         let piece = c.driver.stream(&cfg).unwrap();
+        lost += piece.lost;
         ch1.extend_from_slice(&piece.data[0]);
+        // Points with an edge in them: the peak band spans the 2 V.
+        wide += (0..piece.data[0].len())
+            .filter(|&i| piece.max[0][i] - piece.min[0][i] > 1.5)
+            .count();
     }
     let secs = t0.elapsed().as_secs_f64();
+    let cpu = cpu_secs() - cpu0;
     eprintln!(
-        "roll: {} samples in {secs:.2} s at {} S/s",
+        "roll: {} samples in {secs:.2} s at {} S/s (ADC {} MS/s), host lost {lost}, \
+         {wide} points with an edge, CPU {:.1} % of one core",
         ch1.len(),
-        cfg.rate.rate
+        cfg.rate.rate,
+        cfg.rate.raw / 1e6,
+        cpu / secs * 100.0
     );
+    assert_eq!(lost, 0);
     // The stream is gapless now: all samples but the 2048 raw ones thrown
     // away at the start, less the start-up time and one transfer.
     assert!(
@@ -333,12 +349,17 @@ fn hw_stream_30_ms_per_s_ch1() {
 /// no gaps, as many steps as the clock says, and every 1 kHz period of the
 /// calibration signal on CH1 exactly 2000 steps long.
 fn log_run(name: &str, channels: [bool; 2]) {
+    log_run_step(name, channels, 0.5e-6)
+}
+
+/// [`log_run`] at any step; `lg::RAW` logs one u8 sample per step.
+fn log_run_step(name: &str, channels: [bool; 2], step: f64) {
     use openhantek_tui::logger::{self as lg, reader::LogFile, writer};
     let dir = std::env::temp_dir().join(format!("oht-hw-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("hw.ohlog");
-    let step = 0.5e-6;
+    let raw_log = lg::is_raw(step);
     let shared = writer::shared(path.clone(), 0);
     let g = gain_index(1.0);
     let req = LogRequest {
@@ -354,6 +375,8 @@ fn log_run(name: &str, channels: [bool; 2]) {
         max_adc: openhantek_tui::device::protocol::MAX_ADC_DEFAULT,
     };
     let (hw, per) = req.hw_config();
+    // The step in seconds (the ADC sample time for raw).
+    let step = if raw_log { 1.0 / hw.rate.raw } else { step };
     let acq = Acquisition::spawn(Box::new(|status| open_hardware(None, status)));
     let secs = hw_secs();
     acq.send(Command::StartLog(req));
@@ -365,9 +388,19 @@ fn log_run(name: &str, channels: [bool; 2]) {
     }
     let cpu0 = cpu_secs();
     let t1 = Instant::now();
+    // The file must grow with the data: the disk keeps up (the writer
+    // buffers only 4 MB; a slow disk backs the writer's queue up).
+    let mut slowest: f64 = f64::INFINITY;
+    let mut last = (Instant::now(), 0u64);
     while t1.elapsed().as_secs_f64() < secs {
         while acq.try_recv().is_some() {}
         std::thread::sleep(Duration::from_millis(20));
+        let dt = last.0.elapsed().as_secs_f64();
+        if dt >= 2.0 {
+            let b = shared.lock().unwrap().bytes;
+            slowest = slowest.min((b - last.1) as f64 / dt);
+            last = (Instant::now(), b);
+        }
     }
     let cpu = cpu_secs() - cpu0;
     let wall = t1.elapsed().as_secs_f64();
@@ -385,7 +418,9 @@ fn log_run(name: &str, channels: [bool; 2]) {
     // Every period of the calibration signal: 1 ms = 2000 steps, give or
     // take a step (it is not exactly 1 kHz). A lost USB packet is 32 or
     // 34 steps (256 samples of 8, 512 of 15).
-    let mut edges = Edges::new(1e-3 / step, 8.0);
+    // Raw: a period is 16 000 or 30 000 samples; the 1-in-7 short period
+    // at 16 MS/s is 4 samples, a lost packet 256 or 512.
+    let mut edges = Edges::new(1e-3 / step, if raw_log { 64.0 } else { 8.0 });
     let t2 = Instant::now();
     let end = f.end();
     let mut at = 0;
@@ -404,7 +439,7 @@ fn log_run(name: &str, channels: [bool; 2]) {
         "log {name}: {} MS/s x {}, {per} samples/step, {end} steps in {wall:.1} s \
          (clock says about {expect:.0}), {} gaps {:?}, {} MB ({:.1} MB/s), \
          CH1 {:.2}..{:.2} V, {} periods, {} breaks {:?}, CPU {:.1} % of one core, \
-         read back in {:.1} s",
+         slowest file growth {:.1} MB/s over 2 s, read back in {:.1} s",
         hw.rate.raw / 1e6,
         hw.channels,
         gaps.len(),
@@ -417,6 +452,7 @@ fn log_run(name: &str, channels: [bool; 2]) {
         edges.breaks.len(),
         &edges.breaks[..edges.breaks.len().min(10)],
         cpu / wall * 100.0,
+        slowest / 1e6,
         t2.elapsed().as_secs_f64()
     );
     std::fs::remove_dir_all(&dir).unwrap();
@@ -426,6 +462,13 @@ fn log_run(name: &str, channels: [bool; 2]) {
     );
     assert!(gaps.is_empty(), "{gaps:?}");
     assert!(edges.breaks.is_empty(), "lost samples: {:?}", edges.breaks);
+    assert_eq!(f.header.raw, raw_log);
+    if raw_log {
+        // One byte per channel and sample, and the disk kept up.
+        let n = channels.iter().filter(|c| **c).count() as f64;
+        let rate = hw.rate.raw * n;
+        assert!(slowest > 0.9 * rate, "the disk is too slow: {slowest}");
+    }
     // The steps cover the recording time: the log also has the time from
     // the first data to the Recording state, and the stop takes a moment.
     let periods = end as f64 * step * 1000.0;
@@ -451,4 +494,130 @@ fn hw_log_fastest_two_channels() {
 #[ignore = "needs the real DSO-6022BE, CH1 probe on the calibration pin"]
 fn hw_log_fastest_ch1() {
     log_run("1ch", [true, false]);
+}
+
+#[test]
+#[ignore = "needs the real DSO-6022BE, CH1 probe on the calibration pin; writes 32 MB/s"]
+fn hw_raw_log_two_channels() {
+    log_run_step("raw2", [true, true], openhantek_tui::logger::RAW);
+}
+
+#[test]
+#[ignore = "needs the real DSO-6022BE, CH1 probe on the calibration pin; writes 30 MB/s"]
+fn hw_raw_log_ch1() {
+    log_run_step("raw1", [true, false], openhantek_tui::logger::RAW);
+}
+
+/// Blocks for the trigger from the stream at the top rate (no
+/// decimation): consecutive blocks follow each other with no sample
+/// lost (every 1 kHz period across the blocks has its length), for
+/// `OHT_HW_SECS`. Then triggered, decimated screens through the scope
+/// logic: each one triggered at 1 kHz, the peak band around the mean.
+fn blocks_run(channels: u8) {
+    use openhantek_tui::scope::Scope;
+    use openhantek_tui::settings::Settings;
+    let mut c = open();
+    // 20 µs/div: the top rate, one ADC sample per point.
+    let cfg = config(20e-6, 1.0, channels, 1000);
+    let raw = cfg.rate.raw;
+    assert_eq!((cfg.rate.rate, cfg.rate.oversample), (raw, 1));
+    let secs = hw_secs();
+    let mut edges = Edges::new(raw / 1000.0, 64.0);
+    let cpu0 = cpu_secs();
+    let t0 = Instant::now();
+    let mut blocks = 0u64;
+    let mut first = None;
+    while t0.elapsed().as_secs_f64() < secs {
+        let b = c.driver.capture(&cfg).unwrap();
+        assert_eq!(b.data[0].len(), BLOCK_SAMPLES);
+        assert_eq!(b.data[1].len(), if channels == 2 { BLOCK_SAMPLES } else { 0 });
+        if first.is_none() {
+            first = Some(Instant::now());
+        } else {
+            blocks += 1;
+        }
+        for v in &b.data[0] {
+            edges.push(*v);
+        }
+    }
+    let wall = t0.elapsed().as_secs_f64();
+    let cpu = cpu_secs() - cpu0;
+    let span = first.unwrap().elapsed().as_secs_f64();
+    let samples = blocks as f64 * BLOCK_SAMPLES as f64;
+    eprintln!(
+        "blocks {} MS/s x {channels}: {blocks} blocks ({:.0} per s, {:.4} % of the samples \
+         the clock says), CH1 {:.2}..{:.2} V, {} periods, {} breaks {:?}, CPU {:.1} % of one core",
+        raw / 1e6,
+        blocks as f64 / span,
+        samples / (span * raw) * 100.0,
+        edges.lo,
+        edges.hi,
+        edges.periods,
+        edges.breaks.len(),
+        &edges.breaks[..edges.breaks.len().min(10)],
+        cpu / wall * 100.0
+    );
+    assert!(edges.hi - edges.lo > 1.5, "no probe on the calibration pin?");
+    assert!(edges.breaks.is_empty(), "lost samples: {:?}", edges.breaks);
+    // Every block of the stream came: none dropped, none lost.
+    assert!((samples / (span * raw) - 1.0).abs() < 0.01, "{samples}");
+
+    // Triggered screens at 200 µs/div: decimated (16 MS/s to 4 MS/s, or
+    // 30 MS/s to 5 MS/s), with the peak band.
+    let mut s = Settings::default();
+    s.channels[1].enabled = channels == 2;
+    s.time_idx = openhantek_tui::scope::time_index(200e-6);
+    s.trigger.level = 1.0;
+    s.trigger.position = 0.5;
+    let mut scope = Scope::new(s);
+    let (gen, cfg) = scope.sync_hw().unwrap();
+    assert_eq!(cfg.rate.raw, raw);
+    let (mut trig, mut n) = (0, 0);
+    let t0 = Instant::now();
+    while n < 200 {
+        let cap = c.driver.capture(&cfg).unwrap();
+        let block = openhantek_tui::acquire::Block {
+            gen,
+            cfg,
+            data: cap.data,
+            min: cap.min,
+            max: cap.max,
+            clipped: cap.clipped,
+            range: cap.range,
+            rate: cap.rate,
+            roll: false,
+        };
+        scope.push(block);
+        n += 1;
+        let f = scope.frame.as_ref().unwrap();
+        if f.triggered {
+            trig += 1;
+            let m = scope.measure(0).unwrap();
+            let freq = m.freq.unwrap();
+            assert!((freq - 1000.0).abs() < 10.0, "freq {freq}");
+            let (lo, hi) = f.peak[0].as_ref().unwrap();
+            let tr = f.traces[0].as_ref().unwrap();
+            assert!(lo.iter().zip(tr).all(|(l, v)| l <= v) && hi.iter().zip(tr).all(|(h, v)| h >= v));
+        }
+    }
+    eprintln!(
+        "triggered screens at {} S/s out of {} MS/s: {trig} of {n} in {:.2} s",
+        cfg.rate.rate,
+        raw / 1e6,
+        t0.elapsed().as_secs_f64()
+    );
+    assert!(trig >= n - 1, "{trig} of {n} triggered");
+    c.driver.stop().unwrap();
+}
+
+#[test]
+#[ignore = "needs the real DSO-6022BE, CH1 probe on the calibration pin"]
+fn hw_blocks_16_ms_per_s_two_channels() {
+    blocks_run(2);
+}
+
+#[test]
+#[ignore = "needs the real DSO-6022BE, CH1 probe on the calibration pin"]
+fn hw_blocks_30_ms_per_s_ch1() {
+    blocks_run(1);
 }
