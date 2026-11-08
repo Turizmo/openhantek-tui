@@ -7,6 +7,8 @@ use anyhow::{bail, Context, Result};
 
 use super::protocol::*;
 use super::transport::{Chunk, StreamSetup, Transport};
+use crate::stream::ring::{Failure, Ring, STREAM_RING};
+use std::sync::Arc;
 
 /// One captured block or piece of a stream, in volts at the BNC.
 #[derive(Clone, Debug, Default)]
@@ -86,6 +88,10 @@ pub struct Scope6022<T: Transport> {
     sent: Option<HwConfig>,
     /// The async stream, while running.
     stream: Option<Live>,
+    /// The ring the stream writes into (made at the first start).
+    ring: Option<Arc<Ring>>,
+    /// Bytes of the ring read so far.
+    cursor: u64,
 }
 
 impl<T: Transport> Scope6022<T> {
@@ -96,6 +102,8 @@ impl<T: Transport> Scope6022<T> {
             serial: serial.into(),
             sent: None,
             stream: None,
+            ring: None,
+            cursor: 0,
         }
     }
 
@@ -201,8 +209,7 @@ impl<T: Transport> Scope6022<T> {
     /// Sizes of the async stream for `cfg`: transfers of about 20 ms of
     /// data (one 512 B packet to 256 KiB), enough of them for about
     /// 250 ms (8 to 32), so at most 8 MiB in flight (Linux allows 16 MiB
-    /// by default, `usbfs_memory_mb`). The host queues up to 2 s of data
-    /// (4 to 64 MiB) for a slow consumer before it drops any.
+    /// by default, `usbfs_memory_mb`).
     pub fn stream_setup(cfg: &HwConfig) -> StreamSetup {
         let byte_rate = cfg.rate.raw * cfg.channels.clamp(1, 2) as f64;
         let packets = (byte_rate * 0.02 / PACKET_SIZE as f64).ceil() as usize;
@@ -212,7 +219,6 @@ impl<T: Transport> Scope6022<T> {
             endpoint: EP_BULK_IN,
             transfer,
             transfers,
-            queue_max: ((byte_rate * 2.0) as usize).clamp(4 << 20, 64 << 20),
         }
     }
 
@@ -231,7 +237,12 @@ impl<T: Transport> Scope6022<T> {
             self.configure(cfg)?;
         }
         if self.stream.is_none() {
-            self.t.stream_start(Self::stream_setup(cfg))?;
+            let ring = self
+                .ring
+                .get_or_insert_with(|| Arc::new(Ring::new(STREAM_RING)));
+            let writer = ring.reset(cfg.channels);
+            self.cursor = 0;
+            self.t.stream_start(Self::stream_setup(cfg), writer)?;
             if let Err(e) = self.start() {
                 self.t.stream_stop();
                 return Err(e);
@@ -246,20 +257,33 @@ impl<T: Transport> Scope6022<T> {
             });
         }
         let wait = Duration::from_secs_f64(Self::transfer_secs(cfg) * 2.0 + 1.0);
-        match self.t.stream_next(wait) {
-            Ok(Some(c)) => Ok(c),
-            Ok(None) => {
-                self.end_stream();
-                Err(anyhow::Error::new(rusb::Error::Timeout).context(format!(
-                    "no samples from the scope for {:.1} s",
-                    wait.as_secs_f64()
-                )))
-            }
-            Err(e) => {
-                self.end_stream();
-                Err(e.context("reading samples failed"))
-            }
+        let ring = self.ring.clone().expect("ring is set");
+        let ch = cfg.channels.clamp(1, 2) as u64;
+        ring.wait(self.cursor / ch, wait);
+        if let Some(Failure::Usb(e)) = ring.failure() {
+            self.end_stream();
+            return Err(anyhow::Error::new(e).context("reading samples failed"));
         }
+        if ring.overrun() > 0 {
+            self.end_stream();
+            return Err(anyhow::anyhow!("the host was too slow: samples lost"));
+        }
+        let end = ring.written();
+        if end <= self.cursor {
+            self.end_stream();
+            return Err(anyhow::Error::new(rusb::Error::Timeout).context(format!(
+                "no samples from the scope for {:.1} s",
+                wait.as_secs_f64()
+            )));
+        }
+        let at = ring
+            .take_marks()
+            .last()
+            .map_or_else(std::time::Instant::now, |m| m.at);
+        let data = ring.read_bytes(self.cursor..end, |a, b| [a, b].concat());
+        self.cursor = end;
+        ring.keep_from(end / ch);
+        Ok(Chunk { data, lost: 0, at })
     }
 
     /// Volts per ADC count and volts at count 0, per channel, for `cfg`.
@@ -355,6 +379,34 @@ impl<T: Transport> Scope6022<T> {
         out.clipped = live.dec.clipped;
         out.range = self.range(cfg);
         Ok(out)
+    }
+
+    /// The logger at its end: stop the scope, then give what the stream
+    /// still holds (raw ADC bytes, like [`Scope6022::stream_raw`]), so
+    /// every sample the scope sent is logged.
+    pub fn stop_raw(&mut self) -> Result<Option<RawPiece>> {
+        let rest = match (&self.stream, &self.ring) {
+            (Some(live), Some(ring)) => {
+                let ch = live.cfg.channels.clamp(1, 2) as usize;
+                let mut skip = live.skip_bytes;
+                // Stop the transfers first: nothing more comes after this.
+                self.t.stream_stop();
+                let end = ring.written();
+                let mut data = ring.read_bytes(self.cursor..end, |a, b| [a, b].concat());
+                self.cursor = end;
+                skip = skip.min(data.len());
+                data.drain(..skip);
+                data.truncate(data.len() - data.len() % ch);
+                Some(RawPiece {
+                    data,
+                    lost: 0,
+                    at: std::time::Instant::now(),
+                })
+            }
+            _ => None,
+        };
+        self.stop()?;
+        Ok(rest)
     }
 
     /// The logger: the next piece of the stream as raw ADC bytes, after

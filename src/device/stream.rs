@@ -7,14 +7,14 @@
 //! channels, 30 MS/s with one), measured on the real scope.
 //!
 //! A thread of its own runs the libusb event loop. The transfer callback
-//! copies the data into a channel and resubmits the transfer at once, so
-//! slow processing in the consumer never stops the USB pipe. When the
-//! consumer falls more than [`StreamSetup::queue_max`] bytes behind, new
-//! data is dropped and counted ([`Chunk::lost`]), never silently.
+//! copies the data into the stream [`Ring`](crate::stream::ring::Ring)
+//! with the time it came off the bus, and resubmits the transfer at once.
+//! Nothing else runs there, so slow processing never stops the USB pipe.
+//! When the processing falls so far behind that the ring is full, the
+//! ring drops the data and counts it, never silently.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use libusb1_sys as ffi;
 use libusb1_sys::constants::*;
+
+use crate::stream::ring::{Failure, Writer, MARK_SHORT};
 
 /// How to stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,8 +33,6 @@ pub struct StreamSetup {
     pub transfer: usize,
     /// Transfers kept in flight.
     pub transfers: usize,
-    /// Most bytes waiting for the consumer before new data is dropped.
-    pub queue_max: usize,
 }
 
 /// One piece of a stream.
@@ -45,12 +45,6 @@ pub struct Chunk {
     /// When the transfer completed. A slow consumer sees the chunk later,
     /// but this time is still when the data came off the bus.
     pub at: Instant,
-}
-
-/// What the callback sends to the consumer.
-enum Item {
-    Data(Chunk),
-    Error(rusb::Error),
 }
 
 /// State the callback and the owner share, under one lock: the callback
@@ -68,10 +62,7 @@ struct Inner {
     ctl: Mutex<Ctl>,
     /// Signalled when `in_flight` drops to 0.
     idle: Condvar,
-    tx: Mutex<Sender<Item>>,
-    queued: AtomicUsize,
-    queue_max: usize,
-    lost: AtomicU64,
+    ring: Writer,
 }
 
 impl Inner {
@@ -80,30 +71,24 @@ impl Inner {
         self.ctl.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn send(&self, item: Item) {
-        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
-        // The consumer may be gone already; then nobody wants the data.
-        let _ = tx.send(item);
+    /// Put the data of a finished transfer into the ring. A transfer that
+    /// is shorter than asked or not whole frames is marked: data may be
+    /// missing there.
+    fn deliver(&self, data: &[u8], asked: usize) {
+        let ch = self.ring.ring().channels();
+        let flags = if data.len() < asked || !data.len().is_multiple_of(ch) {
+            MARK_SHORT
+        } else {
+            0
+        };
+        if data.is_empty() && flags == 0 {
+            return;
+        }
+        self.ring.write(data, Instant::now(), flags);
     }
 
-    /// Hand the data of a finished transfer to the consumer, or count it
-    /// as lost when the consumer is too far behind.
-    fn deliver(&self, data: &[u8]) {
-        let n = data.len();
-        if n == 0 {
-            return;
-        }
-        if self.queued.load(Ordering::Acquire) + n > self.queue_max {
-            self.lost.fetch_add(n as u64, Ordering::AcqRel);
-            return;
-        }
-        self.queued.fetch_add(n, Ordering::AcqRel);
-        let lost = self.lost.swap(0, Ordering::AcqRel);
-        self.send(Item::Data(Chunk {
-            data: data.to_vec(),
-            lost,
-            at: Instant::now(),
-        }));
+    fn fail(&self, e: rusb::Error) {
+        self.ring.fail(Failure::Usb(e));
     }
 }
 
@@ -150,21 +135,22 @@ extern "system" fn callback(t: *mut ffi::libusb_transfer) {
         ctl.in_flight -= 1;
         match status {
             LIBUSB_TRANSFER_COMPLETED if !ctl.stop && !ctl.failed => {
-                let len = ((*t).actual_length.max(0) as usize).min((*t).length as usize);
-                inner.deliver(std::slice::from_raw_parts((*t).buffer, len));
+                let asked = (*t).length.max(0) as usize;
+                let len = ((*t).actual_length.max(0) as usize).min(asked);
+                inner.deliver(std::slice::from_raw_parts((*t).buffer, len), asked);
                 let r = ffi::libusb_submit_transfer(t);
                 if r == 0 {
                     ctl.in_flight += 1;
                 } else {
                     ctl.failed = true;
-                    inner.send(Item::Error(error_of_code(r)));
+                    inner.fail(error_of_code(r));
                 }
             }
             LIBUSB_TRANSFER_COMPLETED | LIBUSB_TRANSFER_CANCELLED => {}
             s => {
                 if !ctl.stop && !ctl.failed {
                     ctl.failed = true;
-                    inner.send(Item::Error(error_of_status(s)));
+                    inner.fail(error_of_status(s));
                 }
             }
         }
@@ -184,7 +170,6 @@ unsafe impl<T> Send for Raw<T> {}
 /// frees them.
 pub struct UsbStream {
     inner: Arc<Inner>,
-    rx: Receiver<Item>,
     transfers: Vec<Raw<ffi::libusb_transfer>>,
     /// The transfer buffers (from `Box<[u8]>::into_raw`, with their
     /// length). Only raw pointers, so nothing claims them while libusb
@@ -200,8 +185,9 @@ pub struct UsbStream {
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
 
 impl UsbStream {
-    /// Queue the transfers on `handle`. Start the scope (E3 [01]) only
-    /// after this returns, so no data comes before a buffer is ready.
+    /// Queue the transfers on `handle`; they write into `ring`. Start the
+    /// scope (E3 [01]) only after this returns, so no data comes before a
+    /// buffer is ready.
     ///
     /// # Safety
     /// `handle` must be an open libusb device handle with the interface
@@ -210,8 +196,8 @@ impl UsbStream {
         ctx: *mut ffi::libusb_context,
         handle: *mut ffi::libusb_device_handle,
         setup: StreamSetup,
+        ring: Writer,
     ) -> Result<UsbStream> {
-        let (tx, rx) = mpsc::channel();
         let inner = Arc::new(Inner {
             ctl: Mutex::new(Ctl {
                 stop: false,
@@ -219,10 +205,7 @@ impl UsbStream {
                 in_flight: 0,
             }),
             idle: Condvar::new(),
-            tx: Mutex::new(tx),
-            queued: AtomicUsize::new(0),
-            queue_max: setup.queue_max.max(setup.transfer),
-            lost: AtomicU64::new(0),
+            ring,
         });
         let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let events = {
@@ -250,7 +233,6 @@ impl UsbStream {
         };
         let mut s = UsbStream {
             inner,
-            rx,
             transfers: Vec::new(),
             buffers: Vec::new(),
             ctx: Raw(ctx),
@@ -300,20 +282,6 @@ impl UsbStream {
             ctl.in_flight += 1;
         }
         Ok(s)
-    }
-
-    /// The next piece of data, waiting up to `timeout`. `Ok(None)` when
-    /// nothing came in that time.
-    pub fn next(&mut self, timeout: Duration) -> Result<Option<Chunk>> {
-        match self.rx.recv_timeout(timeout) {
-            Ok(Item::Data(c)) => {
-                self.inner.queued.fetch_sub(c.data.len(), Ordering::AcqRel);
-                Ok(Some(c))
-            }
-            Ok(Item::Error(e)) => Err(e.into()),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
-            Err(RecvTimeoutError::Disconnected) => Err(rusb::Error::Other.into()),
-        }
     }
 
     /// Cancel all transfers and wait until they called back. True when

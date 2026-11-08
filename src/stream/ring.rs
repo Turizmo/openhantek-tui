@@ -305,10 +305,15 @@ impl Ring {
     /// and written.
     pub fn read<R>(&self, frames: Range<u64>, f: impl FnOnce(&[u8], &[u8]) -> R) -> R {
         let ch = self.channels() as u64;
-        let (a, b) = (frames.start * ch, frames.end * ch);
+        self.read_bytes(frames.start * ch..frames.end * ch, f)
+    }
+
+    /// [`Ring::read`] by byte positions.
+    pub fn read_bytes<R>(&self, bytes: Range<u64>, f: impl FnOnce(&[u8], &[u8]) -> R) -> R {
+        let (a, b) = (bytes.start, bytes.end);
         assert!(
             a <= b && b <= self.written() && a >= self.keep.load(Ordering::Acquire),
-            "ring read {frames:?} outside the kept frames"
+            "ring read of bytes {bytes:?} outside the kept ones"
         );
         let size = self.buf.len();
         let start = (a & self.mask) as usize;

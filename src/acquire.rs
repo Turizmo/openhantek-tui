@@ -389,7 +389,15 @@ impl Worker {
     }
 
     fn stop_log(&mut self) {
-        if let Some(l) = self.log.take() {
+        if let Some(mut l) = self.log.take() {
+            // The rest of the stream first: every sample the scope sent.
+            if let Some(c) = &mut self.conn {
+                if let Ok(Some(p)) = c.driver.stop_raw() {
+                    if !p.data.is_empty() {
+                        l.piece(&p, c);
+                    }
+                }
+            }
             l.finish();
             // Start the normal capture from scratch.
             if let Some(c) = &mut self.conn {

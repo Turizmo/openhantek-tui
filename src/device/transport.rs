@@ -7,6 +7,7 @@ use anyhow::{bail, Result};
 
 use super::stream::UsbStream;
 pub use super::stream::{Chunk, StreamSetup};
+use crate::stream::ring::Writer;
 
 /// Vendor request to the device, host to device (bmRequestType 0x40).
 pub const VENDOR_OUT: u8 = 0x40;
@@ -22,14 +23,10 @@ pub trait Transport: Send {
     fn bulk_in(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize>;
 
     /// Queue bulk reads that stay in flight until [`Transport::stream_stop`]
-    /// (an async stream). Start the scope only after this returns.
-    fn stream_start(&mut self, _setup: StreamSetup) -> Result<()> {
+    /// (an async stream); each finished one goes into `ring`, an error
+    /// ends the stream there. Start the scope only after this returns.
+    fn stream_start(&mut self, _setup: StreamSetup, _ring: Writer) -> Result<()> {
         bail!("this transport cannot stream")
-    }
-    /// The next piece of a running stream, waiting up to `timeout`.
-    /// `Ok(None)` when nothing came in that time.
-    fn stream_next(&mut self, _timeout: Duration) -> Result<Option<Chunk>> {
-        bail!("no stream is running")
     }
     /// Cancel the stream's transfers. Does nothing without a stream.
     fn stream_stop(&mut self) {}
@@ -81,21 +78,14 @@ impl Transport for UsbTransport {
         Ok(self.handle.read_bulk(endpoint, buf, timeout)?)
     }
 
-    fn stream_start(&mut self, setup: StreamSetup) -> Result<()> {
+    fn stream_start(&mut self, setup: StreamSetup, ring: Writer) -> Result<()> {
         use rusb::UsbContext;
         self.stream = None;
         let ctx = self.handle.context().as_raw();
         // SAFETY: the handle is open with the interface claimed, and it
         // outlives the stream (the stream is dropped first, see above).
-        self.stream = Some(unsafe { UsbStream::start(ctx, self.handle.as_raw(), setup)? });
+        self.stream = Some(unsafe { UsbStream::start(ctx, self.handle.as_raw(), setup, ring)? });
         Ok(())
-    }
-
-    fn stream_next(&mut self, timeout: Duration) -> Result<Option<Chunk>> {
-        match &mut self.stream {
-            Some(s) => s.next(timeout),
-            None => bail!("no stream is running"),
-        }
     }
 
     fn stream_stop(&mut self) {
@@ -162,12 +152,8 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
         (**self).bulk_in(endpoint, buf, timeout)
     }
 
-    fn stream_start(&mut self, setup: StreamSetup) -> Result<()> {
-        (**self).stream_start(setup)
-    }
-
-    fn stream_next(&mut self, timeout: Duration) -> Result<Option<Chunk>> {
-        (**self).stream_next(timeout)
+    fn stream_start(&mut self, setup: StreamSetup, ring: Writer) -> Result<()> {
+        (**self).stream_start(setup, ring)
     }
 
     fn stream_stop(&mut self) {
