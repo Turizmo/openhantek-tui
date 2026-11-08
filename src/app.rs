@@ -681,11 +681,12 @@ impl App {
                 s.channels[sel].coupling = s.channels[sel].coupling.toggle()
             }
             Act::Probe if sel < 2 => {
+                let is_src = s.trigger_source() == sel;
                 let ch = &mut s.channels[sel];
                 let old = ch.probe as f64;
                 ch.probe = if ch.probe == 1 { 10 } else { 1 };
                 // Keep the trigger level where it is on the screen.
-                if s.trigger.source == sel {
+                if is_src {
                     s.trigger.level *= ch.probe as f64 / old;
                 }
             }
@@ -714,18 +715,18 @@ impl App {
             Act::TriggerMode => s.trigger.mode = s.trigger.mode.next(),
             Act::TriggerSource => s.trigger.source = 1 - s.trigger.source.min(1),
             Act::TriggerEdge => s.trigger.slope = s.trigger.slope.next(),
-            Act::TriggerUp => s.trigger.level += 0.1 * s.channels[s.trigger.source].volts_per_div(),
+            Act::TriggerUp => s.trigger.level += 0.1 * s.channels[s.trigger_source()].volts_per_div(),
             Act::TriggerDown => {
-                s.trigger.level -= 0.1 * s.channels[s.trigger.source].volts_per_div()
+                s.trigger.level -= 0.1 * s.channels[s.trigger_source()].volts_per_div()
             }
             Act::TriggerToMiddle => self.action(Action::TriggerToMiddle),
             Act::TriggerLeft => s.trigger.position = (s.trigger.position - 0.05).max(0.0),
             Act::TriggerRight => s.trigger.position = (s.trigger.position + 0.05).min(1.0),
             Act::TriggerUpFine => {
-                s.trigger.level += 0.01 * s.channels[s.trigger.source].volts_per_div()
+                s.trigger.level += 0.01 * s.channels[s.trigger_source()].volts_per_div()
             }
             Act::TriggerDownFine => {
-                s.trigger.level -= 0.01 * s.channels[s.trigger.source].volts_per_div()
+                s.trigger.level -= 0.01 * s.channels[s.trigger_source()].volts_per_div()
             }
             Act::TriggerLeftFine => s.trigger.position = (s.trigger.position - 0.005).max(0.0),
             Act::TriggerRightFine => s.trigger.position = (s.trigger.position + 0.005).min(1.0),
@@ -879,7 +880,7 @@ impl App {
 
     /// Set the trigger level to the middle of the source signal.
     fn trigger_to_middle(&mut self) {
-        let src = self.scope.settings.trigger.source;
+        let src = self.scope.settings.trigger_source();
         if let Some(m) = self.scope.measure(src) {
             self.scope.settings.trigger.level = (m.max + m.min) / 2.0;
         }

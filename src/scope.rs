@@ -18,6 +18,10 @@ pub const MATH: usize = 2;
 /// Extra samples kept on each side of the screen, for interpolation.
 const MARGIN: usize = 8;
 
+/// Auto mode keeps the last triggered frame this long (seconds of
+/// signal) before it shows untriggered frames.
+pub const AUTO_TIMEOUT: f64 = 0.1;
+
 /// What is on the screen now.
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
@@ -143,6 +147,8 @@ pub struct Scope {
     adc_range: [Option<(usize, (f64, f64))>; 2],
     /// Mean that AC coupling took away, per channel, in the last block.
     ac_mean: [f64; 2],
+    /// Seconds of signal since the last trigger (Auto mode timeout).
+    untriggered_secs: f64,
 }
 
 /// How far inside the input range the trigger level goes when the
@@ -172,6 +178,7 @@ impl Scope {
             notices: Vec::new(),
             adc_range: [None; 2],
             ac_mean: [0.0; 2],
+            untriggered_secs: 0.0,
         }
     }
 
@@ -181,7 +188,7 @@ impl Scope {
     /// calibration.
     pub fn trigger_range(&self) -> (f64, f64) {
         let s = &self.settings;
-        let src = s.trigger.source.min(1);
+        let src = s.trigger_source();
         let ch = &s.channels[src];
         let gain = gain_index(VOLT_DIVS[ch.volt_idx.min(VOLT_DIVS.len() - 1)]);
         let (lo, hi) = match self.adc_range[src] {
@@ -226,7 +233,7 @@ impl Scope {
         let need_ch2 = s.channels[1].enabled
             || s.math.enabled
             || s.display.xy
-            || (!roll && s.trigger.source == 1);
+            || (!roll && s.trigger_source() == 1);
         let max = s.acquisition.max_adc_rate;
         let channels = hw_channels(need_ch2, max);
         let rate = choose_rate(s.coarse_screen_time(), channels, max);
@@ -256,6 +263,7 @@ impl Scope {
         self.hw = Some(cfg);
         self.reset_average();
         self.history.clear();
+        self.untriggered_secs = 0.0;
         if roll_changed {
             self.clear_roll();
         }
@@ -308,9 +316,12 @@ impl Scope {
             let state = self.state;
             self.running = true;
             self.reset_average();
+            // Show the block even when it has no trigger (no Auto hold).
+            let waited = std::mem::replace(&mut self.untriggered_secs, f64::INFINITY);
             if !block.roll {
                 self.process(&block);
             }
+            self.untriggered_secs = waited;
             self.running = running;
             self.state = if running { self.state } else { state };
             self.last_block = Some(block);
@@ -387,27 +398,50 @@ impl Scope {
         let d = ((s.screen_time() * rate).round() as usize).max(2);
         let pre = (s.trigger.position * d as f64).round() as usize;
         let post = d - pre;
-        let src = s.trigger.source.min(1);
-        let src_samples = ch[src].as_deref().or(ch[1 - src].as_deref());
+        let src = s.trigger_source();
+        // The source channel, else the one that was sampled.
+        let src_c = if ch[src].is_some() { src } else { 1 - src };
+        let src_samples = ch[src_c].as_deref();
         let len = src_samples.map_or(0, |v| v.len());
         let vdiv = s.channels[src].volts_per_div();
         let level = self.effective_trigger_level().unwrap_or(s.trigger.level);
         let trig = src_samples.and_then(|v| {
+            let probe = s.channels[src_c].probe as f64;
+            let (lo, hi) = block.range[src_c];
+            let lsb = (hi - lo).abs() / 255.0 * probe;
             find_trigger(
                 v,
                 level,
                 s.trigger.slope,
-                0.1 * vdiv,
+                hysteresis(vdiv, v, lsb),
                 pre + MARGIN,
                 len.saturating_sub(post + MARGIN),
             )
         });
+        let depth = s.display.averaging;
+        // Averaged captures are moved by their sub-sample trigger offset
+        // first, so the edge sits at the same place in each one.
+        let mut frac = 0.0;
         let (start, t0, triggered) = match trig {
             Some(t) => {
-                let start = (t.floor() as usize).saturating_sub(pre + MARGIN);
-                (start, (start as f64 - t) * dt, true)
+                self.untriggered_secs = 0.0;
+                let tf = t.floor();
+                let start = (tf as usize).saturating_sub(pre + MARGIN);
+                if depth > 1 {
+                    frac = t - tf;
+                    (start, (start as f64 - tf) * dt, true)
+                } else {
+                    (start, (start as f64 - t) * dt, true)
+                }
             }
             None if s.trigger.mode == TriggerMode::Auto => {
+                // Keep the last triggered frame for a while: a block can
+                // miss the edge (a block shorter than the signal period).
+                self.untriggered_secs += len as f64 * dt;
+                let holding = self.frame.as_ref().is_some_and(|f| f.triggered && !f.roll);
+                if holding && self.untriggered_secs < AUTO_TIMEOUT {
+                    return false;
+                }
                 // No trigger: show the start of the block as if it triggered there.
                 (0, -((pre + MARGIN) as f64) * dt, false)
             }
@@ -417,22 +451,36 @@ impl Scope {
             }
         };
         let end = start + d + 2 * MARGIN + 1;
-        let cut = |v: &Option<Vec<f64>>| -> Option<Vec<f64>> {
-            v.as_ref()
-                .map(|v| v[start.min(v.len())..end.min(v.len())].to_vec())
-        };
-        let mut traces = [cut(&ch[0]), cut(&ch[1]), None];
-        let cut_pk = |p: &Option<(Vec<f64>, Vec<f64>)>| {
-            p.as_ref().map(|(a, b)| {
-                let r = |v: &Vec<f64>| v[start.min(v.len())..end.min(v.len())].to_vec();
-                (r(a), r(b))
+        let cut = |v: &[f64]| -> Vec<f64> { shift(v, start, end, frac, Shift::Line) };
+        let mut traces = [
+            ch[0].as_deref().map(cut),
+            ch[1].as_deref().map(cut),
+            None,
+        ];
+        let band = |c: usize| {
+            // A block without min and max has a band as thin as the
+            // trace; else the moved band holds both neighbours.
+            let raw = block.min[c].len() == block.data[c].len()
+                && block.max[c].len() == block.data[c].len();
+            let (lo, hi) = if raw {
+                (Shift::Min, Shift::Max)
+            } else {
+                (Shift::Line, Shift::Line)
+            };
+            pk[c].as_ref().map(|(a, b)| {
+                (
+                    shift(a, start, end, frac, lo),
+                    shift(b, start, end, frac, hi),
+                )
             })
         };
-        let mut peak = [cut_pk(&pk[0]), cut_pk(&pk[1]), None];
-        let depth = s.display.averaging;
+        let mut peak = [band(0), band(1), None];
         for i in 0..2 {
             if let Some(t) = &mut traces[i] {
-                if triggered && depth > 1 {
+                if !triggered {
+                    // An untriggered frame is not averaged and leaves the
+                    // average as it is.
+                } else if depth > 1 {
                     *t = self.averagers[i].push(t, depth);
                     if let Some((lo, hi)) = &mut peak[i] {
                         (*lo, *hi) = self.peaks[i].push(lo, hi, depth);
@@ -693,6 +741,48 @@ impl Scope {
     }
 }
 
+/// Trigger hysteresis: 0.1 div, but at most a quarter of the signal's
+/// pk-pk (at least 2 ADC steps of `lsb`), so a big volts/div still
+/// triggers on a small signal.
+fn hysteresis(vdiv: f64, samples: &[f64], lsb: f64) -> f64 {
+    let (lo, hi) = samples
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let pp = if hi >= lo { hi - lo } else { 0.0 };
+    (0.1 * vdiv).min((0.25 * pp).max(2.0 * lsb))
+}
+
+#[derive(Clone, Copy)]
+enum Shift {
+    /// Straight line between the two neighbours.
+    Line,
+    /// The lower of the two neighbours (a band minimum).
+    Min,
+    /// The higher of the two neighbours (a band maximum).
+    Max,
+}
+
+/// `v[start..end]`, moved `frac` (0 .. 1) of a sample later in the
+/// signal: point j is at `start + j + frac`. Past the end it repeats the
+/// last sample.
+fn shift(v: &[f64], start: usize, end: usize, frac: f64, how: Shift) -> Vec<f64> {
+    let end = end.min(v.len());
+    let start = start.min(end);
+    if frac <= 0.0 {
+        return v[start..end].to_vec();
+    }
+    (start..end)
+        .map(|i| {
+            let (a, b) = (v[i], v[(i + 1).min(v.len() - 1)]);
+            match how {
+                Shift::Line => a + (b - a) * frac,
+                Shift::Min => a.min(b),
+                Shift::Max => a.max(b),
+            }
+        })
+        .collect()
+}
+
 /// The mean AC coupling takes away from channel `c` of a block (0 for DC
 /// and in roll mode).
 fn ac_mean(block: &Block, ch: &ChannelSettings, c: usize) -> f64 {
@@ -759,7 +849,10 @@ mod tests {
         assert_eq!(s.hw_config().channels, 2);
         s.settings.math.enabled = false;
         s.settings.trigger.source = 1;
-        assert_eq!(s.hw_config().channels, 2);
+        // Source CH2 while CH2 is off: the trigger follows CH1, so CH1
+        // alone still gets 1-channel mode.
+        assert_eq!(s.settings.trigger_source(), 0);
+        assert_eq!(s.hw_config().channels, 1);
         // Probe x10 at 10 V/div is 1 V/div at the BNC.
         s.settings.channels[0].probe = 10;
         assert_eq!(s.settings.channels[0].volts_per_div(), 10.0);
@@ -1006,22 +1099,23 @@ mod tests {
             (hi[200] - tr[200], tr[200] - lo[200])
         };
         // The spike capture is one of the last 4: its ±3 V stay, not
-        // averaged down.
+        // averaged down. (Aligning the captures to the trigger widens
+        // the band by up to one sample of slope: under 0.01 V here.)
         let (up, down) = band(&s);
-        assert!((up - 3.0).abs() < 1e-6 && (down - 3.0).abs() < 1e-6, "{up} {down}");
+        assert!((up - 3.0).abs() < 0.01 && (down - 3.0).abs() < 0.01, "{up} {down}");
         // A fifth capture: the spike drops out of the window.
         s.push(peaky_block(1, 0.0));
         let (up, _) = band(&s);
-        assert!((up - 1.0).abs() < 1e-6, "{up}");
+        assert!((up - 1.0).abs() < 0.01, "{up}");
         // A settings change resets it with the average.
         s.push(peaky_block(1, 2.0));
-        s.settings.time_idx += 1;
+        s.settings.time_idx -= 1;
         let (gen, _) = s.sync_hw().unwrap();
         let mut b = peaky_block(gen, 0.0);
         b.cfg = s.hw.unwrap();
         s.push(b);
         let (up, _) = band(&s);
-        assert!((up - 1.0).abs() < 1e-6, "{up}");
+        assert!((up - 1.0).abs() < 0.01, "{up}");
     }
 
     #[test]
@@ -1230,5 +1324,225 @@ mod tests {
         assert_eq!(TIME_DIVS[time_index(1.5e-3)], 2e-3);
         assert_eq!(time_index(1e9), TIME_DIVS.len() - 1);
         assert_eq!(time_index(0.0), 0);
+    }
+
+    /// The 1 kHz calibration wave at the BNC of a x10 probe (0 .. 0.2 V)
+    /// with RC edges of 1.5 µs (10 - 90 %), as consecutive blocks of
+    /// 20000 samples with 1 LSB of noise, quantized to the ADC steps.
+    struct CalWave {
+        k: u64,
+        seed: u64,
+    }
+
+    impl CalWave {
+        fn new() -> Self {
+            Self {
+                k: 0,
+                seed: 0x1234_5678_9abc_def1,
+            }
+        }
+
+        fn noise(&mut self) -> f64 {
+            let mut u = || {
+                self.seed ^= self.seed << 13;
+                self.seed ^= self.seed >> 7;
+                self.seed ^= self.seed << 17;
+                ((self.seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-300)
+            };
+            let (a, b) = (u(), u());
+            (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+        }
+
+        /// The next block for scope `s`, the wave on channel `on`.
+        fn block(&mut self, s: &Scope, on: usize) -> Block {
+            let cfg = s.hw.unwrap();
+            let rate = cfg.rate.rate;
+            let range = nominal_range(&cfg);
+            let f = 1000.0 * (1.0 + 37e-6);
+            let tau = 1.5e-6 / 2.2;
+            let mut data: [Vec<f64>; 2] = Default::default();
+            for c in 0..cfg.channels as usize {
+                let lsb = (range[c].1 - range[c].0) / 255.0;
+                data[c] = (0..20_000u64)
+                    .map(|i| {
+                        let t = (self.k + i) as f64 / rate;
+                        let p = (t * f).fract() / f;
+                        let half = 0.5 / f;
+                        let v = if c != on {
+                            0.0
+                        } else if p < half {
+                            0.2 * (1.0 - (-p / tau).exp())
+                        } else {
+                            0.2 * (-(p - half) / tau).exp()
+                        };
+                        ((v / lsb + self.noise()).round() * lsb).clamp(range[c].0, range[c].1)
+                    })
+                    .collect();
+            }
+            self.k += 20_000;
+            Block {
+                gen: s.gen,
+                cfg,
+                data,
+                min: Default::default(),
+                max: Default::default(),
+                clipped: [false; 2],
+                range,
+                rate,
+                roll: false,
+            }
+        }
+    }
+
+    /// 50 ns/div, Auto, rising at 1.16 V, x10 probes, CH1 / CH2 on as
+    /// given, trigger source `src`.
+    fn cal_scope(on: [bool; 2], src: usize, volt_idx: [usize; 2], avg: usize) -> Scope {
+        let mut st = Settings {
+            time_idx: 1,
+            ..Default::default()
+        };
+        st.trigger.mode = TriggerMode::Auto;
+        st.trigger.source = src;
+        st.trigger.level = 1.16;
+        st.trigger.position = 0.5;
+        for c in 0..2 {
+            st.channels[c].enabled = on[c];
+            st.channels[c].probe = 10;
+            st.channels[c].volt_idx = volt_idx[c];
+            st.channels[c].offset = -2.3;
+        }
+        st.display.averaging = avg;
+        st.display.interpolation = Interpolation::Sinc;
+        let mut s = Scope::new(st);
+        s.sync_hw();
+        s
+    }
+
+    /// Push `n` cal wave blocks; return the frames shown, how many of
+    /// them were triggered, and the standard deviation and largest size
+    /// (ns) of where the drawn trace (sin(x)/x, 400 dots) crosses the
+    /// level, relative to the trigger point.
+    fn cal_run(s: &mut Scope, n: usize) -> (usize, usize, f64, f64) {
+        let on = s.settings.trigger_source();
+        let mut wave = CalWave::new();
+        let (mut shown, mut trig) = (0, 0);
+        let mut xs = Vec::new();
+        for _ in 0..n {
+            let b = wave.block(s, on);
+            if !s.push(b) {
+                continue;
+            }
+            shown += 1;
+            let f = s.frame.as_ref().unwrap();
+            if !f.triggered {
+                continue;
+            }
+            trig += 1;
+            let pts = crate::ui::trace_points(f, on, &s.settings, 400, false);
+            let ch = &s.settings.channels[on];
+            let yl = s.settings.trigger.level / ch.volts_per_div() + ch.offset;
+            let x = pts
+                .windows(2)
+                .filter(|w| w[0].1 < yl && w[1].1 >= yl)
+                .map(|w| w[0].0 + (yl - w[0].1) / (w[1].1 - w[0].1) * (w[1].0 - w[0].0))
+                .min_by(|a, b| a.abs().total_cmp(&b.abs()))
+                .expect("a crossing");
+            xs.push(x * s.settings.time_per_div() * 1e9);
+        }
+        let m = xs.iter().sum::<f64>() / xs.len().max(1) as f64;
+        let sd = (xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / xs.len().max(1) as f64).sqrt();
+        let big = xs.iter().fold(0.0f64, |a, x| a.max(x.abs()));
+        (shown, trig, sd, big)
+    }
+
+    #[test]
+    fn cal_wave_ch2_alone_holds_still_with_averaging() {
+        // 2-channel mode at 16 MS/s: 8 samples on the screen. Before the
+        // captures were aligned, averaging 64 moved the edge by up to
+        // ±0.5 sample (sd 17 ns, 0.33 div).
+        for avg in [1, 64] {
+            let mut s = cal_scope([false, true], 1, [7, 1], avg);
+            assert_eq!(s.hw.unwrap().rate.rate, 16e6);
+            let (shown, trig, sd, big) = cal_run(&mut s, 300);
+            assert_eq!((shown, trig), (300, 300));
+            assert!(sd < 10.0 && big < 60.0, "avg {avg}: sd {sd} ns, max {big} ns");
+            if avg == 64 {
+                assert!(sd < 3.0, "sd {sd} ns");
+            }
+        }
+    }
+
+    #[test]
+    fn cal_wave_ch1_alone_at_30_ms_keeps_the_trigger() {
+        // CH1 alone at 30 MS/s: a block (0.67 ms) is shorter than the
+        // 1 ms period, so a third of them have no edge. Auto keeps the
+        // last triggered frame instead of showing them untriggered, and
+        // the average goes on. The trigger source is CH2 (off): it
+        // follows CH1, in 1-channel mode.
+        for avg in [1, 64] {
+            let mut s = cal_scope([true, false], 1, [1, 1], avg);
+            let hw = s.hw.unwrap();
+            assert_eq!((hw.channels, hw.rate.rate), (1, 30e6));
+            let (shown, trig, sd, big) = cal_run(&mut s, 300);
+            assert_eq!(shown, trig, "untriggered frames shown");
+            assert!(trig > 150, "{trig}");
+            assert!(sd < 10.0 && big < 60.0, "avg {avg}: sd {sd} ns, max {big} ns");
+            if avg == 64 {
+                assert!(s.averagers[0].count() > 32, "{}", s.averagers[0].count());
+            }
+        }
+    }
+
+    #[test]
+    fn big_volts_per_div_still_triggers() {
+        // 5 V/div at the BNC (50 V/div with x10): 0.1 div of hysteresis
+        // (5 V) is more than the 2 V signal, so it never armed.
+        let mut s = cal_scope([true, false], 0, [7, 1], 1);
+        let (shown, trig, _, _) = cal_run(&mut s, 30);
+        assert!(shown > 0 && trig == shown, "{trig} of {shown}");
+        // The cap: 0.1 div normally, at most a quarter of the pk-pk.
+        let v = [0.0, 2.0];
+        assert_eq!(hysteresis(0.5, &v, 0.04), 0.05);
+        assert_eq!(hysteresis(50.0, &v, 0.4), 0.8);
+        assert_eq!(hysteresis(50.0, &v, 0.04), 0.5);
+    }
+
+    #[test]
+    fn auto_waits_before_untriggered_frames() {
+        let mut s = scope();
+        s.settings.display.averaging = 4;
+        // 20000 samples at 1 MS/s: 20 ms per block.
+        assert!(s.push(sine_block(1, 1e6, 1000.0, 2.0, 1.0)));
+        assert!(s.push(sine_block(1, 1e6, 1000.0, 2.0, 1.0)));
+        assert_eq!(s.averagers[0].count(), 2);
+        let flat = |s: &Scope| {
+            let mut b = sine_block(s.gen, 1e6, 1000.0, 0.0, 0.0);
+            b.cfg = s.hw.unwrap();
+            b
+        };
+        // Four blocks (80 ms) without a trigger: the triggered frame stays.
+        for _ in 0..4 {
+            assert!(!s.push(flat(&s)));
+            assert!(s.frame.as_ref().unwrap().triggered);
+        }
+        // The fifth (100 ms): untriggered frames from now on.
+        assert!(s.push(flat(&s)));
+        assert!(!s.frame.as_ref().unwrap().triggered);
+        assert_eq!(s.state, TrigState::Auto);
+        assert!(s.push(flat(&s)));
+        // The untriggered frames left the average alone.
+        assert_eq!(s.averagers[0].count(), 2);
+        assert!(s.push(sine_block(1, 1e6, 1000.0, 2.0, 1.0)));
+        assert_eq!(s.averagers[0].count(), 3);
+        assert!(s.frame.as_ref().unwrap().triggered);
+    }
+
+    #[test]
+    fn shift_moves_by_a_fraction_of_a_sample() {
+        let v = [0.0, 1.0, 3.0, 2.0];
+        assert_eq!(shift(&v, 0, 4, 0.0, Shift::Line), v.to_vec());
+        assert_eq!(shift(&v, 1, 4, 0.5, Shift::Line), vec![2.0, 2.5, 2.0]);
+        assert_eq!(shift(&v, 0, 3, 0.25, Shift::Min), vec![0.0, 1.0, 2.0]);
+        assert_eq!(shift(&v, 0, 9, 0.25, Shift::Max), vec![1.0, 3.0, 3.0, 2.0]);
     }
 }

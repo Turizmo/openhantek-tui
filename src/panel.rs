@@ -785,11 +785,12 @@ impl Field {
             }
             ChCoupling(c) => s.channels[c].coupling = if on { Coupling::Ac } else { Coupling::Dc },
             ChProbe(c) => {
+                let is_src = s.trigger_source() == c;
                 let ch = &mut s.channels[c];
                 let old = ch.probe as f64;
                 ch.probe = if on { 10 } else { 1 };
                 // Keep the trigger level where it is on the screen.
-                if s.trigger.source == c {
+                if is_src {
                     s.trigger.level *= ch.probe as f64 / old;
                 }
             }
@@ -1015,7 +1016,7 @@ impl Field {
         use Field::*;
         match self {
             ChOffset(_) | MathOffset => 0.1,
-            TrigLevel => 0.1 * s.channels[s.trigger.source.min(1)].volts_per_div(),
+            TrigLevel => 0.1 * s.channels[s.trigger_source()].volts_per_div(),
             TrigPosition => 5.0,
             CursorPos(i) if i < 2 => 0.1 * s.time_per_div(),
             CursorPos(_) => 0.1 * Self::cursor_scale(s).0,

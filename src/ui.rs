@@ -732,7 +732,7 @@ fn time_margins(
         }
     }
     if !roll && !s.display.xy && g.margins.right >= 1 {
-        let src = s.trigger.source;
+        let src = s.trigger_source();
         let (sc_, off) = trace_scale(s, src);
         let y = g.plot.y + plot.row_of((s.trigger.level / sc_ + off).clamp(-half_v, half_v)) as u16;
         // Red when the level is outside the input range (the trigger
@@ -1333,7 +1333,7 @@ fn draw_time_line(f: &mut TermFrame, app: &App, area: Rect) {
     if s.roll() {
         parts.push(text("Roll".into()));
     } else {
-        let src = s.trigger.source;
+        let src = s.trigger_source();
         let mut trig = vec![Span::raw(format!(
             "Trig {} {} {} {}",
             s.trigger.mode.name(),

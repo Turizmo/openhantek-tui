@@ -965,6 +965,18 @@ impl Settings {
         TIME_DIVS[self.time_idx.min(TIME_DIVS.len() - 1)]
     }
 
+    /// The channel the trigger looks at: the trigger source, or the other
+    /// channel when the source is off and the other is on (CH1 alone with
+    /// source CH2 triggers on CH1, in 1-channel mode).
+    pub fn trigger_source(&self) -> usize {
+        let src = self.trigger.source.min(1);
+        if !self.channels[src].enabled && self.channels[1 - src].enabled {
+            1 - src
+        } else {
+            src
+        }
+    }
+
     /// Time across the whole screen, in seconds.
     pub fn screen_time(&self) -> f64 {
         self.time_per_div() * H_DIVS

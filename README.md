@@ -200,6 +200,20 @@ the hysteresis still applies). Your level does not change: the `◂` mark
 turns red, the status line says
 `Trig Auto CH1 ↑ 1 V (out of range, using 465 mV)`, and with a bigger
 volts/div the real level is used again.
+
+The trigger hysteresis is 0.1 division, but at most a quarter of the
+signal's pk-pk (at least 2 ADC steps), so a small signal at a big
+volts/div still triggers. When the trigger source channel is off and
+the other channel is on, the trigger uses the channel that is on (the
+status line names it): CH1 alone then still samples in 1-channel mode.
+Auto mode keeps the last triggered trace for 100 ms of signal before it
+shows untriggered traces, so a capture that misses the edge (at 30 MS/s
+a capture is 0.67 ms, shorter than the 1 ms of the calibration wave)
+does not make the trace jump. Untriggered traces are not averaged and
+leave the average alone. With averaging on, each capture is first moved
+by its sub-sample trigger offset (linear interpolation), so the edge
+sits at the trigger point in every capture and the average does not
+wander by up to a sample.
 The labels on the left are the volts of the selected trace at each
 division line; the labels below are the time from the trigger point.
 The margins are kept small, so the plot gets the room: the left labels
