@@ -54,31 +54,22 @@ pub fn tick_until(app: &mut App, secs: f64, mut done: impl FnMut(&App) -> bool) 
 }
 
 /// One block for the app's current hardware settings from the fake,
-/// without the thread. Good for UI tests that need exact control. Roll
-/// mode gives a piece of the stream; else a fresh start of the stream
-/// (the signal time goes on).
+/// without the thread. Good for UI tests that need exact control. A fresh
+/// start of the stream each time (the signal time goes on): in roll mode
+/// a piece of about one USB transfer, else [`BLOCK_SAMPLES`] samples.
 pub fn block_for(app: &App, d: &mut Driver, fake: &FakeScope) -> Block {
     let cfg = app.scope.hw.expect("hw config");
-    if cfg.roll {
-        let cap = d.stream(&cfg).unwrap();
-        return Block {
-            gen: app.scope.gen,
-            cfg,
-            data: cap.data,
-            min: cap.min,
-            max: cap.max,
-            clipped: cap.clipped,
-            range: cap.range,
-            rate: cap.rate,
-            roll: true,
-            trigger: None,
-        };
-    }
     if d.streaming().is_some() {
         d.stop().unwrap();
     }
     let os = cfg.rate.oversample;
-    let frames = (2048 / os + 1) * os + BLOCK_SAMPLES * os;
+    let points = if cfg.roll {
+        let ch = cfg.channels.clamp(1, 2) as usize;
+        (Driver::stream_setup(&cfg).transfer / ch / os).max(1)
+    } else {
+        BLOCK_SAMPLES
+    };
+    let frames = (2048 / os + 1) * os + points * os;
     let raw = fake.raw(&cfg, frames);
     d.raw_block(&cfg, &raw, app.scope.gen)
 }

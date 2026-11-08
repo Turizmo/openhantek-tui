@@ -12,9 +12,10 @@
 
 use std::time::{Duration, Instant};
 
-use openhantek_tui::acquire::{Acquisition, Command, LogRequest};
+use openhantek_tui::acquire::{Acquisition, Block, Command, LogRequest};
 use openhantek_tui::device::protocol::{
-    choose_rate, gain_index, MAX_ADC_DEFAULT, raw_rate_of_id, HwConfig, Rate, BLOCK_SAMPLES,
+    choose_rate, gain_index, MAX_ADC_DEFAULT, raw_rate_of_id, Decimator, HwConfig, Rate,
+    BLOCK_SAMPLES,
 };
 use openhantek_tui::device::{open_hardware, Connection};
 use openhantek_tui::dsp::measure::measure;
@@ -138,18 +139,16 @@ fn hw_roll_stream() {
     cfg.roll = true;
     assert_eq!((cfg.rate.raw, cfg.rate.oversample), (16e6, 3200));
     let mut ch1 = Vec::new();
-    let (mut lost, mut wide) = (0, 0);
+    let mut wide = 0;
     let cpu0 = cpu_secs();
     let t0 = std::time::Instant::now();
-    while t0.elapsed().as_secs_f64() < hw_secs().min(10.0) {
-        let piece = c.driver.stream(&cfg).unwrap();
-        lost += piece.lost;
+    let lost = ring_run(&mut c, &cfg, hw_secs().min(10.0), |piece, _| {
         ch1.extend_from_slice(&piece.data[0]);
         // Points with an edge in them: the peak band spans the 2 V.
         wide += (0..piece.data[0].len())
             .filter(|&i| piece.max[0][i] - piece.min[0][i] > 1.5)
             .count();
-    }
+    });
     let secs = t0.elapsed().as_secs_f64();
     let cpu = cpu_secs() - cpu0;
     eprintln!(
@@ -175,7 +174,74 @@ fn hw_roll_stream() {
         let f = m.freq.unwrap();
         assert!((f - 100.0).abs() < 0.5, "roll freq {f}");
     }
+}
+
+/// Stream `cfg` into the ring for `secs` and read it as the processing
+/// thread does: each look takes what came since the last one, decimated
+/// (after the 2048 unstable samples) in volts, with the bus time of its
+/// last transfer. Returns the bytes the ring had to drop (0 when the
+/// host kept up). The scope stops at the end.
+fn ring_run(
+    c: &mut Connection,
+    cfg: &HwConfig,
+    secs: f64,
+    mut f: impl FnMut(&Block, Instant),
+) -> u64 {
+    let ring = c.driver.start_stream(cfg).unwrap();
+    let ch = cfg.channels.clamp(1, 2) as usize;
+    let lines = c.driver.lines(cfg);
+    let peak = cfg.rate.oversample > 1;
+    let mut dec = Decimator::new(cfg.channels, cfg.rate.oversample, 2048);
+    let mut cursor = 0u64;
+    let t0 = Instant::now();
+    while t0.elapsed().as_secs_f64() < secs {
+        ring.wait(ring.frames(), Duration::from_millis(100));
+        assert_eq!(ring.failure(), None, "the stream failed");
+        if ring.overrun() > 0 {
+            break;
+        }
+        let end = ring.written();
+        if end == cursor {
+            continue;
+        }
+        let at = ring.take_marks().last().map_or_else(Instant::now, |m| m.at);
+        let mut b = Block {
+            gen: 0,
+            cfg: *cfg,
+            data: Default::default(),
+            min: Default::default(),
+            max: Default::default(),
+            clipped: [false; 2],
+            range: c.driver.range(cfg),
+            rate: cfg.rate.rate,
+            roll: cfg.roll,
+            trigger: None,
+        };
+        {
+            let (data, min, max) = (&mut b.data, &mut b.min, &mut b.max);
+            let mut out = |c: usize, lo: u8, hi: u8, mean: f64| {
+                let (a, k) = lines[c];
+                data[c].push(a * mean + k);
+                if peak {
+                    min[c].push(a * lo as f64 + k);
+                    max[c].push(a * hi as f64 + k);
+                } else {
+                    min[c].push(a * mean + k);
+                    max[c].push(a * mean + k);
+                }
+            };
+            ring.read_bytes(cursor..end, |x, y| {
+                dec.push(x, &mut out);
+                dec.push(y, &mut out);
+            });
+        }
+        cursor = end;
+        ring.keep_from(end / ch as u64);
+        f(&b, at);
+    }
+    let lost = ring.overrun();
     c.driver.stop().unwrap();
+    lost
 }
 
 /// Seconds for each long hardware run.
@@ -242,12 +308,6 @@ impl Edges {
         }
         self.idx += 1;
     }
-
-    /// Skip `n` samples (a known gap): the next period does not count.
-    fn skip(&mut self, n: u64) {
-        self.idx += n;
-        self.last = None;
-    }
 }
 
 /// The async stream at `rate_id` with `channels`, through the driver:
@@ -270,20 +330,14 @@ fn stream_run(rate_id: u8, channels: u8) {
     // 512 bytes: 256 samples with two channels, 512 with one. So a period
     // off by more than a quarter packet means lost samples.
     let mut edges = Edges::new(raw / 1000.0, 128.0 / channels as f64);
-    let (mut n, mut lost, mut pieces) = (0u64, 0u64, 0u64);
+    let (mut n, mut pieces) = (0u64, 0u64);
     let mut first: Option<Instant> = None;
     let mut last = Instant::now();
     let cpu0 = cpu_secs();
     let t0 = Instant::now();
-    while t0.elapsed().as_secs_f64() < secs {
-        let p = c.driver.stream(&cfg).unwrap();
-        let at = p.at.unwrap();
+    let lost = ring_run(&mut c, &cfg, secs, |p, at| {
         if p.data[0].is_empty() {
-            continue;
-        }
-        if p.lost > 0 {
-            lost += p.lost;
-            edges.skip(p.lost);
+            return;
         }
         for v in &p.data[0] {
             edges.push(*v);
@@ -291,14 +345,13 @@ fn stream_run(rate_id: u8, channels: u8) {
         match first {
             // The first piece sets the time; its samples do not count.
             None => first = Some(at),
-            Some(_) => n += p.data[0].len() as u64 + p.lost,
+            Some(_) => n += p.data[0].len() as u64,
         }
         last = at;
         pieces += 1;
-    }
+    });
     let wall = t0.elapsed().as_secs_f64();
     let cpu = cpu_secs() - cpu0;
-    c.driver.stop().unwrap();
     let span = last.duration_since(first.unwrap()).as_secs_f64();
     let deficit = 1.0 - n as f64 / (span * raw);
     eprintln!(

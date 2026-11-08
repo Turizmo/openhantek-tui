@@ -12,31 +12,6 @@ use crate::stream::pipeline::decimate_block;
 use crate::stream::ring::{Failure, Ring, STREAM_RING};
 use std::sync::Arc;
 
-/// One captured block or piece of a stream, in volts at the BNC.
-#[derive(Clone, Debug, Default)]
-pub struct Captured {
-    /// Samples per channel: the mean of the raw samples of each output
-    /// sample. CH2 is empty in 1-channel mode.
-    pub data: [Vec<f64>; 2],
-    /// Lowest and highest raw sample behind each output sample (the peak
-    /// display). Empty when each output sample is one raw sample: then
-    /// they are `data`.
-    pub min: [Vec<f64>; 2],
-    pub max: [Vec<f64>; 2],
-    /// A raw sample hit 0x00 or 0xFF: the signal is too big for the range.
-    pub clipped: [bool; 2],
-    /// Output samples per second.
-    pub rate: f64,
-    /// Volts at the BNC of the lowest and highest ADC value, per channel:
-    /// what the input can measure at the gain of the capture.
-    pub range: [(f64, f64); 2],
-    /// Samples per channel the host dropped just before this piece of a
-    /// stream (it could not keep up). 0 for blocks.
-    pub lost: u64,
-    /// When a piece of a stream came off the bus. `None` for blocks.
-    pub at: Option<std::time::Instant>,
-}
-
 /// A piece of the stream as raw ADC bytes (the logger bins them itself).
 #[derive(Clone, Debug)]
 pub struct RawPiece {
@@ -53,11 +28,9 @@ pub struct RawPiece {
 /// stable just after sampling starts.
 pub const SKIP_SAMPLES: usize = 2048;
 
-/// The running stream: the settings it was started with and the
-/// decimator of roll mode.
+/// The running stream: the settings it was started with.
 struct Live {
     cfg: HwConfig,
-    dec: Decimator,
     /// Raw path: bytes still to throw away at the start.
     skip_bytes: usize,
 }
@@ -246,7 +219,6 @@ impl<T: Transport> Scope6022<T> {
             let ch = cfg.channels.clamp(1, 2);
             self.stream = Some(Live {
                 cfg: *cfg,
-                dec: Decimator::new(ch, cfg.rate.oversample, SKIP_SAMPLES),
                 skip_bytes: SKIP_SAMPLES * ch as usize,
             });
         }
@@ -341,38 +313,6 @@ impl<T: Transport> Scope6022<T> {
         );
         b.roll = cfg.roll;
         b
-    }
-
-    /// Roll mode: the next piece of the stream (one transfer), decimated
-    /// to the output rate of `cfg`, with min and max per output sample.
-    pub fn stream(&mut self, cfg: &HwConfig) -> Result<Captured> {
-        let chunk = self.next_chunk(cfg)?;
-        let lines = self.lines(cfg);
-        let live = self.stream.as_mut().expect("stream is set");
-        let ch = cfg.channels.clamp(1, 2) as u64;
-        let mut out = Captured {
-            rate: cfg.rate.rate,
-            lost: chunk.lost / ch,
-            at: Some(chunk.at),
-            ..Default::default()
-        };
-        if chunk.lost > 0 {
-            live.dec.reset();
-        }
-        let peak = cfg.rate.oversample > 1;
-        live.dec.clipped = [false; 2];
-        let (data, min, max) = (&mut out.data, &mut out.min, &mut out.max);
-        live.dec.push(&chunk.data, |c, lo, hi, mean| {
-            let (a, b) = lines[c];
-            data[c].push(a * mean + b);
-            if peak {
-                min[c].push(a * lo as f64 + b);
-                max[c].push(a * hi as f64 + b);
-            }
-        });
-        out.clipped = live.dec.clipped;
-        out.range = self.range(cfg);
-        Ok(out)
     }
 
     /// The logger at its end: stop the scope, then give what the stream
@@ -616,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn roll_stream_continues() {
+    fn roll_streams_into_the_ring() {
         let (mut s, fake) = scope([
             Wave::Sine {
                 freq: 1.0,
@@ -627,22 +567,23 @@ mod tests {
         ]);
         let mut c = cfg(1.0, 2, [5, 5]);
         c.roll = true;
-        let mut total = 0;
-        for _ in 0..5 {
-            let piece = s.stream(&c).unwrap();
-            assert_eq!(piece.data[0].len(), piece.data[1].len());
-            assert_eq!(piece.data[0].len(), piece.max[0].len());
-            total += piece.data[0].len();
+        let ring = s.start_stream(&c).unwrap();
+        let t0 = std::time::Instant::now();
+        while ring.written() < 1 << 20 {
+            assert!(t0.elapsed().as_secs() < 10);
+            ring.wait(ring.frames(), Duration::from_millis(50));
         }
-        assert!(total > 400, "total {total}");
         // The transfers were queued before the start command.
         assert!(fake.lock().started_with_stream);
         // The ADC runs at 16 MS/s x 2: 20 ms is 1250 packets, more than
         // the 512 of the biggest transfer; 250 ms is 31 transfers.
         let st = Scope6022::<FakeScope>::stream_setup(&c);
         assert_eq!((st.transfer, st.transfers), (512 * 512, 31));
-        // One start for the whole stream.
+        assert_eq!(ring.take_marks()[0].end, 512 * 512);
+        // The same settings again: the same stream, one start.
+        s.start_stream(&c).unwrap();
         assert_eq!(starts(&fake), 1);
+        s.stop().unwrap();
     }
 
     #[test]
@@ -669,7 +610,7 @@ mod tests {
         let (mut s, fake) = scope([Wave::Dc(0.0); 2]);
         let mut c = cfg(1.0, 2, [5, 5]);
         c.roll = true;
-        s.stream(&c).unwrap();
+        s.start_stream(&c).unwrap();
         assert!(fake.lock().stream.is_some());
         c.roll = false;
         s.capture(&c).unwrap();
