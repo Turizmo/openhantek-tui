@@ -30,7 +30,8 @@ Features:
   calibration file, if you have one (it never writes the EEPROM)
 - Export the screen as CSV or JSON; headless `--measure` mode for scripts
 - Envelope logger (chart recorder): records min, max and mean per time
-  step (2.5 µs to 1 min) without gaps, for hours or days, with a strip
+  step (0.5 µs to 1 min) without gaps, at up to 16 MS/s with both
+  channels or 30 MS/s with CH1 alone, for hours or days, with a strip
   chart log view and CSV export
 - Settings panel (`s`, `Enter` or `F2`) with yazi-style keys: every setting in one place,
   with search and typed values
@@ -458,27 +459,52 @@ the scope view pauses (its title says `● REC: live view paused`);
 changes of volts/div or time/div only change the drawing, and reach the
 scope after the log stops. The log view (`V`) shows the log growing.
 
-**Step and ADC rate.** Steps from 2.5 µs to 1 min in 1-2-5 steps (and
-30 s). The ADC runs at the lowest of 20, 40, 100, 200 or 400 kS/s that
-gives at least 10 samples per step, and never faster than 400 kS/s, the
-rate the scope streams without losing samples. At 2.5 µs the step is one
-sample at 400 kS/s, so only the value is saved (min = max = mean); 5,
-10 and 20 µs have 2, 4 and 8 samples per step.
+**Step and ADC rate.** Steps from 0.5 µs to 1 min in 1-2-5 steps (and
+30 s). The ADC runs at the lowest of 20, 40, 100, 200, 400 and
+500 kS/s, 1, 2, 5, 10, 16 and 30 MS/s that gives at least 10 samples per
+step, and at most at 16 MS/s with both channels sampled. With CH1 alone
+the scope samples only CH1 (1-channel mode) and the ADC goes up to
+30 MS/s; CH2 alone still samples both channels, because the firmware's
+1-channel mode is CH1. At 0.5 µs a step has 8 samples at 16 MS/s with
+both channels, or 15 at 30 MS/s with CH1 alone.
 
-| Step | ADC rate | Samples per step | File size per hour, CH1 + CH2 | one channel |
+The scope streams through many USB transfers in flight at once (an
+async libusb stream, see `src/device/stream.rs`), so its 2 KB buffer
+never overflows. This is gapless up to 32 MB/s: 16 MS/s with both
+channels, 30 MS/s with one. Measured on a DSO-6022BE in a VM on a USB 3
+port: 3 minutes at each, no lost sample (every period of the 1 kHz
+calibration signal checked), with the whole logger using about a third
+of one CPU core and writing 48 MB/s. 24 MS/s with both channels (48 MB/s)
+loses about 0.5 % of the USB packets, so the logger does not use it.
+
+| Step | ADC rate | Samples per step | File size per hour, CH1 + CH2 | CH1 alone |
 |---|---|---|---|---|
-| 2.5 µs | 400 kS/s | 1 | 11.5 GB | 5.8 GB |
-| 10 µs | 400 kS/s | 4 | 8.6 GB | 4.3 GB |
+| 0.5 µs | 16 MS/s (CH1 alone: 30 MS/s) | 8 (15) | 173 GB | 86.4 GB |
+| 1 µs | 10 MS/s | 10 | 86.4 GB | 43.2 GB |
+| 10 µs | 1 MS/s | 10 | 8.6 GB | 4.3 GB |
 | 100 µs | 100 kS/s | 10 | 864 MB | 432 MB |
 | 1 ms | 20 kS/s | 20 | 86.4 MB | 43.2 MB |
 | 1 s | 20 kS/s | 20 000 | 86 kB | 43 kB |
 
-**Gaps.** The thread checks that the samples keep up with the clock. When
-they fall more than 0.3 s behind (the scope lost samples), or the stream
-had to start again (a USB error, the scope unplugged and back), the log
-gets a gap mark and goes on at the right time. Smaller losses add up
-until they reach 0.3 s. The log view draws a gap as a break with a red
-dashed line `┊`; the status line counts them.
+At the fast steps the disk must keep up: 0.5 µs with both channels
+writes 48 MB/s, so a 1 GB limit lasts about 21 s. Older logs with one
+sample per step (2.5 µs at 400 kS/s) still open.
+
+**Gaps.** A log gets a gap mark, and goes on at the right time, when
+samples are lost:
+
+- The PC could not keep up and dropped data (its queue holds about 2 s
+  of data): known exactly, marked at once.
+- The scope lost samples (its buffer overflowed: the time passes, the data
+  never comes). The thread compares the samples with the time each USB
+  transfer arrived: when they stay more than 20 ms plus two transfers
+  (at most about 40 ms) behind for 0.1 s plus four transfers, it marks
+  the missing time. Clock drift up to 0.05 % (500 ppm) is allowed.
+- The stream had to start again (a USB error, the scope unplugged and
+  back): the time without data is the gap.
+
+The log view draws a gap as a break with a red dashed line `┊`; the
+status line counts them.
 
 **Size limit.** Logger › Size limit (`log_limit`, 10 MB to 50 GB, or
 off) is the only limit: the log stops by itself when the file reaches
@@ -528,8 +554,8 @@ channels on/off work as in the scope view (`↑` `↓` `[` `]` `{` `}`
 Past one step per dot column `+` goes on: each step is drawn over 2,
 5, 10, 20 ... dot columns, until about 10 steps fill the screen. Each
 step is then a flat band from its min to its max, and the mean is a
-line through the middles of the steps; logs of single samples (2.5 µs
-to 10 µs steps) have no band, the line joins the samples. Time labels
+line through the middles of the steps; logs of single samples (older
+logs at 2.5 µs) have no band, the line joins the samples. Time labels
 and the `/div` in the status line follow (like `1.1 ms/div`, with an
 extra decimal so the labels keep even steps), cursors sit in the middle
 of their step, and every cursor key (`Alt` too) moves at least one
@@ -547,8 +573,8 @@ is at once (a 2 GB log: 5 s to build, then 0.03 s to open and draw).
 **CSV export.** `E` in the log view, or Logger › Export log CSV / Export
 A–B CSV, writes `openhantek-log-YYYYMMDD-HHMMSS.csv` in the export
 folder. Columns: the time of the start of each step, then
-`ch1_min,ch1_max,ch1_mean,ch2_min,...` for the logged channels (a 2.5 µs
-log has `ch1,ch2`). Logger › CSV time picks `time_utc` (ISO 8601 UTC,
+`ch1_min,ch1_max,ch1_mean,ch2_min,...` for the logged channels (an older
+2.5 µs log of single samples has `ch1,ch2`). Logger › CSV time picks `time_utc` (ISO 8601 UTC,
 like `2026-11-07T18:51:53.613Z`, with as many decimals as the step needs)
 or `time_s` (seconds since the start). Each gap is one row with the
 time where the data stops and empty value cells, like `8.000,,,,,,`, so
@@ -597,7 +623,10 @@ record at the end is ignored).
 - `src/device/`: USB. `protocol.rs` has the vendor requests, sample rates,
   gains and calibration math; `hantek.rs` is the driver; `firmware.rs` and
   `hex.rs` load the firmware; `usb.rs` finds and opens the scope;
-  `fake.rs` is a fake scope that acts like the firmware.
+  `stream.rs` is the async bulk stream (libusb transfers in flight, a
+  thread for the libusb events); `fake.rs` is a fake scope that acts like
+  the firmware, with a model of the stream (bus times, a host queue that
+  drops whole transfers when full, a 40 MB/s link).
 - `src/acquire.rs`: a thread that captures blocks and sends them to the UI.
 - `src/scope.rs`: trigger, averaging, math, roll mode, autoset.
 - `src/dsp/`: trigger search, measurements, FFT, math, interpolation.
@@ -615,8 +644,10 @@ Like OpenHantek6022, it reads 20000 samples per channel per block, throws
 away the first samples after each start (the ADC is not stable yet), and
 averages several ADC samples into one at slow time bases. The fastest rates
 are 24 MS/s for CH1 alone and 12 MS/s with both channels. Roll mode and the
-logger run the ADC at most at 400 kS/s, so the scope buffer does not
-overflow between USB reads.
+logger stream without end: the driver queues 8 to 32 bulk transfers of
+about 20 ms of data each (at most 256 KiB, at most 8 MiB in all, within
+Linux's default 16 MiB `usbfs_memory_mb`) before it starts the scope,
+and keeps them in flight, so the scope's 2 KB buffer never overflows.
 
 ## Tests
 
@@ -624,11 +655,17 @@ overflow between USB reads.
 cargo test                    # unit, end-to-end (fake scope) and UI tests
 OHT_BIG_MB=2000 cargo test --release --test logger big -- --ignored --nocapture
                               # speed of a big log (written to the temp folder)
-cargo test --test hardware -- --ignored --test-threads=1 --nocapture
+cargo test --release --test hardware -- --ignored --test-threads=1 --nocapture
+OHT_HW_SECS=180 cargo test --release --test hardware hw_log -- --ignored --test-threads=1 --nocapture
 ```
 
 The hardware tests need the real scope. With a probe on the calibration
-output they also check the frequency and the voltage.
+output they also check the frequency and the voltage. `hw_stream_*` and
+`hw_log_*` need the CH1 probe on the calibration output: they stream at
+16 MS/s (both channels) and 30 MS/s (CH1) for `OHT_HW_SECS` seconds
+(default 20), through the driver and through the whole logger (a 0.5 µs
+log in the temp folder, deleted afterwards), check every 1 kHz period
+and the sample count against the clock, and print the CPU load.
 
 ## Licence of the firmware
 
