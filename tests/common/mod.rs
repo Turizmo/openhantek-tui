@@ -71,5 +71,6 @@ pub fn block_for(app: &App, d: &mut Driver) -> Block {
         range: cap.range,
         rate: cap.rate,
         roll: cfg.roll,
+        trigger: None,
     }
 }

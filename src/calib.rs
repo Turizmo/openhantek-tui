@@ -260,6 +260,7 @@ mod tests {
             range: [0, 1].map(|c| cal.range(st.gain, c, hs)),
             rate: cfg.rate.rate,
             roll: false,
+            trigger: None,
         }
     }
 

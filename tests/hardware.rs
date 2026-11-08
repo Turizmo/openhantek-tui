@@ -586,6 +586,7 @@ fn blocks_run(channels: u8) {
             range: cap.range,
             rate: cap.rate,
             roll: false,
+            trigger: None,
         };
         scope.push(block);
         n += 1;

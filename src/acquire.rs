@@ -262,6 +262,10 @@ pub struct Block {
     pub rate: f64,
     /// A piece of a roll mode stream: append it, do not trigger.
     pub roll: bool,
+    /// Where the trigger is, as a fractional sample index, when the block
+    /// is a capture around a trigger the stream processing found.
+    /// `None`: look for it in the block.
+    pub trigger: Option<f64>,
 }
 
 pub enum Event {
@@ -473,6 +477,7 @@ impl Worker {
                         range: cap.range,
                         rate: cap.rate,
                         roll: cfg.roll,
+                        trigger: None,
                     };
                     if cfg.roll {
                         // Roll pieces must all arrive, or the trace gets gaps.

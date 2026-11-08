@@ -224,6 +224,26 @@ impl FakeScope {
     pub fn lock(&self) -> std::sync::MutexGuard<'_, FakeState> {
         self.state.lock().unwrap()
     }
+
+    /// `frames` frames of the stream for `cfg`, from a start (with the
+    /// junk at the start), made at once. Tests use it to feed the stream
+    /// processing without a thread.
+    pub fn raw(&self, cfg: &super::protocol::HwConfig, frames: usize) -> Vec<u8> {
+        use super::protocol::{cal_freq_code, coupling_byte, GAIN_BYTE, GAIN_STEPS};
+        let mut s = self.lock();
+        s.rate_id = cfg.rate.id;
+        s.channels = cfg.channels.clamp(1, 2);
+        s.gain_byte = cfg.gains.map(|g| GAIN_BYTE[g.min(GAIN_STEPS - 1)]);
+        s.cal_code = cal_freq_code(cfg.cal_freq);
+        s.coupling = coupling_byte(cfg.dc);
+        s.sampling = true;
+        s.since_start = 0;
+        s.clock = None;
+        let mut buf = vec![0u8; frames * s.channels()];
+        let n = s.fill(&mut buf);
+        buf.truncate(n);
+        buf
+    }
 }
 
 impl FakeState {

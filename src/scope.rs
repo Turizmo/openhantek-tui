@@ -6,17 +6,13 @@ use std::ops::Range;
 
 use crate::acquire::Block;
 use crate::device::protocol::{choose_rate, gain_index, hw_channels, nominal_range, HwConfig};
-use crate::dsp::math::combine;
 use crate::dsp::measure::{measure, Measurements};
 use crate::dsp::trigger::find_trigger;
-use crate::dsp::{Averager, PeakHold};
 use crate::settings::*;
+use crate::stream::pipeline::{self, Averaging, ProcSettings, Roll, MARGIN};
 
 /// Index of the math trace in [`Frame::traces`].
 pub const MATH: usize = 2;
-
-/// Extra samples kept on each side of the screen, for interpolation.
-const MARGIN: usize = 8;
 
 /// Auto mode keeps the last triggered frame this long (seconds of
 /// signal) before it shows untriggered frames.
@@ -129,15 +125,10 @@ pub struct Scope {
     /// Generation of the hardware settings now in use.
     pub gen: u64,
     pub hw: Option<HwConfig>,
-    averagers: [Averager; 3],
-    /// The peak band over the averaged captures, reset with `averagers`.
-    peaks: [PeakHold; 3],
-    /// Roll mode: mean, min and max per channel.
-    roll: [VecDeque<f64>; 2],
-    roll_min: [VecDeque<f64>; 2],
-    roll_max: [VecDeque<f64>; 2],
-    roll_rate: f64,
-    roll_clipped: [bool; 2],
+    /// The average and peak band over the last triggers.
+    avg: Averaging,
+    /// Roll mode: the newest screen of the stream.
+    roll: Roll,
     last_block: Option<Block>,
     autoset: Option<AutosetStep>,
     /// Notices for the message line (autoset results and such).
@@ -151,9 +142,7 @@ pub struct Scope {
     untriggered_secs: f64,
 }
 
-/// How far inside the input range the trigger level goes when the
-/// user's level is outside it: 5 % of the range.
-pub const TRIGGER_INSIDE: f64 = 0.05;
+pub use crate::stream::pipeline::TRIGGER_INSIDE;
 
 impl Scope {
     pub fn new(mut settings: Settings) -> Self {
@@ -166,13 +155,8 @@ impl Scope {
             state: TrigState::Auto,
             gen: 0,
             hw: None,
-            averagers: Default::default(),
-            peaks: Default::default(),
-            roll: Default::default(),
-            roll_min: Default::default(),
-            roll_max: Default::default(),
-            roll_rate: 0.0,
-            roll_clipped: [false; 2],
+            avg: Averaging::default(),
+            roll: Roll::default(),
             last_block: None,
             autoset: None,
             notices: Vec::new(),
@@ -272,24 +256,11 @@ impl Scope {
 
     /// Start the capture average (and its peak band) over.
     fn reset_average(&mut self) {
-        for a in &mut self.averagers {
-            a.reset();
-        }
-        for p in &mut self.peaks {
-            p.reset();
-        }
+        self.avg.reset();
     }
 
     fn clear_roll(&mut self) {
-        for r in self
-            .roll
-            .iter_mut()
-            .chain(&mut self.roll_min)
-            .chain(&mut self.roll_max)
-        {
-            r.clear();
-        }
-        self.roll_clipped = [false; 2];
+        self.roll.clear();
     }
 
     /// Take a new block from the acquisition thread. Returns true when the
@@ -358,26 +329,31 @@ impl Scope {
         Some(data.iter().map(|v| (v - mean) * k).collect())
     }
 
-    /// The peak band of a channel at the probe tip, like
-    /// [`Scope::condition`]: low and high (an inverted channel swaps
-    /// them). A block without min and max has a band as thin as the trace.
-    fn condition_peak(&self, block: &Block, c: usize) -> Option<(Vec<f64>, Vec<f64>)> {
-        let data = &block.data[c];
-        if data.is_empty() {
-            return None;
-        }
-        let (min, max) = if block.min[c].len() == data.len() && block.max[c].len() == data.len()
-        {
-            (&block.min[c], &block.max[c])
+    /// The trigger in a block: a fractional sample index.
+    fn find_trigger(&self, block: &Block, p: &ProcSettings) -> Option<f64> {
+        let s = &self.settings;
+        let (_, pre, post) = p.window(block.rate);
+        let src = s.trigger_source();
+        // The source channel, else the one that was sampled.
+        let src_c = if block.data[src].is_empty() {
+            1 - src
         } else {
-            (data, data)
+            src
         };
-        let ch = &self.settings.channels[c];
-        let k = ch.probe as f64 * if ch.invert { -1.0 } else { 1.0 };
-        let mean = ac_mean(block, ch, c);
-        let lo: Vec<f64> = min.iter().map(|v| (v - mean) * k).collect();
-        let hi: Vec<f64> = max.iter().map(|v| (v - mean) * k).collect();
-        Some(if k < 0.0 { (hi, lo) } else { (lo, hi) })
+        let v = self.condition(block, src_c)?;
+        let vdiv = s.channels[src].volts_per_div();
+        let level = self.effective_trigger_level().unwrap_or(s.trigger.level);
+        let probe = s.channels[src_c].probe as f64;
+        let (lo, hi) = block.range[src_c];
+        let lsb = (hi - lo).abs() / 255.0 * probe;
+        find_trigger(
+            &v,
+            level,
+            s.trigger.slope,
+            hysteresis(vdiv, &v, lsb),
+            pre + MARGIN,
+            v.len().saturating_sub(post + MARGIN),
+        )
     }
 
     fn process(&mut self, block: &Block) -> bool {
@@ -387,122 +363,56 @@ impl Scope {
                 self.ac_mean[c] = ac_mean(block, &self.settings.channels[c], c);
             }
         }
-        let ch = [self.condition(block, 0), self.condition(block, 1)];
-        let pk = [self.condition_peak(block, 0), self.condition_peak(block, 1)];
+        let p = ProcSettings::of(&self.settings, 0);
         if block.roll {
-            return self.process_roll(block, ch, pk);
+            self.roll.push(block, p.screen_time);
+            self.frame = Some(self.roll.frame(&p));
+            self.state = TrigState::Roll;
+            return true;
         }
-        let s = &self.settings;
-        let rate = block.rate;
-        let dt = 1.0 / rate;
-        let d = ((s.screen_time() * rate).round() as usize).max(2);
-        let pre = (s.trigger.position * d as f64).round() as usize;
-        let post = d - pre;
-        let src = s.trigger_source();
-        // The source channel, else the one that was sampled.
-        let src_c = if ch[src].is_some() { src } else { 1 - src };
-        let src_samples = ch[src_c].as_deref();
-        let len = src_samples.map_or(0, |v| v.len());
-        let vdiv = s.channels[src].volts_per_div();
-        let level = self.effective_trigger_level().unwrap_or(s.trigger.level);
-        let trig = src_samples.and_then(|v| {
-            let probe = s.channels[src_c].probe as f64;
-            let (lo, hi) = block.range[src_c];
-            let lsb = (hi - lo).abs() / 255.0 * probe;
-            find_trigger(
-                v,
-                level,
-                s.trigger.slope,
-                hysteresis(vdiv, v, lsb),
-                pre + MARGIN,
-                len.saturating_sub(post + MARGIN),
-            )
-        });
-        let depth = s.display.averaging;
-        // Averaged captures are moved by their sub-sample trigger offset
-        // first, so the edge sits at the same place in each one.
-        let mut frac = 0.0;
-        let (start, t0, triggered) = match trig {
-            Some(t) => {
-                self.untriggered_secs = 0.0;
-                let tf = t.floor();
-                let start = (tf as usize).saturating_sub(pre + MARGIN);
-                if depth > 1 {
-                    frac = t - tf;
-                    (start, (start as f64 - tf) * dt, true)
-                } else {
-                    (start, (start as f64 - t) * dt, true)
-                }
-            }
-            None if s.trigger.mode == TriggerMode::Auto => {
+        let trig = block.trigger.or_else(|| self.find_trigger(block, &p));
+        match trig {
+            Some(_) => self.untriggered_secs = 0.0,
+            None if p.mode == TriggerMode::Auto => {
                 // Keep the last triggered frame for a while: a block can
                 // miss the edge (a block shorter than the signal period).
-                self.untriggered_secs += len as f64 * dt;
+                let len = block.data.iter().map(|d| d.len()).max().unwrap_or(0);
+                self.untriggered_secs += len as f64 / block.rate;
                 let holding = self.frame.as_ref().is_some_and(|f| f.triggered && !f.roll);
                 if holding && self.untriggered_secs < AUTO_TIMEOUT {
                     return false;
                 }
-                // No trigger: show the start of the block as if it triggered there.
-                (0, -((pre + MARGIN) as f64) * dt, false)
             }
             None => {
                 self.state = TrigState::Waiting;
                 return false;
             }
-        };
-        let end = start + d + 2 * MARGIN + 1;
-        let cut = |v: &[f64]| -> Vec<f64> { shift(v, start, end, frac, Shift::Line) };
-        let mut traces = [
-            ch[0].as_deref().map(cut),
-            ch[1].as_deref().map(cut),
-            None,
-        ];
-        let band = |c: usize| {
-            // A block without min and max has a band as thin as the
-            // trace; else the moved band holds both neighbours.
-            let raw = block.min[c].len() == block.data[c].len()
-                && block.max[c].len() == block.data[c].len();
-            let (lo, hi) = if raw {
-                (Shift::Min, Shift::Max)
-            } else {
-                (Shift::Line, Shift::Line)
-            };
-            pk[c].as_ref().map(|(a, b)| {
-                (
-                    shift(a, start, end, frac, lo),
-                    shift(b, start, end, frac, hi),
-                )
-            })
-        };
-        let mut peak = [band(0), band(1), None];
-        for i in 0..2 {
-            if let Some(t) = &mut traces[i] {
-                if !triggered {
-                    // An untriggered frame is not averaged and leaves the
-                    // average as it is.
-                } else if depth > 1 {
-                    *t = self.averagers[i].push(t, depth);
-                    if let Some((lo, hi)) = &mut peak[i] {
-                        (*lo, *hi) = self.peaks[i].push(lo, hi, depth);
-                    }
-                } else {
-                    self.averagers[i].reset();
-                    self.peaks[i].reset();
-                }
-            }
         }
-        traces[MATH] = self.math_trace(&traces);
-        peak[MATH] = self.math_peak(&traces, &peak);
-        let frame = Frame {
-            traces,
-            peak,
-            dt,
-            t0,
-            triggered,
-            roll: false,
-            clipped: block.clipped,
-            rate,
+        let ac = [0, 1].map(|c| ac_mean(block, &self.settings.channels[c], c));
+        let cut = pipeline::cut(block, &p, ac, trig);
+        let depth = p.averaging;
+        let shown = if !cut.triggered {
+            // An untriggered frame is not averaged and leaves the
+            // average as it is.
+            cut
+        } else if depth > 1 {
+            self.avg.add(&cut, depth);
+            self.avg.value(&cut, depth)
+        } else {
+            self.avg.reset();
+            cut
         };
+        let triggered = shown.triggered;
+        let frame = pipeline::frame(
+            &p,
+            shown.traces,
+            shown.peak,
+            block.rate,
+            shown.t0,
+            triggered,
+            false,
+            block.clipped,
+        );
         self.set_frame(frame);
         self.state = if triggered {
             TrigState::Triggered
@@ -513,113 +423,6 @@ impl Scope {
             self.running = false;
             self.state = TrigState::Stopped;
         }
-        true
-    }
-
-    fn math_trace(&self, traces: &[Option<Vec<f64>>; 3]) -> Option<Vec<f64>> {
-        let m = &self.settings.math;
-        if !m.enabled {
-            return None;
-        }
-        let empty = Vec::new();
-        let a = traces[0].as_ref().unwrap_or(&empty);
-        let b = traces[1].as_ref().unwrap_or(&empty);
-        if (m.mode.uses_ch1() && a.is_empty()) || (m.mode.uses_ch2() && b.is_empty()) {
-            return None;
-        }
-        Some(combine(m.mode, a, b))
-    }
-
-    /// The peak band of the math trace from the bands of CH1 and CH2, by
-    /// interval arithmetic (a band that holds every value the function
-    /// can take there). Division gets no band (the line only).
-    fn math_peak(
-        &self,
-        traces: &[Option<Vec<f64>>; 3],
-        peak: &[Option<(Vec<f64>, Vec<f64>)>; 3],
-    ) -> Option<(Vec<f64>, Vec<f64>)> {
-        use crate::dsp::math::MathMode::*;
-        let m = &self.settings.math;
-        let line = traces[MATH].as_ref()?;
-        let empty = (Vec::new(), Vec::new());
-        let (al, ah) = peak[0].as_ref().unwrap_or(&empty);
-        let (bl, bh) = peak[1].as_ref().unwrap_or(&empty);
-        let n = line.len();
-        let get = |v: &Vec<f64>, i: usize| v.get(i).copied().unwrap_or(f64::NAN);
-        let band = |f: &dyn Fn(f64, f64, f64, f64) -> (f64, f64)| {
-            let (lo, hi): (Vec<f64>, Vec<f64>) = (0..n)
-                .map(|i| f(get(al, i), get(ah, i), get(bl, i), get(bh, i)))
-                .unzip();
-            Some((lo, hi))
-        };
-        match m.mode {
-            Add => band(&|al, ah, bl, bh| (al + bl, ah + bh)),
-            Sub => band(&|al, ah, bl, bh| (al - bh, ah - bl)),
-            SubRev => band(&|al, ah, bl, bh| (bl - ah, bh - al)),
-            Avg => band(&|al, ah, bl, bh| ((al + bl) / 2.0, (ah + bh) / 2.0)),
-            NegCh1 => band(&|al, ah, _, _| (-ah, -al)),
-            NegCh2 => band(&|_, _, bl, bh| (-bh, -bl)),
-            Mul => band(&|al, ah, bl, bh| {
-                let p = [al * bl, al * bh, ah * bl, ah * bh];
-                (
-                    p.iter().copied().fold(f64::INFINITY, f64::min),
-                    p.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                )
-            }),
-            _ => Some((line.clone(), line.clone())),
-        }
-    }
-
-    fn process_roll(
-        &mut self,
-        block: &Block,
-        ch: [Option<Vec<f64>>; 2],
-        pk: [Option<(Vec<f64>, Vec<f64>)>; 2],
-    ) -> bool {
-        let rate = block.rate;
-        if (rate - self.roll_rate).abs() > 1e-9 {
-            self.clear_roll();
-            self.roll_rate = rate;
-        }
-        let keep = (self.settings.screen_time() * rate).ceil() as usize + 1;
-        for (c, data) in ch.iter().enumerate() {
-            if let (Some(d), Some((lo, hi))) = (data, &pk[c]) {
-                for (buf, v) in [
-                    (&mut self.roll[c], d),
-                    (&mut self.roll_min[c], lo),
-                    (&mut self.roll_max[c], hi),
-                ] {
-                    buf.extend(v.iter().copied());
-                    while buf.len() > keep {
-                        buf.pop_front();
-                    }
-                }
-            }
-            self.roll_clipped[c] |= block.clipped[c];
-        }
-        let all = |b: &VecDeque<f64>| b.iter().copied().collect::<Vec<f64>>();
-        let [a, b] = [0, 1].map(|c| (!self.roll[c].is_empty()).then(|| all(&self.roll[c])));
-        let n = a.as_ref().or(b.as_ref()).map_or(0, |v| v.len());
-        let mut full: [Option<Vec<f64>>; 3] = [a, b, None];
-        full[MATH] = self.math_trace(&full);
-        let band = |c: usize| {
-            (!self.roll[c].is_empty()).then(|| (all(&self.roll_min[c]), all(&self.roll_max[c])))
-        };
-        let mut peak = [band(0), band(1), None];
-        peak[MATH] = self.math_peak(&full, &peak);
-        let dt = 1.0 / rate;
-        let frame = Frame {
-            traces: full,
-            peak,
-            dt,
-            t0: -(n.saturating_sub(1) as f64) * dt,
-            triggered: false,
-            roll: true,
-            clipped: self.roll_clipped,
-            rate,
-        };
-        self.frame = Some(frame);
-        self.state = TrigState::Roll;
         true
     }
 
@@ -752,37 +555,6 @@ fn hysteresis(vdiv: f64, samples: &[f64], lsb: f64) -> f64 {
     (0.1 * vdiv).min((0.25 * pp).max(2.0 * lsb))
 }
 
-#[derive(Clone, Copy)]
-enum Shift {
-    /// Straight line between the two neighbours.
-    Line,
-    /// The lower of the two neighbours (a band minimum).
-    Min,
-    /// The higher of the two neighbours (a band maximum).
-    Max,
-}
-
-/// `v[start..end]`, moved `frac` (0 .. 1) of a sample later in the
-/// signal: point j is at `start + j + frac`. Past the end it repeats the
-/// last sample.
-fn shift(v: &[f64], start: usize, end: usize, frac: f64, how: Shift) -> Vec<f64> {
-    let end = end.min(v.len());
-    let start = start.min(end);
-    if frac <= 0.0 {
-        return v[start..end].to_vec();
-    }
-    (start..end)
-        .map(|i| {
-            let (a, b) = (v[i], v[(i + 1).min(v.len() - 1)]);
-            match how {
-                Shift::Line => a + (b - a) * frac,
-                Shift::Min => a.min(b),
-                Shift::Max => a.max(b),
-            }
-        })
-        .collect()
-}
-
 /// The mean AC coupling takes away from channel `c` of a block (0 for DC
 /// and in roll mode).
 fn ac_mean(block: &Block, ch: &ChannelSettings, c: usize) -> f64 {
@@ -807,6 +579,7 @@ mod tests {
     use super::*;
     use crate::dsp::math::MathMode;
     use crate::dsp::trigger::Slope;
+    use crate::stream::pipeline::{shift, Shift};
 
     fn sine_block(gen: u64, rate: f64, freq: f64, amp: f64, phase: f64) -> Block {
         let n = 20_000;
@@ -827,6 +600,7 @@ mod tests {
             range: nominal_range(&cfg),
             rate,
             roll: false,
+            trigger: None,
         }
     }
 
@@ -1133,6 +907,7 @@ mod tests {
             range: nominal_range(&cfg),
             rate: cfg.rate.rate,
             roll: true,
+            trigger: None,
         };
         s.push(piece);
         let f = s.frame.as_ref().unwrap();
@@ -1169,6 +944,7 @@ mod tests {
             range,
             rate,
             roll: false,
+            trigger: None,
         }
     }
 
@@ -1238,6 +1014,7 @@ mod tests {
             range: nominal_range(&cfg),
             rate,
             roll: true,
+            trigger: None,
         };
         for k in 0..20 {
             s.push(piece(k));
@@ -1390,6 +1167,7 @@ mod tests {
                 range,
                 rate,
                 roll: false,
+                trigger: None,
             }
         }
     }
@@ -1488,7 +1266,7 @@ mod tests {
             assert!(trig > 150, "{trig}");
             assert!(sd < 10.0 && big < 60.0, "avg {avg}: sd {sd} ns, max {big} ns");
             if avg == 64 {
-                assert!(s.averagers[0].count() > 32, "{}", s.averagers[0].count());
+                assert!(s.avg.count() > 32, "{}", s.avg.count());
             }
         }
     }
@@ -1514,7 +1292,7 @@ mod tests {
         // 20000 samples at 1 MS/s: 20 ms per block.
         assert!(s.push(sine_block(1, 1e6, 1000.0, 2.0, 1.0)));
         assert!(s.push(sine_block(1, 1e6, 1000.0, 2.0, 1.0)));
-        assert_eq!(s.averagers[0].count(), 2);
+        assert_eq!(s.avg.count(), 2);
         let flat = |s: &Scope| {
             let mut b = sine_block(s.gen, 1e6, 1000.0, 0.0, 0.0);
             b.cfg = s.hw.unwrap();
@@ -1531,9 +1309,9 @@ mod tests {
         assert_eq!(s.state, TrigState::Auto);
         assert!(s.push(flat(&s)));
         // The untriggered frames left the average alone.
-        assert_eq!(s.averagers[0].count(), 2);
+        assert_eq!(s.avg.count(), 2);
         assert!(s.push(sine_block(1, 1e6, 1000.0, 2.0, 1.0)));
-        assert_eq!(s.averagers[0].count(), 3);
+        assert_eq!(s.avg.count(), 3);
         assert!(s.frame.as_ref().unwrap().triggered);
     }
 

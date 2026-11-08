@@ -52,42 +52,84 @@ fn lanczos(x: f64, a: f64) -> f64 {
     }
 }
 
-/// Running average of many captures, sample by sample. Noise goes down by
+/// Average of the last captures, sample by sample: a true sliding
+/// window over the last `depth` captures (triggers). Noise goes down by
 /// the square root of the count.
 #[derive(Clone, Debug, Default)]
 pub struct Averager {
+    /// The captures in the average, oldest first.
+    window: std::collections::VecDeque<Vec<f64>>,
     sum: Vec<f64>,
-    count: usize,
+    /// Captures added since the sum was last made from scratch (rounding
+    /// errors of the running sum stay small).
+    since_sum: usize,
 }
 
 impl Averager {
     pub fn reset(&mut self) {
+        self.window.clear();
         self.sum.clear();
-        self.count = 0;
+        self.since_sum = 0;
     }
 
-    /// Add one capture and return the average. With `depth` captures in the
-    /// average, it acts like an exponential moving average after that.
-    pub fn push(&mut self, samples: &[f64], depth: usize) -> Vec<f64> {
+    /// Add one capture. With `depth` 1 or less there is no average (the
+    /// count stays 0). A new length starts over.
+    pub fn add(&mut self, samples: &[f64], depth: usize) {
         if depth <= 1 {
             self.reset();
-            return samples.to_vec();
+            return;
         }
         if self.sum.len() != samples.len() {
-            self.sum = samples.to_vec();
-            self.count = 1;
-            return samples.to_vec();
+            self.reset();
+            self.sum = vec![0.0; samples.len()];
         }
-        self.count = (self.count + 1).min(depth);
-        let k = 1.0 / self.count as f64;
-        for (a, v) in self.sum.iter_mut().zip(samples) {
-            *a += (v - *a) * k;
+        let mut old = None;
+        while self.window.len() >= depth {
+            old = self.window.pop_front();
+            let o = old.as_ref().expect("popped");
+            for (a, v) in self.sum.iter_mut().zip(o) {
+                *a -= v;
+            }
         }
-        self.sum.clone()
+        let mut buf = old.unwrap_or_default();
+        buf.clear();
+        buf.extend_from_slice(samples);
+        for (a, v) in self.sum.iter_mut().zip(&buf) {
+            *a += v;
+        }
+        self.window.push_back(buf);
+        self.since_sum += 1;
+        if self.since_sum >= depth.max(64) {
+            self.since_sum = 0;
+            self.sum.fill(0.0);
+            for w in &self.window {
+                for (a, v) in self.sum.iter_mut().zip(w) {
+                    *a += v;
+                }
+            }
+        }
     }
 
+    /// The average of the captures in the window (empty with none).
+    pub fn value(&self) -> Vec<f64> {
+        let k = 1.0 / self.window.len().max(1) as f64;
+        self.sum.iter().map(|a| a * k).collect()
+    }
+
+    /// Add one capture and return the average (the capture itself with
+    /// `depth` 1 or less).
+    pub fn push(&mut self, samples: &[f64], depth: usize) -> Vec<f64> {
+        self.add(samples, depth);
+        if depth <= 1 {
+            samples.to_vec()
+        } else {
+            self.value()
+        }
+    }
+
+    /// Captures in the average.
     pub fn count(&self) -> usize {
-        self.count
+        self.window.len()
     }
 }
 
@@ -107,22 +149,35 @@ impl PeakHold {
         self.window.clear();
     }
 
-    /// Add the min and max of one capture; return the min and max over
-    /// the last `depth` captures. A new length starts over.
-    pub fn push(&mut self, min: &[f64], max: &[f64], depth: usize) -> (Vec<f64>, Vec<f64>) {
+    /// Add the min and max of one capture. A new length starts over;
+    /// `depth` 1 or less keeps nothing.
+    pub fn add(&mut self, min: &[f64], max: &[f64], depth: usize) {
         if depth <= 1 {
             self.reset();
-            return (min.to_vec(), max.to_vec());
+            return;
         }
         if self.window.front().is_some_and(|w| w.0.len() != min.len()) {
             self.reset();
         }
+        let mut old = None;
         while self.window.len() >= depth {
-            self.window.pop_front();
+            old = self.window.pop_front();
         }
-        self.window.push_back((min.to_vec(), max.to_vec()));
-        let mut lo = min.to_vec();
-        let mut hi = max.to_vec();
+        let (mut lo, mut hi) = old.unwrap_or_default();
+        lo.clear();
+        lo.extend_from_slice(min);
+        hi.clear();
+        hi.extend_from_slice(max);
+        self.window.push_back((lo, hi));
+    }
+
+    /// The min and max over the window.
+    pub fn value(&self) -> (Vec<f64>, Vec<f64>) {
+        let Some((l0, h0)) = self.window.back() else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut lo = l0.clone();
+        let mut hi = h0.clone();
         for (a, b) in &self.window {
             for (l, v) in lo.iter_mut().zip(a) {
                 *l = l.min(*v);
@@ -132,6 +187,17 @@ impl PeakHold {
             }
         }
         (lo, hi)
+    }
+
+    /// Add the min and max of one capture; return the min and max over
+    /// the last `depth` captures.
+    pub fn push(&mut self, min: &[f64], max: &[f64], depth: usize) -> (Vec<f64>, Vec<f64>) {
+        self.add(min, max, depth);
+        if depth <= 1 {
+            (min.to_vec(), max.to_vec())
+        } else {
+            self.value()
+        }
     }
 
     /// Captures in the window.
@@ -186,6 +252,26 @@ mod tests {
         // Depth 1 means no averaging.
         assert_eq!(avg.push(&[7.0], 1), vec![7.0]);
         assert_eq!(avg.count(), 0);
+    }
+
+    #[test]
+    fn averager_is_the_mean_of_the_last_captures() {
+        let mut avg = Averager::default();
+        for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
+            avg.push(&[v], 3);
+        }
+        // The last 3 only: 3, 4 and 5.
+        assert_eq!(avg.value(), vec![4.0]);
+        assert_eq!(avg.count(), 3);
+        // Many captures: the running sum does not drift.
+        for i in 0..10_000 {
+            avg.add(&[0.1 * (i % 7) as f64], 64);
+        }
+        let want = (10_000 - 64..10_000)
+            .map(|i| 0.1 * (i % 7) as f64)
+            .sum::<f64>()
+            / 64.0;
+        assert!((avg.value()[0] - want).abs() < 1e-12);
     }
 
     #[test]
