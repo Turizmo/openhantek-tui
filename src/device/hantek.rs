@@ -149,13 +149,15 @@ impl<T: Transport> Scope6022<T> {
 
     /// Sizes of the async stream for `cfg`: transfers of about 20 ms of
     /// data (one 512 B packet to 256 KiB), enough of them for about
-    /// 250 ms (8 to 32), so at most 8 MiB in flight (Linux allows 16 MiB
-    /// by default, `usbfs_memory_mb`).
+    /// 470 ms (8 to 56), so at most 14 MiB in flight (Linux allows 16 MiB
+    /// by default, `usbfs_memory_mb`). The queue rides out a PC that does
+    /// not take the transfers for a while: a disk flush in a VM stalled
+    /// the USB completions for up to 300 ms.
     pub fn stream_setup(cfg: &HwConfig) -> StreamSetup {
         let byte_rate = cfg.rate.raw * cfg.channels.clamp(1, 2) as f64;
         let packets = (byte_rate * 0.02 / PACKET_SIZE as f64).ceil() as usize;
         let transfer = packets.clamp(1, 512) * PACKET_SIZE;
-        let transfers = ((byte_rate * 0.25 / transfer as f64).ceil() as usize).clamp(8, 32);
+        let transfers = ((byte_rate * 0.47 / transfer as f64).ceil() as usize).clamp(8, 56);
         StreamSetup {
             endpoint: EP_BULK_IN,
             transfer,
@@ -166,6 +168,12 @@ impl<T: Transport> Scope6022<T> {
     /// Seconds of data in one stream transfer.
     pub fn transfer_secs(cfg: &HwConfig) -> f64 {
         Self::stream_setup(cfg).transfer as f64 / (cfg.rate.raw * cfg.channels.clamp(1, 2) as f64)
+    }
+
+    /// Seconds of data in all the stream transfers in flight.
+    pub fn queue_secs(cfg: &HwConfig) -> f64 {
+        let st = Self::stream_setup(cfg);
+        (st.transfer * st.transfers) as f64 / (cfg.rate.raw * cfg.channels.clamp(1, 2) as f64)
     }
 
     /// Use `ring` for the streams from now on (else the first stream
@@ -496,9 +504,9 @@ mod tests {
         // The transfers were queued before the start command.
         assert!(fake.lock().started_with_stream);
         // The ADC runs at 16 MS/s x 2: 20 ms is 1250 packets, more than
-        // the 512 of the biggest transfer; 250 ms is 31 transfers.
+        // the 512 of the biggest transfer; 470 ms is 56 transfers (14 MiB).
         let st = Scope6022::<FakeScope>::stream_setup(&c);
-        assert_eq!((st.transfer, st.transfers), (512 * 512, 31));
+        assert_eq!((st.transfer, st.transfers), (512 * 512, 56));
         assert_eq!(ring.take_marks()[0].end, 512 * 512);
         // The same settings again: the same stream, one start.
         s.start_stream(&c).unwrap();
@@ -518,10 +526,11 @@ mod tests {
             };
             let st = Scope6022::<FakeScope>::stream_setup(&c);
             assert_eq!(st.transfer % PACKET_SIZE, 0);
-            assert!(st.transfer * st.transfers <= 8 << 20, "{st:?}");
-            // At least about 200 ms of data in flight, or 8 transfers.
+            assert!(st.transfer * st.transfers <= 14 << 20, "{st:?}");
+            // At least about 450 ms of data in flight, or 8 transfers.
             let secs = (st.transfer * st.transfers) as f64 / (c.rate.raw * ch as f64);
-            assert!(secs > 0.2 || st.transfers == 8, "{st:?}");
+            assert!(secs > 0.45 || st.transfers == 8, "{st:?}");
+            assert_eq!(secs, Scope6022::<FakeScope>::queue_secs(&c));
         }
     }
 

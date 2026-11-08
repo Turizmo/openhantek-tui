@@ -817,8 +817,8 @@ record at the end is ignored).
   settings panel model.
 
 **One stream for every mode.** The scope always streams: the driver
-queues 8 to 32 bulk transfers of about 20 ms of data each (at most
-256 KiB, at most 8 MiB in all, within Linux's default 16 MiB
+queues 8 to 56 bulk transfers of about 20 ms of data each (at most
+256 KiB, about 470 ms and at most 14 MiB in all, within Linux's default 16 MiB
 `usbfs_memory_mb`) before it starts the scope, and keeps them in flight,
 so the scope's 2 KB buffer never overflows. The ADC runs at the top rate
 the max ADC rate allows; a time base that needs fewer samples gets them
