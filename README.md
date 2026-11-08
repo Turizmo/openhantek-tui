@@ -13,6 +13,10 @@ Features:
   (AC is done in software; a scope with the AC hardware mod also gets the
   hardware command)
 - 20 ns/div to 10 s/div, roll mode from 100 ms/div
+- The ADC always streams at its top clean rate (16 MS/s with both
+  channels, 30 MS/s with CH1 alone) through an async USB stream, in every
+  mode; slower time bases average its samples, and a Max ADC rate
+  setting caps it
 - Software trigger: Auto / Normal / Single, rising / falling / both edges,
   CH1 or CH2, level and position, with hysteresis against noise
 - Measurements: Vpp, max, min, mean, RMS, AC RMS, amplitude, top, base,
@@ -24,15 +28,19 @@ Features:
   windows, in dBV, with peak readout and zoom
 - XY mode
 - Averaging, persistence (old traces fade by age), sin(x)/x interpolation
+- Trace mode: the mean as a line, the peak area (the lowest to the
+  highest ADC sample behind each point, also over the averaged captures),
+  or both
 - Autoset
 - Calibration output frequency from 32 Hz to 100 kHz
 - Uses the calibration in the scope EEPROM and the OpenHantek6022
   calibration file, if you have one (it never writes the EEPROM)
 - Export the screen as CSV or JSON; headless `--measure` mode for scripts
 - Envelope logger (chart recorder): records min, max and mean per time
-  step (0.5 µs to 1 min) without gaps, at up to 16 MS/s with both
+  step (0.5 µs to 1 min) without gaps, from the ADC at 16 MS/s with both
   channels or 30 MS/s with CH1 alone, for hours or days, with a strip
-  chart log view and CSV export
+  chart log view and CSV export; or raw: every ADC sample (62.5 ns or
+  33.3 ns steps)
 - Settings panel (`s`, `Enter` or `F2`) with yazi-style keys: every setting in one place,
   with search and typed values
 - Clean braille plot: whole cells per division, so the grid lines up, and
@@ -153,6 +161,7 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `A` | averaging: 1 2 4 8 16 32 64 |
 | `P` | persistence: 0 2 4 8 16 traces |
 | `d` | dots / lines |
+| `D` | trace mode: average / peak (min..max area) / both |
 | `z` | sin(x)/x / linear interpolation |
 | `g` `G` | calibration output frequency up / down |
 | `E` | export the screen as CSV |
@@ -308,7 +317,8 @@ nearest one. Settings with a fixed list (volts/div, styles, averaging)
 keep the list.
 
 The panel is only as high as its longest column needs: the 13
-categories, the most settings in any category, or the longest list of
+categories (Channel 1, Channel 2, Math, Trigger, Acquisition (time/div,
+roll, max ADC rate, run/stop, autoset), Display, ...), the most settings in any category, or the longest list of
 values, plus the title, the help line and the key hints (16 rows). It is
 worked out over all settings, not the one under the cursor, so it never
 changes size while you move. Value lists longer than 20 rows (time/div)
@@ -350,6 +360,38 @@ time view and the spectrum:
 | `braille bold` | one dot run per column, two dots thick |
 | `ascii lines` | no braille, for fonts that draw it badly: one character per cell, `\|` on steep runs, `/` and `\` on slopes, `_` `-` `‾` for flat parts at the bottom, middle or top of the cell; dots mode puts `.` `·` `'` per sample |
 | `box lines` | no braille: one connected line of box-drawing characters, which the terminal joins cell to cell. `─` for flat runs at the level of the cell row, `│` for steep runs and noise, `╭` `╮` `╰` `╯` where the line turns, `╵` `╷` where a run stops in a cell; dots mode puts `•` per sample |
+
+**Trace mode** (Display › Trace mode, `D`, `display.trace_mode`). Each
+point of a trace is made from many ADC samples at slow time bases (the
+ADC always runs at its top rate; at 1 ms/div 16 of them make one point
+of 1 MS/s), and Display › Averaging averages captures on top of that.
+
+| Mode | Look |
+|---|---|
+| `average` (default) | the mean of those samples as a line, as before |
+| `peak` | the area from the lowest to the highest ADC sample behind each point, in the trace colour: a glitch shorter than a point still shows |
+| `average + peak` | the mean as a bright line over the peak area, muted |
+
+The peak area keeps the absolute extremes: per point the lowest and the
+highest raw sample, and with averaging on, the lowest and highest of the
+last N captures (N = the averaging depth, a sliding window; never an
+average of minima or maxima). It starts over when the average does. With
+one ADC sample per point (the fastest time bases) the area is as thin as
+the line. The braille styles fill it with dots (on the line's cells, so
+it has no holes), box lines with `░` and ascii lines with `:`, under all
+trace lines; old traces of the persistence draw their area in their
+faded colour. The math trace's area holds every value the function can
+take from the two areas (division has none). Measurements, cursors, the
+trigger, FFT and export use the mean.
+
+**Max ADC rate** (Acquisition › Max ADC rate, `acquisition.max_adc_rate`
+in S/s with both channels). The ADC rate in every mode (blocks, roll mode
+and the logger): `16 MS/s · CH1 alone 30 MS/s` (default), `12 MS/s · CH1
+alone 24 MS/s`, then `10 MS/s`, `5 MS/s`, `2 MS/s`, `1 MS/s`, `500 kS/s`,
+`400 kS/s` for both. Lower it if the USB link loses data (gaps in logs,
+`USB timeout`). Below 1 MS/s both channels are always sampled. The
+fastest time bases then show the capped rate; the logger's steps and
+its raw step follow (Device › Sample rate shows `1 MS/s (ADC 16 MS/s)`).
 
 Dots (`d`), persistence (`P`) and interpolation
 (`z`) work with every style. Settings files from older versions still
@@ -454,41 +496,74 @@ applied; the log is always DC). Press `r` to start and `r` again to stop
 (or Logger › Record in the settings panel). The log uses the volts/div
 (the input range), probe and channels set at the start.
 
-While it records, the scope streams at the ADC rate the logger needs and
+While it records, the scope streams for the logger and
 the scope view pauses (its title says `● REC: live view paused`);
 changes of volts/div or time/div only change the drawing, and reach the
 scope after the log stops. The log view (`V`) shows the log growing.
 
 **Step and ADC rate.** Steps from 0.5 µs to 1 min in 1-2-5 steps (and
-30 s). The ADC runs at the lowest of 20, 40, 100, 200, 400 and
-500 kS/s, 1, 2, 5, 10, 16 and 30 MS/s that gives at least 10 samples per
-step, and at most at 16 MS/s with both channels sampled. With CH1 alone
-the scope samples only CH1 (1-channel mode) and the ADC goes up to
-30 MS/s; CH2 alone still samples both channels, because the firmware's
-1-channel mode is CH1. At 0.5 µs a step has 8 samples at 16 MS/s with
-both channels, or 15 at 30 MS/s with CH1 alone.
+30 s), and the raw step. The ADC always runs at the top rate the Max
+ADC rate setting allows: 16 MS/s with both channels sampled, 30 MS/s
+with CH1 alone (the scope samples only CH1, 1-channel mode). CH2 alone
+still samples both channels, because the firmware's 1-channel mode is
+CH1. So each step's min and max are over every ADC sample in it: at
+1 ms a step has 16 000 samples, a glitch of 62.5 ns shows. At 0.5 µs a
+step has 8 samples (15 with CH1 alone). The logger bins the samples in
+ADC counts and turns only each record into volts (the calibration is a
+straight line), so this costs about a fifth of one CPU core at 32 MB/s.
+With a lower max ADC rate a step that is not a whole number of samples
+(0.5 µs at 400 kS/s) is not offered, and a saved one uses the next step
+that is.
 
 The scope streams through many USB transfers in flight at once (an
 async libusb stream, see `src/device/stream.rs`), so its 2 KB buffer
 never overflows. This is gapless up to 32 MB/s: 16 MS/s with both
 channels, 30 MS/s with one. Measured on a DSO-6022BE in a VM on a USB 3
 port: 3 minutes at each, no lost sample (every period of the 1 kHz
-calibration signal checked), with the whole logger using about a third
+calibration signal checked), with the whole logger using about a fifth
 of one CPU core and writing 48 MB/s. 24 MS/s with both channels (48 MB/s)
-loses about 0.5 % of the USB packets, so the logger does not use it.
+loses about 0.5 % of the USB packets, so it is not offered.
 
-| Step | ADC rate | Samples per step | File size per hour, CH1 + CH2 | CH1 alone |
-|---|---|---|---|---|
-| 0.5 µs | 16 MS/s (CH1 alone: 30 MS/s) | 8 (15) | 173 GB | 86.4 GB |
-| 1 µs | 10 MS/s | 10 | 86.4 GB | 43.2 GB |
-| 10 µs | 1 MS/s | 10 | 8.6 GB | 4.3 GB |
-| 100 µs | 100 kS/s | 10 | 864 MB | 432 MB |
-| 1 ms | 20 kS/s | 20 | 86.4 MB | 43.2 MB |
-| 1 s | 20 kS/s | 20 000 | 86 kB | 43 kB |
+| Step | Samples per step (CH1 alone) | File size per hour, CH1 + CH2 | CH1 alone |
+|---|---|---|---|
+| raw | 1 (62.5 ns; CH1 alone 33.3 ns) | 115 GB (32 MB/s) | 108 GB (30 MB/s) |
+| 0.5 µs | 8 (15) | 173 GB | 86.4 GB |
+| 1 µs | 16 (30) | 86.4 GB | 43.2 GB |
+| 10 µs | 160 (300) | 8.6 GB | 4.3 GB |
+| 100 µs | 1600 (3000) | 864 MB | 432 MB |
+| 1 ms | 16 000 (30 000) | 86.4 MB | 43.2 MB |
+| 1 s | 16 M (30 M) | 86 kB | 43 kB |
 
 At the fast steps the disk must keep up: 0.5 µs with both channels
 writes 48 MB/s, so a 1 GB limit lasts about 21 s. Older logs with one
 sample per step (2.5 µs at 400 kS/s) still open.
+
+**Raw step.** `raw (62.5 ns)` (with CH1 alone `raw (33.3 ns)`), the
+first entry of Logger › Step (`step = 0` in the config): one sample per
+step at the ADC rate, stored as the raw 1-byte ADC value. The gain and
+calibration are in the file header, so the log view and the CSV export
+show volts. In plain words, what it means:
+
+- The file grows at about 30-32 MB/s (32 MB/s for both channels, 30 MB/s
+  for CH1 alone, 16 MB/s for CH2 alone), so a 1 GB size limit lasts about
+  30 s. The panel shows the time for the size limit.
+- The disk must keep up with that. A normal SSD or hard disk does (a 60 s
+  raw log at 32 MB/s grew at 31 MB/s or more in every 2 s window, on a
+  disk that writes 760 MB/s); a slow USB stick or a network folder may
+  not, and then data is lost (gaps).
+- There is no min/max envelope per step: each step is one sample, so
+  the log view's peak area is the line itself when zoomed in (zoomed
+  out, a dot column shows the min and max of its samples).
+- The scope's analog bandwidth is about 20 MHz, so detail finer than
+  about 50 ns is not real: the steps are finer than what the input can
+  show.
+- Logging CH2 alone still uses 2-channel mode (16 MS/s); only CH1 alone
+  gets 30 MS/s.
+- Acquisition › Max ADC rate lowers the rate (and the data rate): at
+  1 MS/s a raw step is 1 µs and both channels write 2 MB/s.
+
+Raw logs are file format version 2 (see below), so older builds do not
+open them; envelope logs stay version 1.
 
 **Gaps.** A log gets a gap mark, and goes on at the right time, when
 samples are lost:
@@ -532,10 +607,13 @@ opens any log. In that list `d` (`[keys] delete_log`) deletes the log
 under the cursor: a box asks `Delete log-20261107-185153.ohlog (2.3 MB)?
 y / n`, and only `y` deletes the `.ohlog` and its `.idx` summary file
 (`n`, `Esc` or any other key keeps it). The log being recorded is never
-deleted (stop it first); a log open in the log view is closed first. For each channel the band from min to max is filled (a
-dim colour of the channel), and the mean is a line in the channel's
-trace style: braille thin or bold (dots), ascii lines (`:` fill) or box
-lines (`░` fill). The grid settings apply. Volts/div, positions and
+deleted (stop it first); a log open in the log view is closed first.
+Logger › Trace mode (`logger.trace_mode`, `D` in the log view) picks
+what each channel shows: `average + peak` (the default) fills the band
+from min to max (a muted colour of the channel) under the mean as a line
+in the channel's trace style: braille thin or bold (dots), ascii lines
+(`:` fill) or box lines (`░` fill); `peak` the band alone in the channel
+colour, `average` the mean line alone. The grid settings apply. Volts/div, positions and
 channels on/off work as in the scope view (`↑` `↓` `[` `]` `{` `}`
 `Tab` `1` `2`).
 
@@ -550,12 +628,14 @@ channels on/off work as in the scope view (`↑` `↓` `[` `]` `{` `}`
 | `h` `l`, `H` `L` | move cursor A, cursor B (`Alt`: a tenth, at least one step) |
 | `t` | time labels: clock (UTC, with the date when the screen spans two days) or seconds since the start |
 | `E` | export CSV: between A and B when the cursors are on, else the whole log |
+| `D` | trace mode: average + peak / average / peak |
 
 Past one step per dot column `+` goes on: each step is drawn over 2,
 5, 10, 20 ... dot columns, until about 10 steps fill the screen. Each
 step is then a flat band from its min to its max, and the mean is a
-line through the middles of the steps; logs of single samples (older
-logs at 2.5 µs) have no band, the line joins the samples. Time labels
+line through the middles of the steps; logs of single samples (raw logs,
+and older logs at 2.5 µs) have no band, the line joins the samples (in
+`peak` mode too). Time labels
 and the `/div` in the status line follow (like `1.1 ms/div`, with an
 extra decimal so the labels keep even steps), cursors sit in the middle
 of their step, and every cursor key (`Alt` too) moves at least one
@@ -573,8 +653,9 @@ is at once (a 2 GB log: 5 s to build, then 0.03 s to open and draw).
 **CSV export.** `E` in the log view, or Logger › Export log CSV / Export
 A–B CSV, writes `openhantek-log-YYYYMMDD-HHMMSS.csv` in the export
 folder. Columns: the time of the start of each step, then
-`ch1_min,ch1_max,ch1_mean,ch2_min,...` for the logged channels (an older
-2.5 µs log of single samples has `ch1,ch2`). Logger › CSV time picks `time_utc` (ISO 8601 UTC,
+`ch1_min,ch1_max,ch1_mean,ch2_min,...` for the logged channels (a raw
+log, or an older 2.5 µs log of single samples, has `ch1,ch2`, in volts;
+raw times have 10 decimals, like `0.0000000625`). Logger › CSV time picks `time_utc` (ISO 8601 UTC,
 like `2026-11-07T18:51:53.613Z`, with as many decimals as the step needs)
 or `time_s` (seconds since the start). Each gap is one row with the
 time where the data stops and empty value cells, like `8.000,,,,,,`, so
@@ -584,7 +665,8 @@ plotting tools break the line there.
 
 | Setting | Meaning |
 |---|---|
-| `step` | step in seconds (default 0.001) |
+| `step` | step in seconds (default 0.001); 0 = raw |
+| `trace_mode` | log view: `Average`, `Peak` or `Both` (default) |
 | `log_limit` | size limit in bytes, 0 = off (default 1000000000) |
 | `log_dir` | log folder (default `$XDG_DATA_HOME/openhantek-tui/logs` or `~/.local/share/openhantek-tui/logs`; `--log-dir` wins) |
 | `time_axis` | `Clock` or `Seconds` |
@@ -594,7 +676,8 @@ plotting tools break the line there.
 `log-YYYYMMDD-HHMMSS.ohlog` (UTC).
 
 ```
-header   "OHTLOG\0\x01", version u16 (1), header length u16, flags u16,
+header   "OHTLOG\0\x01", version u16 (1, or 2 for raw logs),
+         header length u16, flags u16 (bit 0, version 2: raw records),
          channel mask u8 (bit 0 CH1, bit 1 CH2), reserved u8,
          start time i64 (ns since 1970 UTC, the first sample),
          step u64 (ns), ADC rate f64 (S/s), samples per step u32,
@@ -607,8 +690,15 @@ chunks   "CHNK", flags u32 (bit 0: data was lost before this chunk),
          first step u64, record count u64 (u64::MAX: open, the records go
          to the end of the file), then the records
 record   per logged channel: min, max, mean as f32 volts (one f32 when
-         there is one sample per step)
+         there is one sample per step); raw logs: one u8 ADC value per
+         logged channel
 ```
+
+A raw value is volts at the probe tip = (value − ADC count of 0 V) ×
+volts per count × probe (negated when inverted), from the channel
+block. In a raw log the step is the ADC sample time, `1 / ADC rate`
+(62.5 ns, 33.3 ns); the step field holds it rounded to whole ns, and
+readers use the ADC rate.
 
 Step `i` starts at `start + i * step`. A new chunk starts only after a
 gap, so a log is usually one chunk. Missing step numbers between chunks
@@ -627,7 +717,8 @@ record at the end is ignored).
   thread for the libusb events); `fake.rs` is a fake scope that acts like
   the firmware, with a model of the stream (bus times, a host queue that
   drops whole transfers when full, a 40 MB/s link).
-- `src/acquire.rs`: a thread that captures blocks and sends them to the UI.
+- `src/acquire.rs`: a thread that captures blocks (or roll pieces, or the
+  log) and sends them to the UI.
 - `src/scope.rs`: trigger, averaging, math, roll mode, autoset.
 - `src/dsp/`: trigger search, measurements, FFT, math, interpolation.
 - `src/logger/`: the envelope logger: `format.rs` (file layout),
@@ -640,14 +731,48 @@ record at the end is ignored).
   braille and text renderer (trace styles and cursor lines), `src/theme.rs` the colours, `src/panel.rs` the
   settings panel model.
 
-Like OpenHantek6022, it reads 20000 samples per channel per block, throws
-away the first samples after each start (the ADC is not stable yet), and
-averages several ADC samples into one at slow time bases. The fastest rates
-are 24 MS/s for CH1 alone and 12 MS/s with both channels. Roll mode and the
-logger stream without end: the driver queues 8 to 32 bulk transfers of
-about 20 ms of data each (at most 256 KiB, at most 8 MiB in all, within
-Linux's default 16 MiB `usbfs_memory_mb`) before it starts the scope,
-and keeps them in flight, so the scope's 2 KB buffer never overflows.
+**One stream for every mode.** The scope always streams: the driver
+queues 8 to 32 bulk transfers of about 20 ms of data each (at most
+256 KiB, at most 8 MiB in all, within Linux's default 16 MiB
+`usbfs_memory_mb`) before it starts the scope, and keeps them in flight,
+so the scope's 2 KB buffer never overflows. The ADC runs at the top rate
+the max ADC rate allows; a time base that needs fewer samples gets them
+by decimation on the fly: each output sample is the mean of a whole
+number of ADC samples (16 of 16 MS/s at 1 ms/div), with their min and
+max for the peak area. The decimation works in ADC counts per transfer,
+so no raw data is kept for a screen (at 50 ms/div a screen is 16 MB of
+raw samples). Output rates are the 1-2-5 rates that divide the ADC rate,
+and the ADC rate / 1, 2, 4 (16, 8, 4 MS/s; 30, 15, 7.5 MS/s).
+
+- Trigger modes (blocks): the stream runs on, and each transfer is
+  decimated into the points of the next blocks of 20 000 samples per
+  channel. The UI's software trigger searches each block as before (a
+  block is twice the screen, so pre- and post-trigger fit). Blocks follow
+  each other with no gap, and each is new data (averaging and
+  persistence see independent captures); a block is ready every 1.25 ms
+  at 16 MS/s, more often than the screen draws, so the UI takes the
+  newest and drops the rest. Continuous streaming with the trigger over
+  this block ring was chosen over a start/stop per capture: a start costs
+  the 2048 unstable samples after it and a USB round trip, and the
+  stream is already gapless.
+- Roll mode: each transfer is decimated and appended to the screen.
+- The logger: each transfer goes to the binner as raw bytes.
+- A settings change (gain, rate, channels, roll / blocks) sends the
+  changed commands (the firmware stops on any command), cancels the
+  transfers and starts the stream again; the first 2048 samples after a
+  start are thrown away (the ADC is not stable yet).
+
+Measured on the real scope (in a VM, USB 3 port): 800 blocks/s at
+16 MS/s with both channels and 1500 blocks/s at 30 MS/s with CH1, every
+calibration period across the blocks the right length, 21 % and 26 % of
+one CPU core; roll mode at 16 MS/s 11 %.
+
+**Calibration.** The offsets in the EEPROM have a bank for the ADC at
+30 MS/s and up; it is used whenever the ADC runs at 30 MS/s (now every
+time base with CH1 alone). On the test scope that bank reads about 3.5
+ADC counts high (0.15 V at 1 V/div), while the 16 MS/s bank is right; if
+yours does too, recalibrate with OpenHantek6022, or set the max ADC rate
+to 12 / 24 MS/s.
 
 ## Tests
 
@@ -660,12 +785,19 @@ OHT_HW_SECS=180 cargo test --release --test hardware hw_log -- --ignored --test-
 ```
 
 The hardware tests need the real scope. With a probe on the calibration
-output they also check the frequency and the voltage. `hw_stream_*` and
-`hw_log_*` need the CH1 probe on the calibration output: they stream at
-16 MS/s (both channels) and 30 MS/s (CH1) for `OHT_HW_SECS` seconds
-(default 20), through the driver and through the whole logger (a 0.5 µs
-log in the temp folder, deleted afterwards), check every 1 kHz period
-and the sample count against the clock, and print the CPU load.
+output they also check the frequency and the voltage. `hw_stream_*`,
+`hw_blocks_*`, `hw_log_*` and `hw_raw_log_*` need the CH1 probe on the
+calibration output: they stream at 16 MS/s (both channels) and 30 MS/s
+(CH1) for `OHT_HW_SECS` seconds (default 20), through the driver, as
+blocks for the trigger (then 200 triggered, decimated screens through the
+scope logic, with the peak band), and through the whole logger (a 0.5 µs
+log and a raw log in the temp folder, deleted afterwards; the raw tests
+also check that the file grows as fast as the data), check every 1 kHz
+period and the sample count against the clock, and print the CPU load.
+
+The fake scope makes its samples from a table per wave period, fast
+enough to stream 32 MB/s in real time; the tests build with
+`opt-level = 1` (`[profile.test]`) so the binning keeps up too.
 
 ## Licence of the firmware
 
