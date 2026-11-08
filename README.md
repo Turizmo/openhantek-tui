@@ -647,8 +647,8 @@ open them; envelope logs stay version 1.
 **Gaps.** A log gets a gap mark, and goes on at the right time, when
 samples are lost:
 
-- The PC could not keep up and dropped data (its queue holds about 2 s
-  of data): known exactly, marked at once.
+- The PC could not keep up (the stream ring holds about 2 s of data):
+  the stream starts again, and the time without data is the gap.
 - The scope lost samples (its buffer overflowed: the time passes, the data
   never comes). The thread compares the samples with the time each USB
   transfer arrived: when they stay more than 20 ms plus two transfers
@@ -794,8 +794,9 @@ record at the end is ignored).
   `hex.rs` load the firmware; `usb.rs` finds and opens the scope;
   `stream.rs` is the async bulk stream (libusb transfers in flight, a
   thread for the libusb events); `fake.rs` is a fake scope that acts like
-  the firmware, with a model of the stream (bus times, a host queue that
-  drops whole transfers when full, a 40 MB/s link).
+  the firmware, with a generator thread that writes the stream into the
+  ring (bus times, real time or as fast as the ring has room, a 40 MB/s
+  link, lost samples and transfer errors on request).
 - `src/stream/`: `ring.rs` is the 64 MiB sample ring the USB side writes
   and the processing reads; `pipeline.rs` is the processing on it
   (decimation, trigger, captures, average, peak band, roll mode, math).
@@ -852,7 +853,11 @@ and the ADC rate / 1, 2, 4 (16, 8, 4 MS/s; 30, 15, 7.5 MS/s).
   fine time/div, the app's calibration) start the trigger search and the
   average over, and the stream goes on.
 - Roll mode: the same ring, no trigger: the points go onto the screen.
-- The logger: each transfer goes to the binner as raw bytes.
+- The logger: a second reader of the same ring, with its own hardware
+  settings (the scope view pauses while it records): each transfer goes
+  to the binner as raw bytes with its bus time for the gap check. When a
+  log stops, the scope stops first and the rest of the ring is logged, so
+  every sample the scope sent is in the file.
 - A settings change (gain, rate, channels, roll / blocks) sends the
   changed commands (the firmware stops on any command), cancels the
   transfers and starts the stream again; the first 2048 samples after a

@@ -8,7 +8,9 @@
 //! `OHT_HW_SECS` seconds each (default 20). The log tests write their log
 //! to the system temp folder (up to 48 MB/s) and delete it afterwards.
 //! `hw_blocks_*` capture blocks for the trigger from the stream at the top
-//! rates, `hw_raw_log_*` log raw samples (32 / 30 MB/s to the disk).
+//! rates, `hw_raw_log_*` log raw samples (32 / 30 MB/s to the disk),
+//! `hw_trigger_stream_*` run the whole stream processing (ring, trigger,
+//! captures) through the acquisition thread and count the triggers.
 
 use std::time::{Duration, Instant};
 
@@ -674,4 +676,84 @@ fn hw_blocks_16_ms_per_s_two_channels() {
 #[ignore = "needs the real DSO-6022BE, CH1 probe on the calibration pin"]
 fn hw_blocks_30_ms_per_s_ch1() {
     blocks_run(1);
+}
+
+/// The whole stream processing on the real scope, through the app's
+/// acquisition thread, for `OHT_HW_SECS`: the 1 kHz calibration wave on
+/// CH1 at 1 ms/div, the trigger at 1 V in the middle of the screen. Each
+/// trigger rearms 5 ms (and a few samples) after its edge, so the next
+/// one is the edge 6 ms later: the trigger count must match the stream
+/// time, with no restart (no lost data) and the UI looking only every
+/// 50 ms.
+fn trigger_stream_run(ch2: bool) {
+    use openhantek_tui::acquire::{Event, Opener};
+    use openhantek_tui::scope::Scope;
+    use openhantek_tui::settings::Settings;
+    let mut s = Settings::default();
+    s.channels[1].enabled = ch2;
+    s.time_idx = openhantek_tui::scope::time_index(1e-3);
+    s.trigger.level = 1.0;
+    s.trigger.position = 0.5;
+    s.cal_freq = 1000;
+    let mut scope = Scope::new(s);
+    let (gen, cfg) = scope.sync_hw().unwrap();
+    let (pgen, p) = scope.sync_proc().unwrap();
+    let opener: Opener = Box::new(|status| open_hardware(None, status));
+    let acq = Acquisition::spawn(opener);
+    acq.send(Command::Configure { gen, cfg });
+    acq.send(Command::Process {
+        pgen,
+        p: Box::new(p.clone()),
+    });
+    let secs = hw_secs();
+    let cpu0 = cpu_secs();
+    let t0 = Instant::now();
+    let mut last = None;
+    let mut restarts = Vec::new();
+    while t0.elapsed().as_secs_f64() < secs {
+        while let Some(ev) = acq.try_recv() {
+            match ev {
+                Event::Restart(r) => restarts.push(r.message()),
+                Event::Error(e) | Event::Disconnected(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        if let Some(p) = acq.latest() {
+            last = Some(p);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let cpu = cpu_secs() - cpu0;
+    drop(acq);
+    let p = last.expect("no frame");
+    let f = p.frame.as_ref().expect("a frame");
+    let dt = 1.0 / f.rate;
+    let stream = p.points as f64 * dt;
+    let want = (stream - 0.005) / 0.006;
+    eprintln!(
+        "trigger stream, ADC {} MS/s x {}: {} triggers in {stream:.2} s of stream \
+         (want {want:.0}), {} averaged, restarts {restarts:?}, CPU {:.1} % of one core",
+        cfg.rate.raw / 1e6,
+        cfg.channels,
+        p.triggers,
+        p.averaged,
+        cpu / t0.elapsed().as_secs_f64() * 100.0
+    );
+    assert!(restarts.is_empty(), "{restarts:?}");
+    assert!(p.triggers > 100, "no probe on the calibration pin?");
+    assert!((p.triggers as f64 - want).abs() < 3.0 + want * 0.002, "{} triggers", p.triggers);
+    assert!(f.triggered);
+    assert_eq!(cfg.channels, if ch2 { 2 } else { 1 });
+}
+
+#[test]
+#[ignore = "needs the real DSO-6022BE, CH1 probe on the calibration pin"]
+fn hw_trigger_stream_16_ms_per_s_two_channels() {
+    trigger_stream_run(true);
+}
+
+#[test]
+#[ignore = "needs the real DSO-6022BE, CH1 probe on the calibration pin"]
+fn hw_trigger_stream_30_ms_per_s_ch1() {
+    trigger_stream_run(false);
 }

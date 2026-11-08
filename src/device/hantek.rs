@@ -6,23 +6,11 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use super::protocol::*;
-use super::transport::{Chunk, StreamSetup, Transport};
+use super::transport::{StreamSetup, Transport};
 use crate::acquire::Block;
 use crate::stream::pipeline::decimate_block;
 use crate::stream::ring::{Failure, Ring, STREAM_RING};
 use std::sync::Arc;
-
-/// A piece of the stream as raw ADC bytes (the logger bins them itself).
-#[derive(Clone, Debug)]
-pub struct RawPiece {
-    /// Whole frames of interleaved samples (CH1, CH2, CH1, ... with two
-    /// channels), after the unstable samples at the start of the stream.
-    pub data: Vec<u8>,
-    /// Samples per channel the host dropped just before this piece.
-    pub lost: u64,
-    /// When the piece came off the bus.
-    pub at: std::time::Instant,
-}
 
 /// Raw samples per channel thrown away after each start: the ADC is not
 /// stable just after sampling starts.
@@ -31,8 +19,6 @@ pub const SKIP_SAMPLES: usize = 2048;
 /// The running stream: the settings it was started with.
 struct Live {
     cfg: HwConfig,
-    /// Raw path: bytes still to throw away at the start.
-    skip_bytes: usize,
 }
 
 pub struct Scope6022<T: Transport> {
@@ -216,11 +202,7 @@ impl<T: Transport> Scope6022<T> {
                 self.t.stream_stop();
                 return Err(e);
             }
-            let ch = cfg.channels.clamp(1, 2);
-            self.stream = Some(Live {
-                cfg: *cfg,
-                skip_bytes: SKIP_SAMPLES * ch as usize,
-            });
+            self.stream = Some(Live { cfg: *cfg });
         }
         Ok(ring)
     }
@@ -252,25 +234,6 @@ impl<T: Transport> Scope6022<T> {
             }
         }
         Ok(())
-    }
-
-    /// The next piece of the stream for `cfg`: what came since the last
-    /// one. Starts the stream when none runs or it runs with other
-    /// settings. On an error the stream ends; the next call starts it
-    /// again.
-    fn next_chunk(&mut self, cfg: &HwConfig) -> Result<Chunk> {
-        let ring = self.start_stream(cfg)?;
-        self.wait_bytes(&ring, self.cursor + 1, cfg)?;
-        let ch = cfg.channels.clamp(1, 2) as u64;
-        let end = ring.written();
-        let at = ring
-            .take_marks()
-            .last()
-            .map_or_else(std::time::Instant::now, |m| m.at);
-        let data = ring.read_bytes(self.cursor..end, |a, b| [a, b].concat());
-        self.cursor = end;
-        ring.keep_from(end / ch);
-        Ok(Chunk { data, lost: 0, at })
     }
 
     /// Volts per ADC count and volts at count 0, per channel, for `cfg`.
@@ -315,49 +278,6 @@ impl<T: Transport> Scope6022<T> {
         b
     }
 
-    /// The logger at its end: stop the scope, then give what the stream
-    /// still holds (raw ADC bytes, like [`Scope6022::stream_raw`]), so
-    /// every sample the scope sent is logged.
-    pub fn stop_raw(&mut self) -> Result<Option<RawPiece>> {
-        let rest = match (&self.stream, &self.ring) {
-            (Some(live), Some(ring)) => {
-                let ch = live.cfg.channels.clamp(1, 2) as usize;
-                let mut skip = live.skip_bytes;
-                // Stop the transfers first: nothing more comes after this.
-                self.t.stream_stop();
-                let end = ring.written();
-                let mut data = ring.read_bytes(self.cursor..end, |a, b| [a, b].concat());
-                self.cursor = end;
-                skip = skip.min(data.len());
-                data.drain(..skip);
-                data.truncate(data.len() - data.len() % ch);
-                Some(RawPiece {
-                    data,
-                    lost: 0,
-                    at: std::time::Instant::now(),
-                })
-            }
-            _ => None,
-        };
-        self.stop()?;
-        Ok(rest)
-    }
-
-    /// The logger: the next piece of the stream as raw ADC bytes, after
-    /// the unstable samples at the start.
-    pub fn stream_raw(&mut self, cfg: &HwConfig) -> Result<RawPiece> {
-        let mut chunk = self.next_chunk(cfg)?;
-        let live = self.stream.as_mut().expect("stream is set");
-        let skip = live.skip_bytes.min(chunk.data.len());
-        live.skip_bytes -= skip;
-        chunk.data.drain(..skip);
-        let ch = cfg.channels.clamp(1, 2) as usize;
-        Ok(RawPiece {
-            lost: chunk.lost / ch as u64,
-            data: chunk.data,
-            at: chunk.at,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -621,23 +541,6 @@ mod tests {
         assert_eq!(starts(&fake), 3);
         s.stop().unwrap();
         assert!(fake.lock().stream.is_none());
-    }
-
-    #[test]
-    fn raw_stream_skips_the_start() {
-        let (mut s, fake) = scope([Wave::Dc(0.0); 2]);
-        fake.lock().noise = 0.0;
-        let mut c = cfg(1.0, 2, [5, 5]);
-        c.rate.oversample = 1;
-        c.roll = true;
-        let mut n = 0;
-        while n < 100_000 {
-            let p = s.stream_raw(&c).unwrap();
-            assert_eq!(p.data.len() % 2, 0);
-            // No junk bytes from the start.
-            assert!(p.data.iter().all(|b| (120..=135).contains(b)));
-            n += p.data.len();
-        }
     }
 
     #[test]

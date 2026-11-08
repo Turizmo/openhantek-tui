@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 
 use super::stream::UsbStream;
-pub use super::stream::{Chunk, StreamSetup};
+pub use super::stream::StreamSetup;
 use crate::stream::ring::Writer;
 
 /// Vendor request to the device, host to device (bmRequestType 0x40).

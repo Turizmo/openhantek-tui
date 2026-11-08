@@ -35,18 +35,6 @@ pub struct StreamSetup {
     pub transfers: usize,
 }
 
-/// One piece of a stream.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Chunk {
-    pub data: Vec<u8>,
-    /// Bytes dropped just before this chunk, because the consumer was too
-    /// slow. Whole transfers, so a multiple of the packet size.
-    pub lost: u64,
-    /// When the transfer completed. A slow consumer sees the chunk later,
-    /// but this time is still when the data came off the bus.
-    pub at: Instant,
-}
-
 /// State the callback and the owner share, under one lock: the callback
 /// checks `stop` and resubmits while holding it, and [`UsbStream::drop`]
 /// sets `stop` and cancels while holding it, so a transfer is never

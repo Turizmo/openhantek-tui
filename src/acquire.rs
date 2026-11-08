@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 
-use crate::device::hantek::{RawPiece, Scope6022};
+use crate::device::hantek::{Scope6022, SKIP_SAMPLES};
 use crate::device::protocol::{AppCal, HwConfig, Rate};
 use crate::device::transport::{is_gone, is_timeout, Transport};
 use crate::device::Connection;
@@ -186,17 +186,19 @@ impl LogSession {
         matches!(self.req.shared.lock().unwrap().state, LogState::Done(_))
     }
 
-    /// Take one piece of the stream.
-    fn piece(&mut self, cap: &RawPiece, conn: &Connection) {
+    /// Take one piece of the stream (one USB transfer, in one or two
+    /// slices of the ring) that came off the bus `at`, after `lost`
+    /// samples per channel that the host knows it dropped.
+    fn piece(&mut self, data: [&[u8]; 2], lost: u64, at: Instant, conn: &Connection) {
         let raw = self.cfg.rate.raw;
-        let n = (cap.data.len() / self.cfg.channels.clamp(1, 2) as usize) as u64;
-        if n == 0 && cap.lost == 0 {
+        let len = data[0].len() + data[1].len();
+        let n = (len / self.cfg.channels.clamp(1, 2) as usize) as u64;
+        if n == 0 && lost == 0 {
             // The samples thrown away at the start of a stream: no data,
             // so nothing to check (a restart stays pending).
             return;
         }
         let now = Instant::now();
-        let at = cap.at;
         if self.binner.is_none() {
             self.binner = Some(self.make_binner(conn));
         }
@@ -214,14 +216,16 @@ impl LogSession {
                 check.piece(at, n, 0, false);
                 self.check = Some(check);
                 self.restart = false;
-                binner.push(&cap.data);
+                binner.push(data[0]);
+                binner.push(data[1]);
             }
             Some(check) => {
-                if let Some(lost) = check.piece(at, n, cap.lost, self.restart) {
+                if let Some(lost) = check.piece(at, n, lost, self.restart) {
                     binner.gap(lost);
                 }
                 self.restart = false;
-                binner.push(&cap.data);
+                binner.push(data[0]);
+                binner.push(data[1]);
             }
         }
         let binner = self.binner.as_mut().expect("binner is set");
@@ -441,6 +445,40 @@ struct Worker {
     ring: Option<Arc<Ring>>,
     ring_size: usize,
     live: Option<Live>,
+    /// The stream of the running log.
+    log_live: Option<LogLive>,
+}
+
+/// The stream of a log: the logger reads the ring as a second reader
+/// (the scope's processing does not run meanwhile).
+struct LogLive {
+    cfg: HwConfig,
+    ring: Arc<Ring>,
+    /// The next byte to log (the unstable start is skipped).
+    cursor: u64,
+    /// Bytes at the end of the last transfer mark.
+    mark_end: u64,
+    /// When data last came, and the bytes then.
+    data_at: Instant,
+    written: u64,
+}
+
+impl LogLive {
+    /// Give the log every transfer that came since the last call, each
+    /// with its bus time.
+    fn take(&mut self, log: &mut LogSession, conn: &Connection) {
+        for m in self.ring.take_marks() {
+            let from = self.mark_end.max(self.cursor);
+            self.mark_end = m.end;
+            if m.end > from {
+                self.ring
+                    .read_bytes(from..m.end, |a, b| log.piece([a, b], 0, m.at, conn));
+                self.cursor = m.end;
+            }
+        }
+        let ch = self.cfg.channels.clamp(1, 2) as u64;
+        self.ring.keep_from(self.cursor / ch);
+    }
 }
 
 impl Worker {
@@ -467,6 +505,7 @@ impl Worker {
             ring: None,
             ring_size,
             live: None,
+            log_live: None,
         }
     }
 
@@ -506,19 +545,16 @@ impl Worker {
 
     fn stop_log(&mut self) {
         if let Some(mut l) = self.log.take() {
-            // The rest of the stream first: every sample the scope sent.
-            if let Some(c) = &mut self.conn {
-                if let Ok(Some(p)) = c.driver.stop_raw() {
-                    if !p.data.is_empty() {
-                        l.piece(&p, c);
-                    }
-                }
-            }
-            l.finish();
-            // Start the normal capture from scratch.
+            // Stop the scope, then take the rest of the stream: every
+            // sample the scope sent is logged.
             if let Some(c) = &mut self.conn {
                 let _ = c.driver.stop();
+                if let Some(live) = &mut self.log_live {
+                    live.take(&mut l, c);
+                }
             }
+            self.log_live = None;
+            l.finish();
         }
     }
 
@@ -598,6 +634,7 @@ impl Worker {
             }
             if self.conn.is_none() {
                 self.live = None;
+                self.log_live = None;
                 if !self.connect() {
                     continue;
                 }
@@ -737,38 +774,100 @@ impl Worker {
         }
     }
 
-    /// Read one piece of the log stream.
+    /// Log what the stream brought; start the log's stream when it does
+    /// not run. A loss or an error marks a gap in the log (the clock
+    /// tells how long) and starts the stream again.
     fn log_step(&mut self, cfg: HwConfig) {
-        let conn = self.conn.as_mut().expect("connected");
-        match conn.driver.stream_raw(&cfg) {
-            Ok(cap) => {
-                self.last_error = None;
-                let conn = self.conn.as_ref().expect("connected");
-                if let Some(l) = &mut self.log {
-                    l.piece(&cap, conn);
+        if self.log_live.as_ref().is_none_or(|l| l.cfg != cfg) {
+            self.log_live = None;
+            let conn = self.conn.as_mut().expect("connected");
+            let ring = self
+                .ring
+                .get_or_insert_with(|| Arc::new(Ring::new(self.ring_size)))
+                .clone();
+            conn.driver.set_ring(ring);
+            match conn.driver.start_stream(&cfg) {
+                Ok(ring) => {
+                    let skip = (SKIP_SAMPLES * cfg.channels.clamp(1, 2) as usize) as u64;
+                    self.log_live = Some(LogLive {
+                        cfg,
+                        ring,
+                        cursor: skip,
+                        mark_end: 0,
+                        data_at: Instant::now(),
+                        written: 0,
+                    });
+                }
+                Err(e) => {
+                    self.log_error(e);
+                    return;
                 }
             }
-            Err(e) => {
-                if let Some(l) = &mut self.log {
-                    l.restart = true;
-                }
-                if is_gone(&e) {
-                    self.conn = None;
-                    if !self.emit(Event::Disconnected(format!("{e:#}"))) {
-                        self.quit = true;
-                    }
-                    self.poll(Some(Duration::from_millis(500)));
-                } else if is_timeout(&e) {
-                    if !self.error_once("USB timeout, trying again".into()) {
-                        self.quit = true;
-                    }
-                } else {
-                    if !self.error_once(format!("{e:#}")) {
-                        self.quit = true;
-                    }
-                    self.poll(Some(Duration::from_millis(200)));
-                }
+        }
+        let (Some(live), Some(log), Some(conn)) = (&mut self.log_live, &mut self.log, &self.conn)
+        else {
+            return;
+        };
+        let ring = live.ring.clone();
+        let failed = ring.failure();
+        // What came before a loss is whole: log it first.
+        live.take(log, conn);
+        self.last_error = None;
+        if let Some(Failure::Usb(e)) = failed {
+            self.log_error(anyhow::Error::new(e).context("reading samples failed"));
+            return;
+        }
+        if ring.overrun() > 0 {
+            // The PC could not keep up: a gap, and the stream again.
+            log.restart = true;
+            self.log_live = None;
+            if let Some(c) = &mut self.conn {
+                let _ = c.driver.stop();
             }
+            return;
+        }
+        let written = ring.written();
+        if written > live.written {
+            live.written = written;
+            live.data_at = Instant::now();
+        }
+        let silent = Duration::from_secs_f64(
+            Scope6022::<Box<dyn Transport>>::transfer_secs(&cfg) * 2.0 + 1.0,
+        );
+        if live.data_at.elapsed() > silent {
+            self.log_error(anyhow::Error::new(rusb::Error::Timeout).context(format!(
+                "no samples from the scope for {:.1} s",
+                silent.as_secs_f64()
+            )));
+            return;
+        }
+        ring.wait(ring.frames(), Duration::from_millis(10));
+    }
+
+    /// The log's stream failed: a gap in the log, the stream again.
+    fn log_error(&mut self, e: anyhow::Error) {
+        if let Some(l) = &mut self.log {
+            l.restart = true;
+        }
+        self.log_live = None;
+        if let Some(c) = &mut self.conn {
+            let _ = c.driver.stop();
+        }
+        if is_gone(&e) {
+            self.conn = None;
+            if !self.emit(Event::Disconnected(format!("{e:#}"))) {
+                self.quit = true;
+            }
+            self.poll(Some(Duration::from_millis(500)));
+        } else if is_timeout(&e) {
+            if !self.error_once("USB timeout, trying again".into()) {
+                self.quit = true;
+            }
+        } else {
+            if !self.error_once(format!("{e:#}")) {
+                self.quit = true;
+            }
+            self.poll(Some(Duration::from_millis(200)));
         }
     }
 
