@@ -37,6 +37,9 @@ Features:
   calibration file, if you have one (it never writes the EEPROM)
 - Zero calibration of its own (`Z`, probes grounded): 0 V of every
   gain and ADC rate bank, saved in the config file over the EEPROM values
+- Probe helper (`C`) on the calibration output: which way to turn the
+  probe trimmer, and a gain check against the 2 Vpp with a gain
+  correction saved in the config file
 - Export the screen as CSV or JSON; headless `--measure` mode for scripts
 - Envelope logger (chart recorder): records min, max and mean per time
   step (0.5 µs to 1 min) without gaps, from the ADC at 16 MS/s with both
@@ -167,6 +170,7 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `z` | sin(x)/x / linear interpolation |
 | `g` `G` | calibration output frequency up / down |
 | `Z` | zero calibration (ground the inputs first, see [Calibration](#calibration)) |
+| `C` | probe helper on the calibration output (see [Calibration](#calibration)) |
 | `E` | export the screen as CSV |
 | `W` | export the screen as JSON |
 | `R` | reset all settings |
@@ -470,6 +474,35 @@ your settings are back, the 24 values (CH1 and CH2 below 30 MS/s, CH1 at
 30 MS/s) are saved in the config file at once, and the message shows the
 biggest change against the zero used before. Clear zero calibration
 forgets them: the EEPROM values again.
+
+**Probe helper** (`C`, or Settings › Calibration › Probe helper). Put the
+probe tip on the calibration pin (the 2 Vpp square wave) and its ground
+clip on the ground pin, and set the probe setting (`p`) to the switch on
+the probe. The helper takes over the scope for the selected channel:
+that channel alone, 0.5 V/div at the tip with 0 V two divisions down,
+two periods on the screen, a rising trigger at 1 V and an average of 8
+captures. A box at the bottom shows:
+
+- **Edge**: how far the level just after each edge is from the flat
+  level before the next edge, in percent of the amplitude (the top and
+  the bottom). Within ±1 % the top is flat: the probe is compensated.
+  Positive is an overshoot (over-compensated: turn the probe trimmer
+  until the top is flat), negative is a rounded edge (under-compensated:
+  turn the trimmer the other way).
+- **Amplitude**: the flat top minus the flat bottom, and its error
+  against the 2 V of the calibration output.
+- **Gain correction** of the channel. `Enter` saves the correction that
+  makes the amplitude 2 V (on top of the one in use), in the config file
+  at once (`calibration.gain`, never the EEPROM); it applies to the
+  channel at every volts/div. `Del` (or `x`) clears it; Settings ›
+  Calibration › Clear gain correction clears both channels. A correction
+  of more than ±30 % is refused (a probe switch at x10 with the setting
+  at x1, say).
+
+In the helper, `Tab` (or `1` `2`) picks the channel, `←` `→` (or `g`
+`G`) the calibration frequency (500 Hz to 2 kHz; 1 kHz to start), `p`
+the probe factor (it stays). `Esc` (or `q`, `C`) closes the helper and
+puts all your settings back, also the calibration frequency.
 
 ## Measurement panel
 

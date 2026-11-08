@@ -101,6 +101,7 @@ pub fn draw(f: &mut TermFrame, app: &App) {
         None => draw_time_line(f, app, status2),
     }
     draw_message_line(f, app, status3);
+    draw_probe_cal(f, app, view, &pal);
     if app.help {
         draw_help(f, area, &scope_help_rows(app), app);
     }
@@ -143,6 +144,47 @@ fn draw_confirm(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         ))
         .wrap(Wrap { trim: false })
         .block(block),
+        popup,
+    );
+}
+
+/// The probe helper's box at the bottom of the scope view: what it
+/// measured, the trimmer hint, the gain, and its keys.
+fn draw_probe_cal(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
+    let Some(p) = &app.probe_cal else {
+        return;
+    };
+    let gain = app.scope.settings.calibration.gain[p.channel];
+    let mut lines: Vec<Line> = p
+        .lines(gain)
+        .into_iter()
+        .map(|l| Line::from(format!(" {l}")))
+        .collect();
+    lines.push(Line::styled(
+        format!(" {}", crate::probecal::PROBE_KEYS),
+        Style::default().fg(pal.help),
+    ));
+    let w = area.width.min(100);
+    let inner_w = w.saturating_sub(2).max(1) as usize;
+    let rows: u16 = lines
+        .iter()
+        .map(|l| (l.width().max(1).div_ceil(inner_w)) as u16)
+        .sum();
+    let h = (rows + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + area.height - h,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(" Probe helper ")
+        .border_style(Style::default().fg(pal.trace[p.channel]));
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
         popup,
     );
 }

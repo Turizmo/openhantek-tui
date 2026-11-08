@@ -41,6 +41,10 @@ pub enum Action {
     ZeroCal,
     /// Forget the app's zero values: the EEPROM values again.
     ClearZeroCal,
+    /// The probe helper on the calibration output.
+    ProbeCal,
+    /// Forget the gain corrections of both channels.
+    ClearGainCal,
 }
 
 /// One setting in the panel.
@@ -96,6 +100,8 @@ pub enum Field {
     CalFreq,
     /// Where the zero values come from.
     CalZero,
+    /// The gain corrections.
+    CalGain,
     DevModel,
     DevSerial,
     DevFirmware,
@@ -265,6 +271,9 @@ pub fn categories() -> Vec<Category> {
                 CalZero,
                 Act(Action::ZeroCal),
                 Act(Action::ClearZeroCal),
+                CalGain,
+                Act(Action::ProbeCal),
+                Act(Action::ClearGainCal),
             ],
         },
         Category {
@@ -434,6 +443,7 @@ impl Field {
             MeasPanel => "Show panel",
             CalFreq => "Output frequency",
             CalZero => "Zero",
+            CalGain => "Gain correction",
             DevModel => "Model",
             DevSerial => "Serial",
             DevFirmware => "Firmware",
@@ -467,6 +477,8 @@ impl Field {
                 Action::DeleteLog(_) => "Delete log",
                 Action::ZeroCal => "Zero calibration",
                 Action::ClearZeroCal => "Clear zero calibration",
+                Action::ProbeCal => "Probe helper",
+                Action::ClearGainCal => "Clear gain correction",
             },
         }
     }
@@ -517,6 +529,7 @@ impl Field {
             MeasPanel => "The measurement panel on the right. Key M.",
             CalFreq => "Frequency of the 2 Vpp square wave on the calibration pins. Keys g G.",
             CalZero => "Where the 0 V values come from: the app's zero calibration (config file) or the scope's EEPROM.",
+            CalGain => "Gain corrections from the probe helper (config file), on top of the EEPROM gain.",
             DevModel | DevSerial | DevFirmware | DevState => "Read from the scope.",
             DevCalibration => "Where the calibration values came from.",
             DevRate => "Sample rate of the traces now, and the ADC rate it is made from (the mean of each few ADC samples).",
@@ -547,6 +560,8 @@ impl Field {
                 Action::DeleteLog(_) => "Delete a log and its .idx file.",
                 Action::ZeroCal => "Ground the probe tips (or BNC inputs), then y: measures 0 V of every gain, both channels at 16 MS/s and CH1 alone at 30 MS/s. Saved in the config file, never the EEPROM. Key Z.",
                 Action::ClearZeroCal => "Forget the zero calibration: the EEPROM values again.",
+                Action::ProbeCal => "Probe tip on the calibration pin: sets time/div and volts/div, shows the edge overshoot and which way to turn the probe trimmer, and the amplitude against 2 V. Enter saves a gain correction, Esc puts your settings back. Key C.",
+                Action::ClearGainCal => "Forget the gain corrections of both channels.",
             },
         }
     }
@@ -559,7 +574,8 @@ impl Field {
                 Kind::Number
             }
             Roll | DevModel | DevSerial | DevFirmware | DevState | DevCalibration | DevRate
-            | CalZero | ExportDir | SettingsFile | ConfigWarnings | LogDir | LogFree => Kind::Info,
+            | ExportDir | SettingsFile | ConfigWarnings | LogDir | LogFree => Kind::Info,
+            CalZero | CalGain => Kind::Info,
             Act(_) => Kind::Action,
             _ => Kind::Choice,
         }
@@ -1118,6 +1134,17 @@ impl Field {
                         0 => "EEPROM".into(),
                         n => format!("app, {n} values"),
                     },
+                    CalGain => {
+                        let g = &s.calibration;
+                        let one = |c: usize| {
+                            if g.has_gain(c) {
+                                format!("CH{} {:+.2} %", c + 1, (g.gain[c] - 1.0) * 100.0)
+                            } else {
+                                format!("CH{} none", c + 1)
+                            }
+                        };
+                        format!("{} · {}", one(0), one(1))
+                    }
                     _ => String::new(),
                 }
             }

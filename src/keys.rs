@@ -100,6 +100,8 @@ pub enum Act {
     CalFreqDown,
     /// Zero calibration with the inputs grounded.
     ZeroCal,
+    /// Probe helper on the calibration output.
+    ProbeCal,
     ExportCsv,
     ExportJson,
     Reset,
@@ -250,6 +252,7 @@ pub const ACTIONS: &[ActionDef] = &[
     def(CalFreqUp, "cal_freq_up", S, &["g"], "calibration output frequency up"),
     def(CalFreqDown, "cal_freq_down", S, &["G"], "calibration output frequency down"),
     def(ZeroCal, "zero_cal", S, &["Z"], "zero calibration: ground the inputs, measure 0 V of every gain (app config, not the EEPROM)"),
+    def(ProbeCal, "probe_cal", S, &["C"], "probe helper: trimmer and gain on the calibration output"),
     def(ExportCsv, "export_csv", S, &["E"], "export the screen as CSV"),
     def(ExportJson, "export_json", S, &["W"], "export the screen as JSON"),
     def(Reset, "reset", S, &["R"], "reset all settings"),
@@ -640,6 +643,7 @@ pub const SCOPE_HELP: &[(&[Act], &str)] = &[
     (&[Interpolation], "sin(x)/x / linear interpolation"),
     (&[CalFreqUp, CalFreqDown], "calibration output frequency up / down"),
     (&[ZeroCal], "zero calibration: ground the inputs first (saved in the config, never the EEPROM)"),
+    (&[ProbeCal], "probe helper: probe on the cal pin; trimmer hint, gain check (Enter saves, Esc closes)"),
     (&[ExportCsv], "export the screen as CSV"),
     (&[ExportJson], "export the screen as JSON"),
     (&[Reset], "reset all settings"),

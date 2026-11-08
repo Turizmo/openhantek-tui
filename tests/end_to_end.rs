@@ -236,6 +236,99 @@ fn zero_calibration_fails_with_a_signal_and_restores_the_settings() {
     assert_eq!(app.scope.settings.calibration.zero_count(), 0);
 }
 
+#[test]
+fn probe_helper_on_the_calibration_output() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    let dir = std::env::temp_dir().join(format!("oht-e2e-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("config.toml");
+    let loaded = openhantek_tui::config::load(&path, None);
+    // 1.96 Vpp: the input reads 2 % low.
+    let low = Wave::Square {
+        freq: 1000.0,
+        low: 0.0,
+        high: 1.96,
+        duty: 0.5,
+    };
+    let (mut app, fake) = live_app([Wave::CalOut, Wave::Dc(0.0)], loaded.settings);
+    app.save_target = loaded.save;
+    tick_until(&mut app, 5.0, |a| a.connected);
+    app.scope.settings.time_idx = time_index(10e-3);
+    let before = app.scope.settings.clone();
+    app.handle_key(key('C'));
+    assert!(app.probe_cal.is_some());
+    let s = &app.scope.settings;
+    assert_eq!(s.channels[0].volts_per_div(), 0.5);
+    assert_eq!(s.time_per_div(), 200e-6);
+    assert!(!s.channels[1].enabled);
+    tick_until(&mut app, 10.0, |a| {
+        a.probe_cal.as_ref().unwrap().reading.is_some()
+    });
+    let r = app.probe_cal.as_ref().unwrap().reading.unwrap();
+    assert!(r.edge.abs() < 1.0, "{r:?}");
+    assert!(r.gain_error().abs() < 1.0, "{r:?}");
+    assert!((r.freq.unwrap() - 1000.0).abs() < 5.0, "{r:?}");
+    // The box shows it.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| openhantek_tui::ui::draw(f, &app)).unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        text.contains("Probe helper") && text.contains("Flat top"),
+        "{text}"
+    );
+    // A frequency step: 800 Hz, 500 us/div.
+    app.handle_key(KeyEvent::from(KeyCode::Left));
+    assert_eq!(app.scope.settings.cal_freq, 800);
+    assert_eq!(app.scope.settings.time_per_div(), 500e-6);
+    // 2 % low: Enter saves a gain correction of 2 / 1.96.
+    fake.lock().waves[0] = low;
+    app.handle_key(KeyEvent::from(KeyCode::Right));
+    tick_until(&mut app, 10.0, |a| {
+        a.probe_cal
+            .as_ref()
+            .unwrap()
+            .reading
+            .is_some_and(|r| r.gain_error() < -1.5)
+    });
+    app.handle_key(KeyEvent::from(KeyCode::Enter));
+    let g = app.scope.settings.calibration.gain[0];
+    assert!((g - 2.0 / 1.96).abs() < 0.003, "{g}");
+    assert!(app
+        .current_message()
+        .unwrap()
+        .text
+        .contains("saved in the config file"));
+    // Measured again with the correction: 2 V.
+    tick_until(&mut app, 10.0, |a| {
+        a.probe_cal
+            .as_ref()
+            .unwrap()
+            .reading
+            .is_some_and(|r| r.gain_error().abs() < 0.3)
+    });
+    // Esc: the user's settings are back, with the gain correction.
+    app.handle_key(KeyEvent::from(KeyCode::Esc));
+    assert!(app.probe_cal.is_none());
+    let mut back = app.scope.settings.clone();
+    back.calibration = before.calibration.clone();
+    assert_eq!(back, before);
+    let t: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let saved = t["calibration"]["gain"].as_array().unwrap()[0]
+        .as_float()
+        .unwrap();
+    assert!((saved - g).abs() < 1e-9);
+    // Clear it from the panel action.
+    app.action(openhantek_tui::panel::Action::ClearGainCal);
+    assert_eq!(app.scope.settings.calibration.gain, [1.0, 1.0]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 fn key(c: char) -> ratatui::crossterm::event::KeyEvent {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let code = match c {

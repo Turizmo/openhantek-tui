@@ -16,6 +16,7 @@ use crate::logger::view::Move;
 use crate::logger::writer::{self as log_writer, LogState, Shared, StopReason};
 use crate::logger::{self, csv as log_csv};
 use crate::panel::{Action, DeviceInfo, Outcome, Panel};
+use crate::probecal::ProbeCal;
 use crate::scope::{Scope, MATH};
 use crate::settings::*;
 
@@ -117,6 +118,8 @@ pub struct App {
     pub ask_zero_cal: bool,
     /// The running zero calibration.
     pub zero_cal: Option<ZeroCal>,
+    /// The open probe helper (calibration output).
+    pub probe_cal: Option<ProbeCal>,
     sent_cal: Option<AppCal>,
 }
 
@@ -156,6 +159,7 @@ impl App {
             save_target: None,
             ask_zero_cal: false,
             zero_cal: None,
+            probe_cal: None,
             sent_cal: None,
         };
         app.sync();
@@ -195,6 +199,11 @@ impl App {
         if self.zero_cal.as_ref().is_some_and(|z| z.timed_out()) {
             self.end_zero_cal(Err("no data from the scope".into()));
             changed = true;
+        }
+        if changed {
+            if let (Some(p), Some(f)) = (&mut self.probe_cal, &self.scope.frame) {
+                p.frame(f);
+            }
         }
         changed |= self.log_tick();
         changed | self.sync()
@@ -601,6 +610,10 @@ impl App {
             }
             return;
         }
+        if self.probe_cal.is_some() {
+            self.probe_cal_key(key);
+            return;
+        }
         if let Some(d) = self.confirm_delete.take() {
             // Only y deletes; n, Esc and any other key keep the log.
             match key.code {
@@ -822,6 +835,7 @@ impl App {
             Act::ExportJson => self.action(Action::ExportJson),
             Act::Reset => self.action(Action::Reset),
             Act::ZeroCal => self.action(Action::ZeroCal),
+            Act::ProbeCal => self.action(Action::ProbeCal),
             _ => return,
         }
         self.changed();
@@ -887,6 +901,12 @@ impl App {
                 }
             }
             Action::ZeroCal => self.ask_zero_cal(),
+            Action::ProbeCal => self.open_probe_cal(),
+            Action::ClearGainCal => {
+                self.scope.settings.calibration.gain = [1.0; 2];
+                let saved = self.save_calibration();
+                self.notify(format!("Gain corrections cleared{saved}"), false);
+            }
             Action::ClearZeroCal => {
                 self.scope.settings.calibration.clear_zero();
                 let saved = self.save_calibration();
@@ -982,6 +1002,109 @@ impl App {
         if self.zero_cal.is_some() {
             self.end_zero_cal(Err("stopped".into()));
         }
+        self.close_probe_cal();
+    }
+
+    /// Open the probe helper on the selected channel.
+    pub fn open_probe_cal(&mut self) {
+        if self.recording() {
+            self.notify("Stop the logger before the probe helper", true);
+            return;
+        }
+        self.panel_open = false;
+        self.show_log = false;
+        let ch = self.scope.settings.selected.min(1);
+        let p = ProbeCal::new(self.scope.settings.clone(), self.scope.running, ch);
+        self.scope.settings = p.settings();
+        self.scope.set_running(true);
+        self.probe_cal = Some(p);
+        self.changed();
+    }
+
+    /// Close the probe helper: the user's settings back (with a new gain
+    /// correction, if one was saved).
+    pub fn close_probe_cal(&mut self) {
+        let Some(p) = self.probe_cal.take() else {
+            return;
+        };
+        let cal = self.scope.settings.calibration.clone();
+        self.scope.settings = p.saved;
+        self.scope.settings.calibration = cal;
+        self.scope.set_running(p.was_running);
+        self.changed();
+    }
+
+    /// A key while the probe helper is open.
+    fn probe_cal_key(&mut self, key: KeyEvent) {
+        let Some(p) = &mut self.probe_cal else {
+            return;
+        };
+        let c = p.channel;
+        let gain = self.scope.settings.calibration.gain[c];
+        let mut note: Option<(String, bool)> = None;
+        let mut apply = true;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') => {
+                self.close_probe_cal();
+                self.notify("Probe helper closed: your settings are back", false);
+                return;
+            }
+            KeyCode::Tab | KeyCode::BackTab => p.channel = 1 - c,
+            KeyCode::Char('1') => p.channel = 0,
+            KeyCode::Char('2') => p.channel = 1,
+            KeyCode::Right | KeyCode::Char('g') | KeyCode::Char('+') => p.step_freq(true),
+            KeyCode::Left | KeyCode::Char('G') | KeyCode::Char('-') => p.step_freq(false),
+            KeyCode::Char('p') => {
+                // The probe switch is the user's setting: it stays.
+                let ch = &mut p.saved.channels[c];
+                ch.probe = if ch.probe == 1 { 10 } else { 1 };
+            }
+            KeyCode::Enter => {
+                apply = false;
+                match p.new_gain(gain) {
+                    Ok(g) => {
+                        self.scope.settings.calibration.gain[c] = g;
+                        p.changed();
+                        let saved = self.save_calibration();
+                        note = Some((
+                            format!(
+                                "CH{} gain correction x{g:.4} ({:+.2} %){saved}",
+                                c + 1,
+                                (g - 1.0) * 100.0
+                            ),
+                            false,
+                        ));
+                    }
+                    Err(e) => note = Some((format!("No gain correction: {e}"), true)),
+                }
+            }
+            KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('x') => {
+                apply = false;
+                self.scope.settings.calibration.gain[c] = 1.0;
+                p.changed();
+                let saved = self.save_calibration();
+                note = Some((format!("CH{} gain correction cleared{saved}", c + 1), false));
+            }
+            _ => {
+                apply = false;
+                note = Some((
+                    format!("Probe helper: {}", crate::probecal::PROBE_KEYS),
+                    false,
+                ));
+            }
+        }
+        if apply {
+            if let Some(p) = &mut self.probe_cal {
+                p.changed();
+                let cal = self.scope.settings.calibration.clone();
+                self.scope.settings = p.settings();
+                self.scope.settings.calibration = cal;
+            }
+        }
+        if let Some((text, error)) = note {
+            self.notify(text, error);
+        }
+        self.changed();
     }
 
     /// Save the calibration in the config file now (only it: the other

@@ -11,6 +11,7 @@ pub mod keys;
 pub mod logger;
 pub mod panel;
 pub mod plot;
+pub mod probecal;
 pub mod scope;
 pub mod settings;
 pub mod si;
