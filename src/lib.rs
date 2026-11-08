@@ -15,5 +15,6 @@ pub mod probecal;
 pub mod scope;
 pub mod settings;
 pub mod si;
+pub mod stream;
 pub mod theme;
 pub mod ui;
