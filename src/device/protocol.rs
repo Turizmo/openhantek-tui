@@ -126,10 +126,12 @@ pub fn choose_rate(screen_time: f64, two_channels: bool) -> Rate {
         .unwrap_or(RATES[0])
 }
 
-/// Fastest ADC rate used in roll mode. Roll mode streams without end, and
-/// between two USB reads the scope FIFO must hold the data. At 400 kS/s it
-/// holds a few ms, which is enough; at 1 MS/s samples get lost.
-pub const MAX_ROLL_RAW: f64 = 400e3;
+/// Fastest ADC rate used in roll mode. Roll mode streams without end
+/// through the async USB stream (gapless up to 32 MB/s), so it can use the
+/// same ADC rates as blocks at the roll time bases (1 MS/s at 100 ms/div,
+/// with 100x oversampling). With one synchronous read at a time it had to
+/// stay at 400 kS/s, or the scope FIFO overflowed between reads.
+pub const MAX_ROLL_RAW: f64 = 1e6;
 
 /// Sample rate for roll mode: the same output rate as [`choose_rate`],
 /// but with the ADC at most at [`MAX_ROLL_RAW`] (less oversampling).
@@ -489,7 +491,9 @@ mod tests {
             assert_eq!(raw_rate_of_id(r.id), r.raw);
             assert!((r.raw / r.oversample as f64 - r.rate).abs() < 1e-9, "{r:?}");
         }
-        assert_eq!(roll_rate(1.0).oversample, 40);
+        // The same rate and oversampling as a block at 100 ms/div.
+        assert_eq!(roll_rate(1.0), choose_rate(1.0, true));
+        assert_eq!(roll_rate(1.0).oversample, 100);
     }
 
     #[test]
