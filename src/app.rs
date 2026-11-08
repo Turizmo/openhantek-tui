@@ -5,10 +5,9 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::acquire::{Acquisition, Command, Event, LogRequest};
+use crate::acquire::{Acquisition, Block, Command, Event, LogRequest};
 use crate::calib::{ZeroCal, ZeroOutcome};
 use crate::config::SaveTarget;
-use crate::device::protocol::AppCal;
 use crate::export;
 use crate::keys::{Act, KeyMap, View};
 use crate::logger::view::LogView;
@@ -19,6 +18,7 @@ use crate::panel::{Action, DeviceInfo, Outcome, Panel};
 use crate::probecal::ProbeCal;
 use crate::scope::{Scope, MATH};
 use crate::settings::*;
+use crate::stream::pipeline::Published;
 
 /// What a logger key does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +120,6 @@ pub struct App {
     pub zero_cal: Option<ZeroCal>,
     /// The open probe helper (calibration output).
     pub probe_cal: Option<ProbeCal>,
-    sent_cal: Option<AppCal>,
 }
 
 fn next_in<T: PartialEq + Copy>(list: &[T], v: T) -> T {
@@ -160,7 +159,6 @@ impl App {
             ask_zero_cal: false,
             zero_cal: None,
             probe_cal: None,
-            sent_cal: None,
         };
         app.sync();
         app
@@ -195,6 +193,9 @@ impl App {
         let mut changed = false;
         while let Some(ev) = self.acq.as_ref().and_then(|a| a.try_recv()) {
             changed |= self.handle_event(ev);
+        }
+        if let Some(p) = self.acq.as_ref().and_then(|a| a.latest()) {
+            changed |= self.handle_published(*p);
         }
         if self.zero_cal.as_ref().is_some_and(|z| z.timed_out()) {
             self.end_zero_cal(Err("no data from the scope".into()));
@@ -507,14 +508,31 @@ impl App {
         }
     }
 
+    /// Take the newest frame of the stream processing.
+    pub fn handle_published(&mut self, p: Published) -> bool {
+        if self.zero_cal.is_some() && p.gen == self.scope.gen {
+            if let Some(b) = &p.snapshot {
+                self.zero_cal_block(b);
+            }
+        }
+        self.scope.take(p)
+    }
+
+    /// Take one block (in volts at the BNC) as if the stream processing
+    /// made a frame of it. The UI tests feed blocks this way.
+    pub fn handle_block(&mut self, b: Block) -> bool {
+        if self.zero_cal.is_some() && b.gen == self.scope.gen {
+            self.zero_cal_block(&b);
+        }
+        self.scope.push(b)
+    }
+
     /// Handle one event from the acquisition thread.
     pub fn handle_event(&mut self, ev: Event) -> bool {
         match ev {
-            Event::Block(b) => {
-                if self.zero_cal.is_some() && b.gen == self.scope.gen {
-                    self.zero_cal_block(&b);
-                }
-                self.scope.push(*b)
+            Event::Restart(why) => {
+                self.notify(why.message(), true);
+                true
             }
             Event::Status(s) => {
                 self.status = Some(s);
@@ -557,11 +575,12 @@ impl App {
             self.notify(n, false);
             changed = true;
         }
-        let cal = self.scope.settings.calibration.app_cal();
-        if self.sent_cal != Some(cal) {
-            self.sent_cal = Some(cal);
+        if let Some((pgen, p)) = self.scope.sync_proc() {
             if let Some(a) = &self.acq {
-                a.send(Command::Calibration(cal));
+                a.send(Command::Process {
+                    pgen,
+                    p: Box::new(p),
+                });
             }
         }
         if let Some((gen, cfg)) = self.scope.sync_hw() {

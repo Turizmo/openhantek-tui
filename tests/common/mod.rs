@@ -7,6 +7,7 @@ use openhantek_tui::acquire::{Acquisition, Block, Opener};
 use openhantek_tui::app::App;
 use openhantek_tui::device::fake::{FakeScope, Wave};
 use openhantek_tui::device::hantek::Scope6022;
+use openhantek_tui::device::protocol::BLOCK_SAMPLES;
 use openhantek_tui::device::{Connection, Driver};
 use openhantek_tui::settings::Settings;
 
@@ -52,25 +53,32 @@ pub fn tick_until(app: &mut App, secs: f64, mut done: impl FnMut(&App) -> bool) 
     panic!("timed out; state {:?}", app.scope.state);
 }
 
-/// Capture one block for the app's current hardware settings, without the
-/// thread. Good for UI tests that need exact control.
-pub fn block_for(app: &App, d: &mut Driver) -> Block {
+/// One block for the app's current hardware settings from the fake,
+/// without the thread. Good for UI tests that need exact control. Roll
+/// mode gives a piece of the stream; else a fresh start of the stream
+/// (the signal time goes on).
+pub fn block_for(app: &App, d: &mut Driver, fake: &FakeScope) -> Block {
     let cfg = app.scope.hw.expect("hw config");
-    let cap = if cfg.roll {
-        d.stream(&cfg).unwrap()
-    } else {
-        d.capture(&cfg).unwrap()
-    };
-    Block {
-        gen: app.scope.gen,
-        cfg,
-        data: cap.data,
-        min: cap.min,
-        max: cap.max,
-        clipped: cap.clipped,
-        range: cap.range,
-        rate: cap.rate,
-        roll: cfg.roll,
-        trigger: None,
+    if cfg.roll {
+        let cap = d.stream(&cfg).unwrap();
+        return Block {
+            gen: app.scope.gen,
+            cfg,
+            data: cap.data,
+            min: cap.min,
+            max: cap.max,
+            clipped: cap.clipped,
+            range: cap.range,
+            rate: cap.rate,
+            roll: true,
+            trigger: None,
+        };
     }
+    if d.streaming().is_some() {
+        d.stop().unwrap();
+    }
+    let os = cfg.rate.oversample;
+    let frames = (2048 / os + 1) * os + BLOCK_SAMPLES * os;
+    let raw = fake.raw(&cfg, frames);
+    d.raw_block(&cfg, &raw, app.scope.gen)
 }

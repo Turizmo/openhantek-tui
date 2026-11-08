@@ -21,6 +21,7 @@ use ratatui::Terminal;
 struct Rig {
     app: App,
     driver: openhantek_tui::device::Driver,
+    fake: FakeScope,
 }
 
 impl Rig {
@@ -32,14 +33,14 @@ impl Rig {
             name: "TESTSCOPE".into(),
             notes: vec![],
         });
-        Self { app, driver }
+        Self { app, driver, fake }
     }
 
     /// Push one block made with the current settings.
     fn feed(&mut self) {
         self.app.tick();
-        let b = block_for(&self.app, &mut self.driver);
-        self.app.handle_event(Event::Block(Box::new(b)));
+        let b = block_for(&self.app, &mut self.driver, &self.fake);
+        self.app.handle_block(b);
     }
 
     fn key(&mut self, code: KeyCode) {

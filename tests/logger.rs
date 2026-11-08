@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::*;
-use openhantek_tui::acquire::{Acquisition, Command, Event, LogRequest};
+use openhantek_tui::acquire::{Acquisition, Command, LogRequest};
+use openhantek_tui::stream::pipeline::ProcSettings;
 use openhantek_tui::device::fake::{FakeScope, Wave};
 use openhantek_tui::logger::reader::LogFile;
 use openhantek_tui::logger::writer::{self, LogState, Shared, StopReason};
@@ -111,16 +112,6 @@ fn records_without_gaps_at_1_ms() {
         x[1][0] < -1.35 && x[1][1] > 1.35 && x[1][2].abs() < 0.1,
         "{x:?}"
     );
-    // After the log, the scope goes back to blocks for the UI.
-    let mut block = false;
-    for _ in 0..100 {
-        if let Some(Event::Block(_)) = acq.recv_timeout(Duration::from_millis(50)) {
-            block = true;
-            break;
-        }
-    }
-    // No Configure was sent after the log, so there may be none.
-    let _ = block;
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -314,20 +305,22 @@ fn size_limit_stops_the_log() {
     assert_eq!(sh.lock().unwrap().bytes, len);
     let f = LogFile::open(&path).unwrap();
     assert!(f.end() > 16_000, "{}", f.end());
-    // The thread goes back to normal capture: a Configure gives blocks.
+    // The thread goes back to normal capture: settings give frames.
     let app = openhantek_tui::app::App::new(Default::default(), None);
     let cfg = app.scope.hw_config();
     acq.send(Command::Configure { gen: 7, cfg });
+    let p = Box::new(ProcSettings::of(&app.scope.settings, 0));
+    acq.send(Command::Process { pgen: 1, p });
     let mut ok = false;
     for _ in 0..200 {
-        if let Some(Event::Block(b)) = acq.recv_timeout(Duration::from_millis(50)) {
-            if b.gen == 7 {
-                ok = true;
-                break;
-            }
+        drain(&acq);
+        if acq.latest().is_some_and(|p| p.gen == 7) {
+            ok = true;
+            break;
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(ok, "no block after the log stopped");
+    assert!(ok, "no frame after the log stopped");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

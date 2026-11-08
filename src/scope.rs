@@ -9,7 +9,7 @@ use crate::device::protocol::{choose_rate, gain_index, hw_channels, nominal_rang
 use crate::dsp::measure::{measure, Measurements};
 use crate::dsp::trigger::find_trigger;
 use crate::settings::*;
-use crate::stream::pipeline::{self, Averaging, ProcSettings, Roll, MARGIN};
+use crate::stream::pipeline::{self, Averaging, ProcSettings, Published, Roll, MARGIN};
 
 /// Index of the math trace in [`Frame::traces`].
 pub const MATH: usize = 2;
@@ -124,6 +124,12 @@ pub struct Scope {
     pub state: TrigState,
     /// Generation of the hardware settings now in use.
     pub gen: u64,
+    /// Generation of the processing settings now in use.
+    pub pgen: u64,
+    /// The processing settings last sent.
+    proc: Option<ProcSettings>,
+    /// Counts the arms of the single trigger.
+    arm: u64,
     pub hw: Option<HwConfig>,
     /// The average and peak band over the last triggers.
     avg: Averaging,
@@ -140,6 +146,8 @@ pub struct Scope {
     ac_mean: [f64; 2],
     /// Seconds of signal since the last trigger (Auto mode timeout).
     untriggered_secs: f64,
+    /// Triggers in the average of the last frame.
+    pub averaged: usize,
 }
 
 pub use crate::stream::pipeline::TRIGGER_INSIDE;
@@ -154,6 +162,9 @@ impl Scope {
             history: VecDeque::new(),
             state: TrigState::Auto,
             gen: 0,
+            pgen: 0,
+            proc: None,
+            arm: 0,
             hw: None,
             avg: Averaging::default(),
             roll: Roll::default(),
@@ -163,6 +174,7 @@ impl Scope {
             adc_range: [None; 2],
             ac_mean: [0.0; 2],
             untriggered_secs: 0.0,
+            averaged: 0,
         }
     }
 
@@ -254,6 +266,59 @@ impl Scope {
         Some((self.gen, cfg))
     }
 
+    /// Call after any settings change. When the processing settings
+    /// changed, this makes a new processing generation and returns what to
+    /// send.
+    pub fn sync_proc(&mut self) -> Option<(u64, ProcSettings)> {
+        let p = ProcSettings::of(&self.settings, self.arm);
+        if self.proc.as_ref() == Some(&p) {
+            return None;
+        }
+        self.pgen += 1;
+        self.proc = Some(p.clone());
+        Some((self.pgen, p))
+    }
+
+    /// Take the newest frame of the stream processing. Returns true when
+    /// the screen changed.
+    pub fn take(&mut self, p: Published) -> bool {
+        if p.gen != self.gen || p.pgen != self.pgen || !self.running {
+            return false;
+        }
+        let hw = self.hw;
+        for c in 0..2 {
+            if let Some(h) = hw {
+                self.adc_range[c] = Some((h.gains[c], p.range[c]));
+            }
+            self.ac_mean[c] = p.ac_mean[c];
+        }
+        if let Some(step) = self.autoset {
+            if let Some(b) = &p.snapshot {
+                self.autoset_step(step, b);
+            }
+            self.last_block = p.snapshot;
+            return false;
+        }
+        if p.snapshot.is_some() {
+            self.last_block = p.snapshot;
+        }
+        let new = p.frame.is_some();
+        if let Some(f) = p.frame {
+            if f.roll {
+                self.frame = Some(f);
+            } else {
+                self.set_frame(f);
+            }
+        }
+        self.state = p.state;
+        self.averaged = p.averaged;
+        if p.single_done {
+            self.running = false;
+            self.state = TrigState::Stopped;
+        }
+        new || p.single_done
+    }
+
     /// Start the capture average (and its peak band) over.
     fn reset_average(&mut self) {
         self.avg.reset();
@@ -315,6 +380,7 @@ impl Scope {
         self.settings.trigger.mode = TriggerMode::Single;
         self.running = true;
         self.state = TrigState::Waiting;
+        self.arm += 1;
     }
 
     /// Channel samples at the probe tip: probe, invert, AC coupling.

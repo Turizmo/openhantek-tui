@@ -1,10 +1,18 @@
-//! Acquisition thread: talks to the scope and sends sample blocks to the UI.
-//! The UI sends settings; each settings change gets a new generation
-//! number, so the UI can drop blocks made with old settings.
+//! Acquisition: the processing thread. It talks to the scope, runs the
+//! stream processing on the ring the USB side writes, and hands the
+//! newest frame to the UI through [`Latest`]. The UI sends settings; each
+//! hardware change gets a new generation number (`gen`, the stream
+//! starts again) and each processing change another (`pgen`, only the
+//! processing starts over), so the UI can drop frames made with old ones.
+//!
+//! Three threads: the USB events thread only copies transfers into the
+//! ring; this thread does everything else; the UI takes finished frames.
+//! A slow UI never makes this thread drop data: a frame the UI did not
+//! take is replaced by a newer one.
 
-use std::sync::mpsc::{
-    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -18,6 +26,8 @@ use crate::logger::binner::Binner;
 use crate::logger::format::{ChannelInfo, Header};
 use crate::logger::gapcheck::GapCheck;
 use crate::logger::writer::{self, LogState, Msg, Shared, Writer};
+use crate::stream::pipeline::{Pipeline, ProcSettings, Published};
+use crate::stream::ring::{Failure, Ring, MARK_SHORT, STREAM_RING};
 
 pub enum Command {
     /// Use these hardware settings from now on.
@@ -25,16 +35,19 @@ pub enum Command {
         gen: u64,
         cfg: HwConfig,
     },
+    /// Use these processing settings from now on: the trigger search
+    /// and the average start over, the stream goes on.
+    Process {
+        pgen: u64,
+        p: Box<ProcSettings>,
+    },
     /// Capture (true) or stop (false).
     Run(bool),
     /// Start the envelope logger. While it runs, the scope streams with
     /// the logger's settings, `Configure` waits until the log stops, and
-    /// no blocks go to the UI.
+    /// no frames go to the UI.
     StartLog(LogRequest),
     StopLog,
-    /// Use the app's own calibration (from the config file) from now on,
-    /// also after a reconnect. Never written to the scope.
-    Calibration(AppCal),
     Quit,
 }
 
@@ -268,6 +281,27 @@ pub struct Block {
     pub trigger: Option<f64>,
 }
 
+/// Why the stream started again by itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Restart {
+    /// The processing fell so far behind that the ring was full: data
+    /// was dropped.
+    Overrun,
+    /// The scope or USB lost samples (the reason).
+    UsbLoss(String),
+}
+
+impl Restart {
+    pub fn message(&self) -> String {
+        match self {
+            Restart::Overrun => {
+                "Processing fell behind and samples were lost: the stream started again".into()
+            }
+            Restart::UsbLoss(why) => format!("USB lost samples ({why}): the stream started again"),
+        }
+    }
+}
+
 pub enum Event {
     /// Progress text, like "Loading firmware".
     Status(String),
@@ -278,8 +312,36 @@ pub enum Event {
     /// The scope went away. The thread keeps trying to open it again.
     Disconnected(String),
     Error(String),
-    /// Boxed: a block is big, the other events are small.
-    Block(Box<Block>),
+    /// The stream started again after a loss of data.
+    Restart(Restart),
+}
+
+/// The newest frame the processing made, for the UI. A new one replaces
+/// one the UI did not take yet.
+#[derive(Default)]
+pub struct Latest {
+    slot: Mutex<Option<Box<Published>>>,
+    fresh: AtomicBool,
+}
+
+impl Latest {
+    pub fn put(&self, p: Box<Published>) {
+        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+        self.fresh.store(true, Ordering::Release);
+    }
+
+    /// The newest frame, if one came since the last call.
+    pub fn take(&self) -> Option<Box<Published>> {
+        if !self.fresh.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// True when a frame is waiting.
+    pub fn fresh(&self) -> bool {
+        self.fresh.load(Ordering::Acquire)
+    }
 }
 
 /// Opens the scope. Gets a callback for progress texts.
@@ -288,20 +350,30 @@ pub type Opener = Box<dyn FnMut(&mut dyn FnMut(&str)) -> Result<Connection> + Se
 pub struct Acquisition {
     tx: Sender<Command>,
     rx: Option<Receiver<Event>>,
+    latest: Arc<Latest>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Acquisition {
     pub fn spawn(opener: Opener) -> Self {
+        Self::spawn_with(opener, STREAM_RING)
+    }
+
+    /// [`Acquisition::spawn`] with a stream ring of `ring` bytes (a power
+    /// of two; the tests use small ones).
+    pub fn spawn_with(opener: Opener, ring: usize) -> Self {
         let (tx, cmd_rx) = mpsc::channel();
-        let (ev_tx, rx) = mpsc::sync_channel(8);
+        let (ev_tx, rx) = mpsc::channel();
+        let latest = Arc::new(Latest::default());
+        let l2 = latest.clone();
         let handle = std::thread::Builder::new()
             .name("acquisition".into())
-            .spawn(move || Worker::new(opener, cmd_rx, ev_tx).run())
+            .spawn(move || Worker::new(opener, cmd_rx, ev_tx, l2, ring).run())
             .expect("start the acquisition thread");
         Self {
             tx,
             rx: Some(rx),
+            latest,
             handle: Some(handle),
         }
     }
@@ -318,12 +390,16 @@ impl Acquisition {
     pub fn recv_timeout(&self, timeout: Duration) -> Option<Event> {
         self.rx.as_ref()?.recv_timeout(timeout).ok()
     }
+
+    /// The newest frame, if one came since the last call.
+    pub fn latest(&self) -> Option<Box<Published>> {
+        self.latest.take()
+    }
 }
 
 impl Drop for Acquisition {
     fn drop(&mut self) {
         let _ = self.tx.send(Command::Quit);
-        // Drop our end, so a blocked send in the thread returns.
         self.rx = None;
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -331,43 +407,88 @@ impl Drop for Acquisition {
     }
 }
 
+/// The running scope stream and its processing.
+struct Live {
+    gen: u64,
+    cfg: HwConfig,
+    ring: Arc<Ring>,
+    pipeline: Pipeline,
+    /// Checks the transfer times against the data: a scope FIFO that
+    /// overflowed loses data silently.
+    check: GapCheck,
+    /// Bytes at the end of the last transfer mark.
+    mark_end: u64,
+    /// When data last came.
+    data_at: Instant,
+    written: u64,
+}
+
 struct Worker {
     opener: Opener,
     cmd_rx: Receiver<Command>,
-    ev_tx: SyncSender<Event>,
+    ev_tx: Sender<Event>,
+    latest: Arc<Latest>,
     conn: Option<Connection>,
     want: Option<(u64, HwConfig)>,
+    process: Option<(u64, ProcSettings)>,
     running: bool,
     quit: bool,
     last_error: Option<String>,
     log: Option<LogSession>,
     /// The app's calibration, put into each connection.
     app_cal: AppCal,
+    /// The stream ring, made at the first stream and used for all.
+    ring: Option<Arc<Ring>>,
+    ring_size: usize,
+    live: Option<Live>,
 }
 
 impl Worker {
-    fn new(opener: Opener, cmd_rx: Receiver<Command>, ev_tx: SyncSender<Event>) -> Self {
+    fn new(
+        opener: Opener,
+        cmd_rx: Receiver<Command>,
+        ev_tx: Sender<Event>,
+        latest: Arc<Latest>,
+        ring_size: usize,
+    ) -> Self {
         Self {
             opener,
             cmd_rx,
             ev_tx,
+            latest,
             conn: None,
             want: None,
+            process: None,
             running: true,
             quit: false,
             last_error: None,
             log: None,
             app_cal: AppCal::default(),
+            ring: None,
+            ring_size,
+            live: None,
         }
     }
 
     fn handle(&mut self, cmd: Command) {
         match cmd {
             Command::Configure { gen, cfg } => self.want = Some((gen, cfg)),
+            Command::Process { pgen, p } => {
+                self.app_cal = p.cal;
+                if let Some(c) = &mut self.conn {
+                    c.driver.cal.app = p.cal;
+                }
+                if let Some(l) = &mut self.live {
+                    let newest = l.ring.frames();
+                    l.pipeline.set_proc(pgen, (*p).clone(), newest);
+                }
+                self.process = Some((pgen, *p));
+            }
             Command::Run(run) => {
                 self.running = run;
                 // A log keeps the scope running.
                 if !run && self.log.is_none() {
+                    self.stop_stream();
                     if let Some(c) = &mut self.conn {
                         let _ = c.driver.stop();
                     }
@@ -375,15 +496,10 @@ impl Worker {
             }
             Command::StartLog(req) => {
                 self.stop_log();
+                self.stop_stream();
                 self.log = Some(LogSession::new(req));
             }
             Command::StopLog => self.stop_log(),
-            Command::Calibration(cal) => {
-                self.app_cal = cal;
-                if let Some(c) = &mut self.conn {
-                    c.driver.cal.app = cal;
-                }
-            }
             Command::Quit => self.quit = true,
         }
     }
@@ -400,6 +516,15 @@ impl Worker {
             }
             l.finish();
             // Start the normal capture from scratch.
+            if let Some(c) = &mut self.conn {
+                let _ = c.driver.stop();
+            }
+        }
+    }
+
+    /// End the scope stream (the scope stops sampling).
+    fn stop_stream(&mut self) {
+        if self.live.take().is_some() {
             if let Some(c) = &mut self.conn {
                 let _ = c.driver.stop();
             }
@@ -444,14 +569,38 @@ impl Worker {
         self.emit(Event::Error(msg))
     }
 
+    /// A stream error: the scope is gone, or try again.
+    fn stream_error(&mut self, e: anyhow::Error) {
+        self.stop_stream();
+        if is_gone(&e) {
+            self.conn = None;
+            if !self.emit(Event::Disconnected(format!("{e:#}"))) {
+                self.quit = true;
+            }
+            self.poll(Some(Duration::from_millis(500)));
+        } else if is_timeout(&e) {
+            if !self.error_once("USB timeout, trying again".into()) {
+                self.quit = true;
+            }
+        } else {
+            if !self.error_once(format!("{e:#}")) {
+                self.quit = true;
+            }
+            self.poll(Some(Duration::from_millis(200)));
+        }
+    }
+
     fn run(mut self) {
         while !self.quit {
             self.poll(None);
             if self.quit {
                 break;
             }
-            if self.conn.is_none() && !self.connect() {
-                continue;
+            if self.conn.is_none() {
+                self.live = None;
+                if !self.connect() {
+                    continue;
+                }
             }
             if self.log.as_ref().is_some_and(|l| l.writer_done()) {
                 // The size limit (or a write error) ended the log.
@@ -462,66 +611,129 @@ impl Worker {
                 self.log_step(cfg);
                 continue;
             }
-            let (Some((gen, cfg)), true) = (self.want, self.running) else {
+            let (Some((gen, cfg)), Some((pgen, p)), true) =
+                (self.want, self.process.clone(), self.running)
+            else {
+                self.stop_stream();
                 self.poll(Some(Duration::from_millis(50)));
                 continue;
             };
-            let conn = self.conn.as_mut().expect("connected");
-            let result = if cfg.roll {
-                conn.driver.stream(&cfg)
-            } else {
-                conn.driver.capture(&cfg)
-            };
-            match result {
-                Ok(cap) => {
-                    self.last_error = None;
-                    let block = Block {
-                        gen,
-                        cfg,
-                        data: cap.data,
-                        min: cap.min,
-                        max: cap.max,
-                        clipped: cap.clipped,
-                        range: cap.range,
-                        rate: cap.rate,
-                        roll: cfg.roll,
-                        trigger: None,
-                    };
-                    if cfg.roll {
-                        // Roll pieces must all arrive, or the trace gets gaps.
-                        if !self.emit(Event::Block(Box::new(block))) {
-                            break;
-                        }
-                    } else if let Err(TrySendError::Disconnected(_)) =
-                        self.ev_tx.try_send(Event::Block(Box::new(block)))
-                    {
-                        // A full queue just drops the block: the UI is behind.
-                        break;
-                    }
-                }
-                Err(e) if is_gone(&e) => {
-                    self.conn = None;
-                    if !self.emit(Event::Disconnected(format!("{e:#}"))) {
-                        break;
-                    }
-                    self.poll(Some(Duration::from_millis(500)));
-                }
-                Err(e) if is_timeout(&e) => {
-                    if !self.error_once("USB timeout, trying again".into()) {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if !self.error_once(format!("{e:#}")) {
-                        break;
-                    }
-                    self.poll(Some(Duration::from_millis(200)));
+            if self
+                .live
+                .as_ref()
+                .is_none_or(|l| l.gen != gen || l.cfg != cfg)
+            {
+                self.stop_stream();
+                if let Err(e) = self.start_stream(gen, cfg, pgen, p) {
+                    self.stream_error(e);
+                    continue;
                 }
             }
+            self.process_stream();
         }
         self.stop_log();
+        self.stop_stream();
         if let Some(c) = &mut self.conn {
             let _ = c.driver.stop();
+        }
+    }
+
+    /// Start the scope stream and its processing.
+    fn start_stream(&mut self, gen: u64, cfg: HwConfig, pgen: u64, p: ProcSettings) -> Result<()> {
+        let conn = self.conn.as_mut().expect("connected");
+        let ring = self
+            .ring
+            .get_or_insert_with(|| Arc::new(Ring::new(self.ring_size)))
+            .clone();
+        conn.driver.set_ring(ring);
+        let ring = conn.driver.start_stream(&cfg)?;
+        let pipeline = Pipeline::new(gen, pgen, cfg, &conn.driver.cal, p, ring.frames());
+        self.live = Some(Live {
+            gen,
+            cfg,
+            ring,
+            pipeline,
+            check: GapCheck::new(
+                cfg.rate.raw,
+                Scope6022::<Box<dyn Transport>>::transfer_secs(&cfg),
+            ),
+            mark_end: 0,
+            data_at: Instant::now(),
+            written: 0,
+        });
+        Ok(())
+    }
+
+    /// Process what the stream brought; wait a little for more.
+    fn process_stream(&mut self) {
+        let live = self.live.as_mut().expect("streaming");
+        let ring = live.ring.clone();
+        if let Some(Failure::Usb(e)) = ring.failure() {
+            let e = anyhow::Error::new(e).context("reading samples failed");
+            if is_gone(&e) {
+                self.stream_error(e);
+            } else {
+                // A transfer that failed: its data is lost.
+                self.restart(Restart::UsbLoss(format!("{e:#}")));
+            }
+            return;
+        }
+        if ring.overrun() > 0 {
+            self.restart(Restart::Overrun);
+            return;
+        }
+        let ch = live.cfg.channels.clamp(1, 2) as u64;
+        let mut loss = None;
+        for m in ring.take_marks() {
+            let n = (m.end - live.mark_end) / ch;
+            live.mark_end = m.end;
+            if m.flags & MARK_SHORT != 0 {
+                loss = Some("a short transfer".to_string());
+            } else if let Some(lost) = live.check.piece(m.at, n, 0, false) {
+                loss = Some(format!(
+                    "{:.1} ms missing",
+                    lost as f64 / live.cfg.rate.raw * 1e3
+                ));
+            }
+        }
+        if let Some(why) = loss {
+            self.restart(Restart::UsbLoss(why));
+            return;
+        }
+        let latest = self.latest.clone();
+        live.pipeline.step(&ring, &mut |p| latest.put(p));
+        self.last_error = None;
+        if live.pipeline.single_done() {
+            // The single trigger fired: the scope stops.
+            self.running = false;
+            self.stop_stream();
+            return;
+        }
+        let written = ring.written();
+        if written > live.written {
+            live.written = written;
+            live.data_at = Instant::now();
+        }
+        let silent = Duration::from_secs_f64(
+            Scope6022::<Box<dyn Transport>>::transfer_secs(&live.cfg) * 2.0 + 1.0,
+        );
+        if live.data_at.elapsed() > silent {
+            let e = anyhow::Error::new(rusb::Error::Timeout).context(format!(
+                "no samples from the scope for {:.1} s",
+                silent.as_secs_f64()
+            ));
+            self.stream_error(e);
+            return;
+        }
+        // All of it is done: wait for more (commands are looked at often).
+        ring.wait(ring.frames(), Duration::from_millis(10));
+    }
+
+    /// Start the stream again after a loss, and tell the UI.
+    fn restart(&mut self, why: Restart) {
+        self.stop_stream();
+        if !self.emit(Event::Restart(why)) {
+            self.quit = true;
         }
     }
 
@@ -593,13 +805,16 @@ impl Worker {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::device::fake::{FakeScope, Wave};
     use crate::device::hantek::Scope6022;
     use crate::device::protocol::{choose_rate, MAX_ADC_DEFAULT};
     use crate::device::Driver;
-    use std::sync::{Arc, Mutex};
+    use crate::scope::TrigState;
+    use crate::settings::{Settings, TriggerMode};
+    use crate::stream::pipeline::capture_len;
 
     fn fake_opener(fake: FakeScope) -> Opener {
         Box::new(move |_status| {
@@ -613,67 +828,98 @@ mod tests {
         })
     }
 
-    fn cfg(roll: bool) -> HwConfig {
+    fn settings(time_div: f64) -> Settings {
+        let mut s = Settings::default();
+        s.time_idx = crate::scope::time_index(time_div);
+        s.trigger.level = 1.0;
+        s
+    }
+
+    fn cfg_of(s: &Settings) -> HwConfig {
         HwConfig {
-            rate: choose_rate(if roll { 2.0 } else { 0.01 }, 2, MAX_ADC_DEFAULT),
+            rate: choose_rate(s.coarse_screen_time(), 2, MAX_ADC_DEFAULT),
             channels: 2,
             gains: [5, 5],
             dc: [true; 2],
             cal_freq: 1000,
-            roll,
+            roll: s.roll(),
         }
     }
 
-    fn next_block(acq: &Acquisition) -> Block {
-        for _ in 0..200 {
-            if let Some(Event::Block(b)) = acq.recv_timeout(Duration::from_millis(50)) {
-                return *b;
+    /// Settings for the hardware and the processing, both generation `gen`.
+    fn go(acq: &Acquisition, gen: u64, s: &Settings) {
+        acq.send(Command::Configure {
+            gen,
+            cfg: cfg_of(s),
+        });
+        acq.send(Command::Process {
+            pgen: gen,
+            p: Box::new(ProcSettings::of(s, gen)),
+        });
+    }
+
+    /// The next published frame of generation `gen`.
+    fn next_frame(acq: &Acquisition, gen: u64) -> Box<Published> {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(10) {
+            while acq.try_recv().is_some() {}
+            if let Some(p) = acq.latest() {
+                if p.gen == gen && p.frame.is_some() {
+                    return p;
+                }
             }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        panic!("no block");
+        panic!("no frame");
+    }
+
+    /// Wait for an event that `want` takes.
+    fn wait_event(acq: &Acquisition, secs: u64, want: impl Fn(&Event) -> bool) -> bool {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(secs) {
+            if let Some(e) = acq.recv_timeout(Duration::from_millis(20)) {
+                if want(&e) {
+                    return true;
+                }
+            }
+            acq.latest();
+        }
+        false
     }
 
     #[test]
-    fn connects_and_streams_blocks_with_generation() {
-        let fake = FakeScope::new([Wave::Dc(1.0), Wave::Dc(-1.0)]);
+    fn connects_and_streams_frames_with_generation() {
+        let fake = FakeScope::new([Wave::CalOut, Wave::Dc(-1.0)]);
         let acq = Acquisition::spawn(fake_opener(fake));
-        acq.send(Command::Configure {
-            gen: 1,
-            cfg: cfg(false),
-        });
-        let b = next_block(&acq);
-        assert_eq!(b.gen, 1);
-        assert_eq!(b.data[0].len(), crate::device::protocol::BLOCK_SAMPLES);
-        acq.send(Command::Configure {
-            gen: 2,
-            cfg: cfg(true),
-        });
-        // Old blocks may still come; a gen 2 roll block must follow.
-        let mut b = next_block(&acq);
-        while b.gen != 2 {
-            b = next_block(&acq);
-        }
-        assert!(b.roll);
+        let s = settings(1e-3);
+        go(&acq, 1, &s);
+        let p = next_frame(&acq, 1);
+        assert_eq!(p.state, TrigState::Triggered);
+        let f = p.frame.as_ref().unwrap();
+        let (d, _, _) = ProcSettings::of(&s, 1).window(f.rate);
+        assert_eq!(f.traces[0].as_ref().unwrap().len(), capture_len(d));
+        let roll = settings(0.2);
+        go(&acq, 2, &roll);
+        let p = next_frame(&acq, 2);
+        assert_eq!(p.state, TrigState::Roll);
+        assert!(p.frame.as_ref().unwrap().roll);
     }
 
     #[test]
     fn stop_stops_the_scope() {
         let fake = FakeScope::new([Wave::Dc(0.0); 2]);
         let acq = Acquisition::spawn(fake_opener(fake.clone()));
-        acq.send(Command::Configure {
-            gen: 1,
-            cfg: cfg(false),
-        });
-        next_block(&acq);
+        go(&acq, 1, &settings(1e-3));
+        next_frame(&acq, 1);
         acq.send(Command::Run(false));
         std::thread::sleep(Duration::from_millis(200));
-        while acq.try_recv().is_some() {}
         let before = fake.lock().bulk_bytes;
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(fake.lock().bulk_bytes, before);
         assert!(!fake.lock().sampling);
+        acq.latest();
         acq.send(Command::Run(true));
-        next_block(&acq);
+        next_frame(&acq, 1);
     }
 
     #[test]
@@ -696,11 +942,8 @@ mod tests {
             })
         });
         let acq = Acquisition::spawn(opener);
-        acq.send(Command::Configure {
-            gen: 1,
-            cfg: cfg(false),
-        });
-        next_block(&acq);
+        go(&acq, 1, &settings(1e-3));
+        next_frame(&acq, 1);
         fake.lock().unplugged = true;
         let mut saw_disconnect = false;
         let mut saw_error = false;
@@ -717,15 +960,11 @@ mod tests {
         }
         assert!(saw_disconnect && saw_error);
         fake.lock().unplugged = false;
-        let mut connected = false;
-        for _ in 0..100 {
-            if let Some(Event::Connected { .. }) = acq.recv_timeout(Duration::from_millis(50)) {
-                connected = true;
-                break;
-            }
-        }
-        assert!(connected);
-        next_block(&acq);
+        assert!(wait_event(&acq, 5, |e| matches!(
+            e,
+            Event::Connected { .. }
+        )));
+        next_frame(&acq, 1);
         assert!(*opens.lock().unwrap() >= 3);
     }
 
@@ -733,14 +972,95 @@ mod tests {
     fn quit_stops_sampling() {
         let fake = FakeScope::new([Wave::Dc(0.0); 2]);
         let acq = Acquisition::spawn(fake_opener(fake.clone()));
-        acq.send(Command::Configure {
-            gen: 1,
-            cfg: cfg(false),
-        });
-        next_block(&acq);
+        go(&acq, 1, &settings(1e-3));
+        next_frame(&acq, 1);
         drop(acq);
         let calls = fake.lock().calls.clone();
         let last = calls.last().unwrap();
         assert_eq!((last.request, last.data.clone()), (0xE3, vec![0]));
+        assert!(fake.lock().stream.is_none());
+    }
+
+    #[test]
+    fn a_full_ring_restarts_the_stream() {
+        // A capture of 10 ms at 32 MB/s does not fit 64 kB: the reader
+        // must hold the data back, the ring fills.
+        let fake = FakeScope::new([Wave::CalOut, Wave::Dc(0.0)]);
+        fake.lock().realtime = true;
+        let acq = Acquisition::spawn_with(fake_opener(fake), 1 << 16);
+        go(&acq, 1, &settings(1e-3));
+        assert!(wait_event(&acq, 10, |e| matches!(
+            e,
+            Event::Restart(Restart::Overrun)
+        )));
+    }
+
+    #[test]
+    fn lost_samples_and_transfer_errors_restart_the_stream() {
+        let fake = FakeScope::new([Wave::CalOut, Wave::Dc(0.0)]);
+        let acq = Acquisition::spawn(fake_opener(fake.clone()));
+        go(&acq, 1, &settings(1e-3));
+        next_frame(&acq, 1);
+        // The scope's FIFO lost 100 ms: the bus times say so.
+        fake.lock().drop_samples = 1_600_000;
+        assert!(wait_event(&acq, 10, |e| matches!(
+            e,
+            Event::Restart(Restart::UsbLoss(_))
+        )));
+        next_frame(&acq, 1);
+        fake.lock().fail_stream = Some(rusb::Error::Overflow);
+        assert!(wait_event(&acq, 10, |e| matches!(
+            e,
+            Event::Restart(Restart::UsbLoss(w)) if w.contains("Overflow")
+        )));
+        // It goes on after that.
+        next_frame(&acq, 1);
+    }
+
+    #[test]
+    fn single_stops_the_stream_after_its_trigger() {
+        let fake = FakeScope::new([Wave::CalOut, Wave::Dc(0.0)]);
+        let acq = Acquisition::spawn(fake_opener(fake.clone()));
+        let mut s = settings(1e-3);
+        s.trigger.mode = TriggerMode::Single;
+        go(&acq, 1, &s);
+        let p = next_frame(&acq, 1);
+        assert!(p.single_done);
+        assert_eq!(p.triggers, 1);
+        let t0 = Instant::now();
+        while fake.lock().sampling {
+            assert!(t0.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_slow_ui_gets_the_newest_frame_and_every_trigger() {
+        // The cal wave in real time; the UI looks only after 1 s.
+        let fake = FakeScope::new([Wave::CalOut, Wave::Dc(0.0)]);
+        fake.lock().realtime = true;
+        let acq = Acquisition::spawn(fake_opener(fake));
+        let s = settings(1e-3);
+        go(&acq, 1, &s);
+        next_frame(&acq, 1);
+        std::thread::sleep(Duration::from_secs(1));
+        let p = next_frame(&acq, 1);
+        let f = p.frame.as_ref().unwrap();
+        let dt = 1.0 / f.rate;
+        // 1 kHz edges, 10 ms screen with the trigger in the middle: each
+        // trigger rearms 5 ms (and the margin) after its edge, so the
+        // next is 6 ms later.
+        let secs = p.points as f64 * dt;
+        let want = (secs - 0.005 - 2048.0 / 16e6) / 0.006;
+        assert!(
+            (p.triggers as f64 - want).abs() < 2.5,
+            "{} triggers in {secs:.3} s, want {want:.1}",
+            p.triggers
+        );
+        // The frame is of the newest trigger: the capture after it is
+        // still being filled, and the publish is at most a frame time old.
+        let t = p.trigger_at.unwrap() * dt;
+        assert!(secs - t < 0.006 + 0.005 + 0.02, "{secs} {t}");
+        assert!(p.triggers > 150);
     }
 }

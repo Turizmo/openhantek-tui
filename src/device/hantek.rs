@@ -7,6 +7,8 @@ use anyhow::{bail, Context, Result};
 
 use super::protocol::*;
 use super::transport::{Chunk, StreamSetup, Transport};
+use crate::acquire::Block;
+use crate::stream::pipeline::decimate_block;
 use crate::stream::ring::{Failure, Ring, STREAM_RING};
 use std::sync::Arc;
 
@@ -47,37 +49,17 @@ pub struct RawPiece {
     pub at: std::time::Instant,
 }
 
-impl Live {
-    /// Whole points (all channels) in the ring, after `head`.
-    fn points(&self) -> usize {
-        let n = self.cfg.channels.clamp(1, 2) as usize;
-        self.ring[..n].iter().map(|r| r.len()).min().unwrap_or(0) - self.head
-    }
-}
-
 /// Raw samples per channel thrown away after each start: the ADC is not
 /// stable just after sampling starts.
 pub const SKIP_SAMPLES: usize = 2048;
 
-/// One output point of a channel in ADC counts: mean, min, max.
-#[derive(Clone, Copy, Debug)]
-struct Pt {
-    mean: f32,
-    min: u8,
-    max: u8,
-}
-
-/// The running stream: the settings it was started with, the decimator,
-/// and the points of the block being filled.
+/// The running stream: the settings it was started with and the
+/// decimator of roll mode.
 struct Live {
     cfg: HwConfig,
     dec: Decimator,
     /// Raw path: bytes still to throw away at the start.
     skip_bytes: usize,
-    /// Block mode: the points of the next blocks, per channel, from
-    /// `head` on.
-    ring: [Vec<Pt>; 2],
-    head: usize,
 }
 
 pub struct Scope6022<T: Transport> {
@@ -227,19 +209,33 @@ impl<T: Transport> Scope6022<T> {
         Self::stream_setup(cfg).transfer as f64 / (cfg.rate.raw * cfg.channels.clamp(1, 2) as f64)
     }
 
-    /// The next transfer of the stream for `cfg`. Starts the stream when
-    /// none runs or it runs with other settings: sends the settings that
-    /// changed, queues the async transfers, then starts the scope, so no
-    /// data comes before a buffer is ready. On an error the stream ends;
-    /// the next call starts it again.
-    fn next_chunk(&mut self, cfg: &HwConfig) -> Result<Chunk> {
+    /// Use `ring` for the streams from now on (else the first stream
+    /// makes one).
+    pub fn set_ring(&mut self, ring: Arc<Ring>) {
+        if self.stream.is_none() {
+            self.ring = Some(ring);
+        }
+    }
+
+    /// The settings of the running stream, if one runs.
+    pub fn streaming(&self) -> Option<HwConfig> {
+        self.stream.as_ref().map(|l| l.cfg)
+    }
+
+    /// Start the stream for `cfg` into the ring, unless it runs with
+    /// these settings already: send the settings that changed, queue the
+    /// async transfers, then start the scope, so no data comes before a
+    /// buffer is ready. The ring starts over (frame 0 is the first
+    /// sample after the start).
+    pub fn start_stream(&mut self, cfg: &HwConfig) -> Result<Arc<Ring>> {
         if self.stream.as_ref().is_some_and(|l| l.cfg != *cfg) || self.sent != Some(*cfg) {
             self.configure(cfg)?;
         }
+        let ring = self
+            .ring
+            .get_or_insert_with(|| Arc::new(Ring::new(STREAM_RING)))
+            .clone();
         if self.stream.is_none() {
-            let ring = self
-                .ring
-                .get_or_insert_with(|| Arc::new(Ring::new(STREAM_RING)));
             let writer = ring.reset(cfg.channels);
             self.cursor = 0;
             self.t.stream_start(Self::stream_setup(cfg), writer)?;
@@ -252,30 +248,49 @@ impl<T: Transport> Scope6022<T> {
                 cfg: *cfg,
                 dec: Decimator::new(ch, cfg.rate.oversample, SKIP_SAMPLES),
                 skip_bytes: SKIP_SAMPLES * ch as usize,
-                ring: Default::default(),
-                head: 0,
             });
         }
+        Ok(ring)
+    }
+
+    /// Wait until the ring holds `bytes`. An error (and the stream ends)
+    /// when the stream failed, lost data or stays silent.
+    fn wait_bytes(&mut self, ring: &Ring, bytes: u64, cfg: &HwConfig) -> Result<()> {
         let wait = Duration::from_secs_f64(Self::transfer_secs(cfg) * 2.0 + 1.0);
-        let ring = self.ring.clone().expect("ring is set");
         let ch = cfg.channels.clamp(1, 2) as u64;
-        ring.wait(self.cursor / ch, wait);
-        if let Some(Failure::Usb(e)) = ring.failure() {
-            self.end_stream();
-            return Err(anyhow::Error::new(e).context("reading samples failed"));
+        let mut last = (ring.written(), std::time::Instant::now());
+        while ring.written() < bytes {
+            ring.wait(ring.written() / ch, Duration::from_millis(100));
+            if let Some(Failure::Usb(e)) = ring.failure() {
+                self.end_stream();
+                return Err(anyhow::Error::new(e).context("reading samples failed"));
+            }
+            if ring.overrun() > 0 {
+                self.end_stream();
+                bail!("the host was too slow: samples lost");
+            }
+            if ring.written() > last.0 {
+                last = (ring.written(), std::time::Instant::now());
+            } else if last.1.elapsed() > wait {
+                self.end_stream();
+                return Err(anyhow::Error::new(rusb::Error::Timeout).context(format!(
+                    "no samples from the scope for {:.1} s",
+                    wait.as_secs_f64()
+                )));
+            }
         }
-        if ring.overrun() > 0 {
-            self.end_stream();
-            return Err(anyhow::anyhow!("the host was too slow: samples lost"));
-        }
+        Ok(())
+    }
+
+    /// The next piece of the stream for `cfg`: what came since the last
+    /// one. Starts the stream when none runs or it runs with other
+    /// settings. On an error the stream ends; the next call starts it
+    /// again.
+    fn next_chunk(&mut self, cfg: &HwConfig) -> Result<Chunk> {
+        let ring = self.start_stream(cfg)?;
+        self.wait_bytes(&ring, self.cursor + 1, cfg)?;
+        let ch = cfg.channels.clamp(1, 2) as u64;
         let end = ring.written();
-        if end <= self.cursor {
-            self.end_stream();
-            return Err(anyhow::Error::new(rusb::Error::Timeout).context(format!(
-                "no samples from the scope for {:.1} s",
-                wait.as_secs_f64()
-            )));
-        }
         let at = ring
             .take_marks()
             .last()
@@ -287,66 +302,45 @@ impl<T: Transport> Scope6022<T> {
     }
 
     /// Volts per ADC count and volts at count 0, per channel, for `cfg`.
-    fn lines(&self, cfg: &HwConfig) -> [(f64, f64); 2] {
+    pub fn lines(&self, cfg: &HwConfig) -> [(f64, f64); 2] {
         [0, 1].map(|c| self.cal.linear(cfg.gains[c], c, cfg.high_speed()))
     }
 
-    /// Capture one block of [`BLOCK_SAMPLES`] output samples per channel
-    /// for the trigger. The scope streams without a stop (the async
-    /// stream), the ADC at the rate of `cfg` (the top rate), and each
-    /// piece is decimated as it comes into the points of the next blocks,
-    /// so no raw data is kept. Blocks come in stream order, each right
-    /// after the one before: one transfer can fill several (13 at 30 MS/s).
-    /// When data was lost (the caller was more than the stream's 2 s queue
-    /// behind), the points before the gap are dropped.
-    pub fn capture(&mut self, cfg: &HwConfig) -> Result<Captured> {
-        loop {
-            let live = self.stream.as_mut().filter(|l| l.cfg == *cfg);
-            if live.is_some_and(|l| l.points() >= BLOCK_SAMPLES) {
-                break;
-            }
-            let chunk = self.next_chunk(cfg)?;
-            let live = self.stream.as_mut().expect("stream is set");
-            // Less than a block is left: move it to the front (cheap).
-            let head = std::mem::take(&mut live.head);
-            for r in &mut live.ring {
-                r.drain(..head.min(r.len()));
-            }
-            if chunk.lost > 0 {
-                live.ring[0].clear();
-                live.ring[1].clear();
-                live.dec.reset();
-            }
-            let ring = &mut live.ring;
-            live.dec.push(&chunk.data, |c, min, max, mean| {
-                ring[c].push(Pt {
-                    mean: mean as f32,
-                    min,
-                    max,
-                })
-            });
-        }
-        let lines = self.lines(cfg);
-        let live = self.stream.as_mut().expect("stream is set");
-        let range = live.head..live.head + BLOCK_SAMPLES;
-        let mut out = Captured {
-            rate: cfg.rate.rate,
-            ..Default::default()
-        };
-        let peak = cfg.rate.oversample > 1;
-        for (c, &(a, b)) in lines.iter().enumerate().take(cfg.channels.clamp(1, 2) as usize) {
-            let pts = &live.ring[c][range.clone()];
-            out.data[c] = pts.iter().map(|p| a * p.mean as f64 + b).collect();
-            if peak {
-                // A negative slope would swap them; it is positive.
-                out.min[c] = pts.iter().map(|p| a * p.min as f64 + b).collect();
-                out.max[c] = pts.iter().map(|p| a * p.max as f64 + b).collect();
-            }
-            out.clipped[c] = pts.iter().any(|p| p.min == 0 || p.max == 0xFF);
-        }
-        live.head += BLOCK_SAMPLES;
-        out.range = self.range(cfg);
-        Ok(out)
+    /// The stream as blocks of [`BLOCK_SAMPLES`] output samples per
+    /// channel, each right after the one before (the hardware tests).
+    /// Starts the stream for `cfg` when none runs with it.
+    pub fn capture(&mut self, cfg: &HwConfig) -> Result<Block> {
+        let ring = self.start_stream(cfg)?;
+        let ch = cfg.channels.clamp(1, 2) as u64;
+        let os = cfg.rate.oversample.max(1) as u64;
+        let skip = (SKIP_SAMPLES as u64).div_ceil(os) * os * ch;
+        self.cursor = self.cursor.max(skip);
+        let need = BLOCK_SAMPLES as u64 * os * ch;
+        self.wait_bytes(&ring, self.cursor + need, cfg)?;
+        let (lines, range) = (self.lines(cfg), self.range(cfg));
+        let block = ring.read_bytes(self.cursor..self.cursor + need, |a, b| {
+            decimate_block([a, b], cfg, lines, range, 0)
+        });
+        self.cursor += need;
+        ring.keep_from(self.cursor / ch);
+        Ok(block)
+    }
+
+    /// A block from raw stream bytes for `cfg` that start at the start
+    /// of a stream: the unstable samples at the start are skipped.
+    pub fn raw_block(&self, cfg: &HwConfig, raw: &[u8], gen: u64) -> Block {
+        let ch = cfg.channels.clamp(1, 2) as usize;
+        let os = cfg.rate.oversample.max(1);
+        let skip = (SKIP_SAMPLES.div_ceil(os) * os * ch).min(raw.len());
+        let mut b = decimate_block(
+            [&raw[skip..], &[]],
+            cfg,
+            self.lines(cfg),
+            self.range(cfg),
+            gen,
+        );
+        b.roll = cfg.roll;
+        b
     }
 
     /// Roll mode: the next piece of the stream (one transfer), decimated
