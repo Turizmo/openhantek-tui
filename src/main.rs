@@ -164,13 +164,36 @@ fn pop_keyboard_enhancement() {
     let _ = ratatui::crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
 }
 
+/// Shortest time between two frames: at most 60 frames per second.
+const FRAME_TIME: Duration = Duration::from_nanos(16_666_667);
+/// Draw at least this often, also when nothing changed (the clock, old
+/// messages going away).
+const IDLE_REDRAW: Duration = Duration::from_millis(500);
+
+/// Should the loop draw now, `since` the last frame? A change waits for
+/// the frame time, so fast keys and blocks never draw more than 60
+/// frames per second; with no change, the idle redraw.
+fn draw_due(dirty: bool, since: Duration) -> bool {
+    (dirty && since >= FRAME_TIME) || since >= IDLE_REDRAW
+}
+
+/// How long to wait for a key before the next look at the scope: until
+/// the next frame may be drawn, at least 1 ms, at most a frame time.
+fn wait_time(dirty: bool, since: Duration) -> Duration {
+    let wait = if dirty {
+        FRAME_TIME.saturating_sub(since)
+    } else {
+        FRAME_TIME
+    };
+    wait.max(Duration::from_millis(1))
+}
+
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
-    let frame_time = Duration::from_millis(33);
-    let mut last_draw = Instant::now() - frame_time;
+    let mut last_draw = Instant::now() - IDLE_REDRAW;
     let mut dirty = true;
     loop {
         dirty |= app.tick();
-        if dirty || last_draw.elapsed() >= Duration::from_millis(500) {
+        if draw_due(dirty, last_draw.elapsed()) {
             terminal.draw(|f| ui::draw(f, app))?;
             last_draw = Instant::now();
             dirty = false;
@@ -178,8 +201,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
         if app.quit {
             return Ok(());
         }
-        let wait = frame_time.saturating_sub(last_draw.elapsed());
-        if event::poll(wait)? {
+        // Take every waiting key before the next frame: a burst of keys
+        // (a held key) makes one frame, not one per key.
+        let mut wait = wait_time(dirty, last_draw.elapsed());
+        while event::poll(wait)? {
             match event::read()? {
                 TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key);
@@ -188,6 +213,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
                 TermEvent::Resize(_, _) => dirty = true,
                 _ => {}
             }
+            if app.quit {
+                return Ok(());
+            }
+            wait = Duration::ZERO;
         }
     }
 }
@@ -251,4 +280,26 @@ fn measure_once(app: &mut App, csv: Option<&std::path::Path>) -> Result<()> {
         writeln!(out, "Saved {}", path.display())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn at_most_60_frames_per_second() {
+        let ms = Duration::from_millis;
+        // A change right after a frame waits for the frame time.
+        assert!(!draw_due(true, ms(0)));
+        assert!(!draw_due(true, ms(16)));
+        assert!(draw_due(true, ms(17)));
+        // No change: only the idle redraw.
+        assert!(!draw_due(false, ms(100)));
+        assert!(draw_due(false, ms(500)));
+        // A pending change waits only until the frame is due.
+        assert_eq!(wait_time(true, ms(10)), FRAME_TIME - ms(10));
+        assert_eq!(wait_time(true, ms(40)), ms(1));
+        assert_eq!(wait_time(false, ms(0)), FRAME_TIME);
+        assert!(FRAME_TIME.as_secs_f64() * 60.0 >= 0.99999);
+    }
 }
