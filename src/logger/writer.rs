@@ -22,6 +22,9 @@ pub enum Msg {
     Begin(Header),
     /// Records from step `first` on, as f32 values in file order.
     Records { first: u64, data: Vec<f32> },
+    /// Raw records (raw logs) from step `first` on: the u8 ADC values in
+    /// file order.
+    Raw { first: u64, data: Vec<u8> },
     /// Data was lost before the next records.
     Gap,
     /// Close the file.
@@ -209,7 +212,11 @@ impl W {
                 drop(s);
                 self.header = Some(h);
             }
-            Msg::Records { first, data } => self.records(first, &data)?,
+            Msg::Records { first, data } => {
+                let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                self.records(first, &bytes)?
+            }
+            Msg::Raw { first, data } => self.records(first, &data)?,
             Msg::Gap => {
                 self.gap = true;
                 self.gaps += 1;
@@ -219,13 +226,13 @@ impl W {
         Ok(())
     }
 
-    fn records(&mut self, first: u64, data: &[f32]) -> std::io::Result<()> {
+    /// Write records (encoded, `record_bytes` each) from step `first` on.
+    fn records(&mut self, first: u64, data: &[u8]) -> std::io::Result<()> {
         let Some(h) = &self.header else {
             return Ok(());
         };
         let size = h.record_bytes() as u64;
-        let per = (size / 4) as usize;
-        let n = (data.len() / per.max(1)) as u64;
+        let n = data.len() as u64 / size.max(1);
         if n == 0 {
             return Ok(());
         }
@@ -252,9 +259,8 @@ impl W {
                 self.size += CHUNK_HEADER as u64;
                 self.gap = false;
             }
-            for v in &data[..take as usize * per] {
-                self.buf.extend_from_slice(&v.to_le_bytes());
-            }
+            self.buf
+                .extend_from_slice(&data[..(take * size) as usize]);
             self.size += take * size;
             self.next = first + take;
             self.records += take;

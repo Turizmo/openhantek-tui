@@ -19,6 +19,12 @@ use super::transport::{Chunk, ControlCall, StreamSetup, Transport, VENDOR_IN, VE
 /// scope side, without a report.
 pub const USB_MAX_BYTES: f64 = 40e6;
 
+/// Most samples in one wave table of the fake.
+const TABLE_MAX: usize = 1 << 22;
+/// Noise values in the fake's table (a prime, so it does not line up
+/// with wave periods).
+const NOISE_LEN: usize = 65_521;
+
 /// A test signal at the BNC input, in volts.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Wave {
@@ -124,6 +130,15 @@ pub struct FakeState {
     t: f64,
     since_start: usize,
     rng: u64,
+    /// One period of each wave in clean ADC values (see
+    /// [`FakeState::tables`]); empty: compute each sample.
+    table: [Vec<f32>; 2],
+    /// Noise values, used in turn.
+    noise_table: Vec<f32>,
+    noise_at: usize,
+    /// The settings the tables are for.
+    #[allow(clippy::type_complexity)]
+    table_key: Option<(u8, [u8; 2], u8, [u8; 2], String, u64)>,
     clock: Option<Instant>,
 }
 
@@ -179,6 +194,10 @@ impl FakeScope {
                 t: 0.0,
                 since_start: 0,
                 rng: 0x9E37_79B9_7F4A_7C15,
+                table: Default::default(),
+                noise_table: Vec::new(),
+                noise_at: 0,
+                table_key: None,
                 clock: None,
             })),
         }
@@ -215,7 +234,64 @@ impl FakeState {
         next() + next()
     }
 
-    fn sample(&mut self, ch: usize) -> u8 {
+    /// The clean ADC value (no noise) of channel `ch` at signal time `t`.
+    fn clean(&self, ch: usize, t: f64) -> f32 {
+        let cal_freq = cal_freq_of_code(self.cal_code);
+        let v = self.waves[ch].at(t, cal_freq);
+        (self.zero[ch] as f64 + v * counts_per_volt(self.gain_byte[ch])) as f32
+    }
+
+    /// Make the sample tables if the settings changed: one period of each
+    /// wave in clean ADC values (when the period is a whole number of
+    /// samples, up to [`TABLE_MAX`]), and a table of noise. A table
+    /// lookup per sample keeps the fake fast at 30 MS/s, also in a
+    /// debug build.
+    fn tables(&mut self) {
+        let key = (
+            self.rate_id,
+            self.gain_byte,
+            self.cal_code,
+            self.zero,
+            format!("{:?}", self.waves),
+            self.noise.to_bits(),
+        );
+        if self.table_key.as_ref() == Some(&key) {
+            return;
+        }
+        let raw = self.raw_rate();
+        let cal_freq = cal_freq_of_code(self.cal_code);
+        for ch in 0..2 {
+            let freq = match self.waves[ch] {
+                Wave::Dc(_) => None,
+                Wave::CalOut => Some(cal_freq),
+                Wave::Sine { freq, .. } | Wave::Square { freq, .. } | Wave::Triangle { freq, .. } => {
+                    Some(freq)
+                }
+            };
+            let period = match freq {
+                None => Some(1),
+                Some(f) => {
+                    let n = raw / f;
+                    (f > 0.0 && (n - n.round()).abs() < 1e-6 && n.round() as usize <= TABLE_MAX)
+                        .then(|| n.round() as usize)
+                }
+            };
+            self.table[ch] = match period {
+                Some(n) => (0..n.max(1)).map(|i| self.clean(ch, i as f64 / raw)).collect(),
+                None => Vec::new(),
+            };
+        }
+        let mut noise = Vec::with_capacity(NOISE_LEN);
+        for _ in 0..NOISE_LEN {
+            noise.push((self.random() * self.noise) as f32);
+        }
+        self.noise_table = noise;
+        self.table_key = Some(key);
+    }
+
+    /// Sample of channel `ch` at the signal time now.
+    #[inline]
+    fn sample(&mut self, ch: usize, raw: f64) -> u8 {
         if self.since_start < self.junk {
             return if self.since_start.is_multiple_of(2) {
                 0x00
@@ -223,11 +299,19 @@ impl FakeState {
                 0xFF
             };
         }
-        let cal_freq = cal_freq_of_code(self.cal_code);
-        let v = self.waves[ch].at(self.t, cal_freq);
-        let n = self.random() * self.noise;
-        let raw = self.zero[ch] as f64 + v * counts_per_volt(self.gain_byte[ch]) + n;
-        raw.round().clamp(0.0, 255.0) as u8
+        let tab = &self.table[ch];
+        let clean = if tab.is_empty() {
+            self.clean(ch, self.t)
+        } else {
+            let n = tab.len();
+            // The index of the signal time in the period.
+            let i = ((self.t * raw).round() as u64 % n as u64) as usize;
+            tab[i]
+        };
+        self.noise_at = (self.noise_at + 1) % NOISE_LEN;
+        (clean + self.noise_table[self.noise_at])
+            .round()
+            .clamp(0.0, 255.0) as u8
     }
 
     fn raw_rate(&self) -> f64 {
@@ -240,27 +324,79 @@ impl FakeState {
 
     /// Let `frames` samples per channel pass without sending them.
     fn skip(&mut self, frames: usize) {
-        let dt = 1.0 / self.raw_rate();
-        for _ in 0..frames {
-            self.t += dt;
-            self.since_start += 1;
-        }
+        self.t += frames as f64 / self.raw_rate();
+        self.since_start += frames;
     }
 
     /// Fill `buf` with samples (whole frames). Returns the bytes used.
     fn fill(&mut self, buf: &mut [u8]) -> usize {
         let channels = self.channels();
-        let dt = 1.0 / self.raw_rate();
+        let raw = self.raw_rate();
+        let dt = 1.0 / raw;
         let n = buf.len() - buf.len() % channels;
+        let frames = n / channels;
         let lost = std::mem::take(&mut self.drop_samples);
         self.skip(lost);
-        for frame in buf[..n].chunks_mut(channels) {
-            for (c, b) in frame.iter_mut().enumerate() {
-                *b = self.sample(c);
-            }
-            self.t += dt;
-            self.since_start += 1;
+        self.tables();
+        // Whole samples from here: the table index of a sample is its
+        // number, so count samples from the time now.
+        let k0 = (self.t * raw).round();
+        let junk = self.junk.saturating_sub(self.since_start).min(frames);
+        for (j, frame) in buf[..junk * channels].chunks_exact_mut(channels).enumerate() {
+            let b = if (self.since_start + j).is_multiple_of(2) {
+                0x00
+            } else {
+                0xFF
+            };
+            frame.fill(b);
         }
+        let fast = self.table[..channels].iter().all(|t| !t.is_empty());
+        if fast {
+            // The hot loop: a table lookup and a noise value per sample.
+            let k = k0 as u64 + junk as u64;
+            let mut idx = [0usize; 2];
+            for (c, i) in idx.iter_mut().enumerate().take(channels) {
+                *i = (k % self.table[c].len() as u64) as usize;
+            }
+            let mut ni = self.noise_at;
+            let noise = &self.noise_table;
+            let (t0, t1) = (&self.table[0], &self.table[1]);
+            let (n0, n1) = (t0.len(), t1.len().max(1));
+            for frame in buf[junk * channels..n].chunks_exact_mut(channels) {
+                ni += 1;
+                if ni == NOISE_LEN {
+                    ni = 0;
+                }
+                frame[0] = (t0[idx[0]] + noise[ni] + 0.5).clamp(0.0, 255.0) as u8;
+                idx[0] += 1;
+                if idx[0] == n0 {
+                    idx[0] = 0;
+                }
+                if channels == 2 {
+                    ni += 1;
+                    if ni == NOISE_LEN {
+                        ni = 0;
+                    }
+                    frame[1] = (t1[idx[1]] + noise[ni] + 0.5).clamp(0.0, 255.0) as u8;
+                    idx[1] += 1;
+                    if idx[1] == n1 {
+                        idx[1] = 0;
+                    }
+                }
+            }
+            self.noise_at = ni;
+            self.since_start += frames;
+        } else {
+            self.since_start += junk;
+            for (j, frame) in buf[junk * channels..n].chunks_mut(channels).enumerate() {
+                self.t = (k0 + (junk + j) as f64) * dt;
+                for (c, b) in frame.iter_mut().enumerate() {
+                    *b = self.sample(c, raw);
+                }
+                self.since_start += 1;
+            }
+        }
+        self.t = (k0 + frames as f64) * dt;
         self.bulk_bytes += n;
         n
     }

@@ -1,7 +1,8 @@
 //! The log file layout. All numbers are little-endian.
 //!
 //! ```text
-//! header   magic "OHTLOG\0\x01", version u16, header_len u16, flags u16,
+//! header   magic "OHTLOG\0\x01", version u16 (1 or 2), header_len u16,
+//!          flags u16 (bit 0, version 2 only: raw records),
 //!          channel mask u8, reserved u8, start time i64 (ns since 1970
 //!          UTC), step u64 (ns), ADC rate f64 (S/s), samples per step u32,
 //!          reserved u32, then 2 channel blocks of 24 bytes (gain index u8,
@@ -16,8 +17,17 @@
 //!          after a crash). A partial record at the end is ignored.
 //! records  one per step, for each logged channel (CH1 first): min, max,
 //!          mean as f32 volts at the probe tip. With one sample per step
-//!          only the value (min = max = mean).
+//!          only the value (min = max = mean). Raw logs (flag bit 0): one
+//!          ADC sample per step, as the raw u8 ADC value; volts at the
+//!          probe tip = (value - zero count) * volts per count * probe,
+//!          negated when inverted (all from the channel block).
 //! ```
+//!
+//! Version 1 files are envelope logs. Version 2 adds the raw flag; the
+//! writer uses it only for raw logs, so envelope logs stay version 1 and
+//! older builds still read them. In a raw log the step is the ADC sample
+//! time (`1 / ADC rate`, like 62.5 ns or 33.3 ns); the step field holds
+//! it rounded to whole ns, and readers use the ADC rate.
 //!
 //! Step `i` covers the time `start + i * step` to `start + (i + 1) *
 //! step`. Missing step numbers between chunks are gaps (no data).
@@ -25,7 +35,12 @@
 use anyhow::{bail, Result};
 
 pub const MAGIC: [u8; 8] = *b"OHTLOG\0\x01";
+/// Version of envelope logs (also read: [`VERSION_RAW`]).
 pub const VERSION: u16 = 1;
+/// Version of raw logs: version 1 plus the raw flag.
+pub const VERSION_RAW: u16 = 2;
+/// Header flag: raw u8 records.
+pub const HEADER_RAW: u16 = 1;
 pub const CHUNK_MAGIC: [u8; 4] = *b"CHNK";
 pub const CHUNK_HEADER: usize = 24;
 /// Record count of an open chunk.
@@ -66,6 +81,13 @@ impl Default for ChannelInfo {
 }
 
 impl ChannelInfo {
+    /// Volts at the probe tip of an ADC value `v`: `a * v + b`.
+    pub fn linear(&self) -> (f32, f32) {
+        let k = self.probe as f32 * if self.invert { -1.0 } else { 1.0 };
+        let a = self.volts_per_count * k;
+        (a, -self.zero_count * a)
+    }
+
     /// Lowest and highest volts at the probe tip the ADC can show.
     pub fn range(&self) -> (f64, f64) {
         let k = self.probe as f64 * if self.invert { -1.0 } else { 1.0 };
@@ -86,6 +108,8 @@ pub struct Header {
     pub channels: [ChannelInfo; 2],
     /// Like `DSO-6022BE 0694CE656429 FW0210`.
     pub device: String,
+    /// Raw log: one ADC sample per step, stored as the u8 ADC value.
+    pub raw: bool,
 }
 
 impl Header {
@@ -104,12 +128,27 @@ impl Header {
     }
 
     pub fn record_bytes(&self) -> usize {
-        super::record_bytes(self.nch(), self.samples_per_step)
+        super::record_bytes(self.nch(), self.samples_per_step, self.raw)
     }
 
-    /// The step in seconds.
+    /// The step in seconds: the ADC sample time for raw logs.
     pub fn step(&self) -> f64 {
-        self.step_ns as f64 * 1e-9
+        if self.raw && self.adc_rate > 0.0 {
+            self.samples_per_step as f64 / self.adc_rate
+        } else {
+            self.step_ns as f64 * 1e-9
+        }
+    }
+
+    /// Start of step `i`, in picoseconds since the start of the log
+    /// (exact for raw logs too, to the ps).
+    pub fn step_ps(&self, i: u64) -> i128 {
+        if self.raw && self.adc_rate >= 1.0 {
+            let rate = self.adc_rate.round() as i128;
+            (i as i128 * self.samples_per_step as i128 * 1_000_000_000_000 + rate / 2) / rate
+        } else {
+            i as i128 * self.step_ns as i128 * 1000
+        }
     }
 
     /// Start time in seconds since 1970 UTC.
@@ -120,9 +159,14 @@ impl Header {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(128);
         b.extend_from_slice(&MAGIC);
-        b.extend_from_slice(&VERSION.to_le_bytes());
+        let (version, flags) = if self.raw {
+            (VERSION_RAW, HEADER_RAW)
+        } else {
+            (VERSION, 0)
+        };
+        b.extend_from_slice(&version.to_le_bytes());
         b.extend_from_slice(&0u16.to_le_bytes()); // header_len, set below
-        b.extend_from_slice(&0u16.to_le_bytes()); // flags
+        b.extend_from_slice(&flags.to_le_bytes());
         let mask = self.channels[0].enabled as u8 | (self.channels[1].enabled as u8) << 1;
         b.push(mask);
         b.push(0);
@@ -159,9 +203,12 @@ impl Header {
         let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
         let f32_at = |i: usize| f32::from_le_bytes(b[i..i + 4].try_into().unwrap());
         let version = u16_at(8);
-        if version != VERSION {
-            bail!("log file version {version} is not supported (this program reads {VERSION})");
+        if version != VERSION && version != VERSION_RAW {
+            bail!(
+                "log file version {version} is not supported (this program reads {VERSION} and {VERSION_RAW})"
+            );
         }
+        let raw = version >= VERSION_RAW && u16_at(12) & HEADER_RAW != 0;
         let len = u16_at(10) as usize;
         if len < 98 || len > b.len() {
             bail!("log file header is cut off");
@@ -171,7 +218,8 @@ impl Header {
         let step_ns = u64::from_le_bytes(b[24..32].try_into().unwrap());
         let adc_rate = f64::from_le_bytes(b[32..40].try_into().unwrap());
         let samples_per_step = u32::from_le_bytes(b[40..44].try_into().unwrap());
-        if step_ns == 0 || samples_per_step == 0 || mask & 3 == 0 {
+        if step_ns == 0 || samples_per_step == 0 || mask & 3 == 0 || (raw && samples_per_step != 1)
+        {
             bail!("log file header has bad values");
         }
         let ch = |c: usize| {
@@ -197,6 +245,7 @@ impl Header {
                 samples_per_step,
                 channels: [ch(0), ch(1)],
                 device,
+                raw,
             },
             len,
         ))
@@ -246,6 +295,20 @@ pub type Rec = [[f32; 3]; 2];
 pub fn decode_records(h: &Header, bytes: &[u8], out: &mut Vec<Rec>) {
     let size = h.record_bytes();
     let logged = h.logged();
+    if h.raw {
+        // Volts at the probe tip = a * value + b, per channel.
+        let lin = [0, 1].map(|c| h.channels[c].linear());
+        out.reserve(bytes.len() / size.max(1));
+        for r in bytes.chunks_exact(size) {
+            let mut rec = [[f32::NAN; 3]; 2];
+            for (k, &c) in logged.iter().enumerate() {
+                let (a, b) = lin[c];
+                rec[c] = [(a * r[k] as f32 + b); 3];
+            }
+            out.push(rec);
+        }
+        return;
+    }
     let per = if h.single() { 1 } else { 3 };
     for r in bytes.chunks_exact(size) {
         let mut rec = [[f32::NAN; 3]; 2];
@@ -267,7 +330,12 @@ pub fn decode_records(h: &Header, bytes: &[u8], out: &mut Vec<Rec>) {
 
 #[cfg(test)]
 pub(crate) fn test_header(channels: [bool; 2], step: f64) -> Header {
-    let (rate, n) = super::adc_for_step(super::step_ns(step), super::hw_channels(channels));
+    let max = crate::device::protocol::MAX_ADC_DEFAULT;
+    let (rate, n) = super::adc_for_step(
+        super::step_ns(step),
+        super::hw_channels(channels, max),
+        max,
+    );
     let mut ch = [ChannelInfo::default(), ChannelInfo::default()];
     ch[0].enabled = channels[0];
     ch[1].enabled = channels[1];
@@ -278,7 +346,21 @@ pub(crate) fn test_header(channels: [bool; 2], step: f64) -> Header {
         samples_per_step: n,
         channels: ch,
         device: "TEST".into(),
+        raw: false,
     }
+}
+
+/// A raw test header: one u8 sample per step at the default top rate.
+#[cfg(test)]
+pub(crate) fn test_raw_header(channels: [bool; 2]) -> Header {
+    let mut h = test_header(channels, 1e-3);
+    let max = crate::device::protocol::MAX_ADC_DEFAULT;
+    let (rate, _) = super::adc_for_step(0, super::hw_channels(channels, max), max);
+    h.raw = true;
+    h.adc_rate = rate.raw;
+    h.samples_per_step = 1;
+    h.step_ns = (1e9 / rate.raw).round() as u64;
+    h
 }
 
 #[cfg(test)]
@@ -329,6 +411,43 @@ mod tests {
         assert!(out[0][0][0].is_nan());
         assert_eq!(out[0][1], [1.5; 3]);
         assert_eq!(out[1][1], [-2.0; 3]);
+    }
+
+    #[test]
+    fn raw_header_and_records() {
+        let mut h = test_raw_header([true, true]);
+        h.channels[1].probe = 10;
+        h.channels[1].invert = true;
+        h.channels[0].zero_count = 128.0;
+        h.channels[0].volts_per_count = 0.04;
+        let b = h.encode();
+        // Version 2 with the raw flag; envelope logs stay version 1.
+        assert_eq!(u16::from_le_bytes([b[8], b[9]]), VERSION_RAW);
+        assert_eq!(u16::from_le_bytes([b[12], b[13]]), HEADER_RAW);
+        assert_eq!(&test_header([true, true], 1e-3).encode()[8..10], &[1, 0]);
+        let (back, _) = Header::decode(&b).unwrap();
+        assert_eq!(back, h);
+        assert!(back.single());
+        assert_eq!(back.record_bytes(), 2);
+        assert!((back.step() - 62.5e-9).abs() < 1e-18);
+        assert_eq!(back.step_ps(3), 187_500);
+        let mut out = Vec::new();
+        decode_records(&back, &[128, 128, 153, 100], &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0][0], [0.0; 3]);
+        assert!((out[1][0][0] - 1.0).abs() < 1e-6);
+        // CH2: x10, inverted, around its own zero count.
+        let (a, z) = (h.channels[1].volts_per_count, h.channels[1].zero_count);
+        assert!((out[1][1][0] - (100.0 - z) * a * -10.0).abs() < 1e-4);
+        // 30 MS/s steps are exact to the ps.
+        let mut h1 = test_raw_header([true, false]);
+        h1.adc_rate = 30e6;
+        assert_eq!(h1.step_ps(3), 100_000);
+        assert_eq!(h1.step_ps(1), 33_333);
+        // A version 1 file with the flag bit set is not raw.
+        let mut v1 = b.clone();
+        v1[8] = 1;
+        assert!(Header::decode(&v1).is_err() || !Header::decode(&v1).unwrap().0.raw);
     }
 
     #[test]

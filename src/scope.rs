@@ -5,11 +5,11 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use crate::acquire::Block;
-use crate::device::protocol::{choose_rate, gain_index, nominal_range, roll_rate, HwConfig};
+use crate::device::protocol::{choose_rate, gain_index, hw_channels, nominal_range, HwConfig};
 use crate::dsp::math::combine;
 use crate::dsp::measure::{measure, Measurements};
 use crate::dsp::trigger::find_trigger;
-use crate::dsp::Averager;
+use crate::dsp::{Averager, PeakHold};
 use crate::settings::*;
 
 /// Index of the math trace in [`Frame::traces`].
@@ -22,7 +22,13 @@ const MARGIN: usize = 8;
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     /// CH1, CH2 and MATH, at the probe tip. `None` when not available.
+    /// Each sample is the mean of the raw samples behind it (and of the
+    /// averaged captures).
     pub traces: [Option<Vec<f64>>; 3],
+    /// The peak band of each trace: the lowest and highest raw sample
+    /// behind each sample, over the averaged captures too. The same
+    /// length as the trace.
+    pub peak: [Option<(Vec<f64>, Vec<f64>)>; 3],
     /// Time between samples, in seconds.
     pub dt: f64,
     /// Time of sample 0, relative to the trigger point, in seconds.
@@ -120,7 +126,12 @@ pub struct Scope {
     pub gen: u64,
     pub hw: Option<HwConfig>,
     averagers: [Averager; 3],
+    /// The peak band over the averaged captures, reset with `averagers`.
+    peaks: [PeakHold; 3],
+    /// Roll mode: mean, min and max per channel.
     roll: [VecDeque<f64>; 2],
+    roll_min: [VecDeque<f64>; 2],
+    roll_max: [VecDeque<f64>; 2],
     roll_rate: f64,
     roll_clipped: [bool; 2],
     last_block: Option<Block>,
@@ -150,7 +161,10 @@ impl Scope {
             gen: 0,
             hw: None,
             averagers: Default::default(),
+            peaks: Default::default(),
             roll: Default::default(),
+            roll_min: Default::default(),
+            roll_max: Default::default(),
             roll_rate: 0.0,
             roll_clipped: [false; 2],
             last_block: None,
@@ -213,12 +227,9 @@ impl Scope {
             || s.math.enabled
             || s.display.xy
             || (!roll && s.trigger.source == 1);
-        let rate = if roll {
-            roll_rate(s.coarse_screen_time())
-        } else {
-            choose_rate(s.coarse_screen_time(), need_ch2)
-        };
-        let channels = if need_ch2 || rate.slow() { 2 } else { 1 };
+        let max = s.acquisition.max_adc_rate;
+        let channels = hw_channels(need_ch2, max);
+        let rate = choose_rate(s.coarse_screen_time(), channels, max);
         let gains = [0, 1].map(|c| gain_index(VOLT_DIVS[s.channels[c].volt_idx]));
         let dc = [0, 1].map(|c| s.channels[c].coupling == Coupling::Dc);
         HwConfig {
@@ -243,9 +254,7 @@ impl Scope {
             .is_none_or(|h| h.roll != cfg.roll || h.rate != cfg.rate);
         self.gen += 1;
         self.hw = Some(cfg);
-        for a in &mut self.averagers {
-            a.reset();
-        }
+        self.reset_average();
         self.history.clear();
         if roll_changed {
             self.clear_roll();
@@ -253,8 +262,23 @@ impl Scope {
         Some((self.gen, cfg))
     }
 
+    /// Start the capture average (and its peak band) over.
+    fn reset_average(&mut self) {
+        for a in &mut self.averagers {
+            a.reset();
+        }
+        for p in &mut self.peaks {
+            p.reset();
+        }
+    }
+
     fn clear_roll(&mut self) {
-        for r in &mut self.roll {
+        for r in self
+            .roll
+            .iter_mut()
+            .chain(&mut self.roll_min)
+            .chain(&mut self.roll_max)
+        {
             r.clear();
         }
         self.roll_clipped = [false; 2];
@@ -283,9 +307,7 @@ impl Scope {
             let running = self.running;
             let state = self.state;
             self.running = true;
-            for a in &mut self.averagers {
-                a.reset();
-            }
+            self.reset_average();
             if !block.roll {
                 self.process(&block);
             }
@@ -325,6 +347,28 @@ impl Scope {
         Some(data.iter().map(|v| (v - mean) * k).collect())
     }
 
+    /// The peak band of a channel at the probe tip, like
+    /// [`Scope::condition`]: low and high (an inverted channel swaps
+    /// them). A block without min and max has a band as thin as the trace.
+    fn condition_peak(&self, block: &Block, c: usize) -> Option<(Vec<f64>, Vec<f64>)> {
+        let data = &block.data[c];
+        if data.is_empty() {
+            return None;
+        }
+        let (min, max) = if block.min[c].len() == data.len() && block.max[c].len() == data.len()
+        {
+            (&block.min[c], &block.max[c])
+        } else {
+            (data, data)
+        };
+        let ch = &self.settings.channels[c];
+        let k = ch.probe as f64 * if ch.invert { -1.0 } else { 1.0 };
+        let mean = ac_mean(block, ch, c);
+        let lo: Vec<f64> = min.iter().map(|v| (v - mean) * k).collect();
+        let hi: Vec<f64> = max.iter().map(|v| (v - mean) * k).collect();
+        Some(if k < 0.0 { (hi, lo) } else { (lo, hi) })
+    }
+
     fn process(&mut self, block: &Block) -> bool {
         for c in 0..2 {
             if !block.data[c].is_empty() {
@@ -333,8 +377,9 @@ impl Scope {
             }
         }
         let ch = [self.condition(block, 0), self.condition(block, 1)];
+        let pk = [self.condition_peak(block, 0), self.condition_peak(block, 1)];
         if block.roll {
-            return self.process_roll(block, ch);
+            return self.process_roll(block, ch, pk);
         }
         let s = &self.settings;
         let rate = block.rate;
@@ -377,19 +422,32 @@ impl Scope {
                 .map(|v| v[start.min(v.len())..end.min(v.len())].to_vec())
         };
         let mut traces = [cut(&ch[0]), cut(&ch[1]), None];
+        let cut_pk = |p: &Option<(Vec<f64>, Vec<f64>)>| {
+            p.as_ref().map(|(a, b)| {
+                let r = |v: &Vec<f64>| v[start.min(v.len())..end.min(v.len())].to_vec();
+                (r(a), r(b))
+            })
+        };
+        let mut peak = [cut_pk(&pk[0]), cut_pk(&pk[1]), None];
         let depth = s.display.averaging;
-        for (i, tr) in traces.iter_mut().enumerate().take(2) {
-            if let Some(t) = tr {
+        for i in 0..2 {
+            if let Some(t) = &mut traces[i] {
                 if triggered && depth > 1 {
                     *t = self.averagers[i].push(t, depth);
+                    if let Some((lo, hi)) = &mut peak[i] {
+                        (*lo, *hi) = self.peaks[i].push(lo, hi, depth);
+                    }
                 } else {
                     self.averagers[i].reset();
+                    self.peaks[i].reset();
                 }
             }
         }
         traces[MATH] = self.math_trace(&traces);
+        peak[MATH] = self.math_peak(&traces, &peak);
         let frame = Frame {
             traces,
+            peak,
             dt,
             t0,
             triggered,
@@ -424,7 +482,52 @@ impl Scope {
         Some(combine(m.mode, a, b))
     }
 
-    fn process_roll(&mut self, block: &Block, ch: [Option<Vec<f64>>; 2]) -> bool {
+    /// The peak band of the math trace from the bands of CH1 and CH2, by
+    /// interval arithmetic (a band that holds every value the function
+    /// can take there). Division gets no band (the line only).
+    fn math_peak(
+        &self,
+        traces: &[Option<Vec<f64>>; 3],
+        peak: &[Option<(Vec<f64>, Vec<f64>)>; 3],
+    ) -> Option<(Vec<f64>, Vec<f64>)> {
+        use crate::dsp::math::MathMode::*;
+        let m = &self.settings.math;
+        let line = traces[MATH].as_ref()?;
+        let empty = (Vec::new(), Vec::new());
+        let (al, ah) = peak[0].as_ref().unwrap_or(&empty);
+        let (bl, bh) = peak[1].as_ref().unwrap_or(&empty);
+        let n = line.len();
+        let get = |v: &Vec<f64>, i: usize| v.get(i).copied().unwrap_or(f64::NAN);
+        let band = |f: &dyn Fn(f64, f64, f64, f64) -> (f64, f64)| {
+            let (lo, hi): (Vec<f64>, Vec<f64>) = (0..n)
+                .map(|i| f(get(al, i), get(ah, i), get(bl, i), get(bh, i)))
+                .unzip();
+            Some((lo, hi))
+        };
+        match m.mode {
+            Add => band(&|al, ah, bl, bh| (al + bl, ah + bh)),
+            Sub => band(&|al, ah, bl, bh| (al - bh, ah - bl)),
+            SubRev => band(&|al, ah, bl, bh| (bl - ah, bh - al)),
+            Avg => band(&|al, ah, bl, bh| ((al + bl) / 2.0, (ah + bh) / 2.0)),
+            NegCh1 => band(&|al, ah, _, _| (-ah, -al)),
+            NegCh2 => band(&|_, _, bl, bh| (-bh, -bl)),
+            Mul => band(&|al, ah, bl, bh| {
+                let p = [al * bl, al * bh, ah * bl, ah * bh];
+                (
+                    p.iter().copied().fold(f64::INFINITY, f64::min),
+                    p.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                )
+            }),
+            _ => Some((line.clone(), line.clone())),
+        }
+    }
+
+    fn process_roll(
+        &mut self,
+        block: &Block,
+        ch: [Option<Vec<f64>>; 2],
+        pk: [Option<(Vec<f64>, Vec<f64>)>; 2],
+    ) -> bool {
         let rate = block.rate;
         if (rate - self.roll_rate).abs() > 1e-9 {
             self.clear_roll();
@@ -432,25 +535,34 @@ impl Scope {
         }
         let keep = (self.settings.screen_time() * rate).ceil() as usize + 1;
         for (c, data) in ch.iter().enumerate() {
-            if let Some(d) = data {
-                let buf = &mut self.roll[c];
-                buf.extend(d.iter().copied());
-                while buf.len() > keep {
-                    buf.pop_front();
+            if let (Some(d), Some((lo, hi))) = (data, &pk[c]) {
+                for (buf, v) in [
+                    (&mut self.roll[c], d),
+                    (&mut self.roll_min[c], lo),
+                    (&mut self.roll_max[c], hi),
+                ] {
+                    buf.extend(v.iter().copied());
+                    while buf.len() > keep {
+                        buf.pop_front();
+                    }
                 }
             }
             self.roll_clipped[c] |= block.clipped[c];
         }
-        let [a, b] = [0, 1].map(|c| {
-            let buf = &self.roll[c];
-            (!buf.is_empty()).then(|| buf.iter().copied().collect::<Vec<f64>>())
-        });
+        let all = |b: &VecDeque<f64>| b.iter().copied().collect::<Vec<f64>>();
+        let [a, b] = [0, 1].map(|c| (!self.roll[c].is_empty()).then(|| all(&self.roll[c])));
         let n = a.as_ref().or(b.as_ref()).map_or(0, |v| v.len());
         let mut full: [Option<Vec<f64>>; 3] = [a, b, None];
         full[MATH] = self.math_trace(&full);
+        let band = |c: usize| {
+            (!self.roll[c].is_empty()).then(|| (all(&self.roll_min[c]), all(&self.roll_max[c])))
+        };
+        let mut peak = [band(0), band(1), None];
+        peak[MATH] = self.math_peak(&full, &peak);
         let dt = 1.0 / rate;
         let frame = Frame {
             traces: full,
+            peak,
             dt,
             t0: -(n.saturating_sub(1) as f64) * dt,
             triggered: false,
@@ -619,6 +731,8 @@ mod tests {
             gen,
             cfg,
             data: [w(amp, phase), w(amp / 2.0, phase)],
+            min: Default::default(),
+            max: Default::default(),
             clipped: [false; 2],
             range: nominal_range(&cfg),
             rate,
@@ -650,12 +764,18 @@ mod tests {
         s.settings.channels[0].probe = 10;
         assert_eq!(s.settings.channels[0].volts_per_div(), 10.0);
         assert_eq!(s.hw_config().gains[0], 5);
-        // Slow time bases are roll mode with both channels.
+        // Slow time bases are roll mode; CH1 alone streams at 30 MS/s too.
         s.settings.trigger.source = 0;
         s.settings.time_idx = time_index(1.0);
         let cfg = s.hw_config();
         assert!(cfg.roll);
-        assert_eq!(cfg.channels, 2);
+        assert_eq!((cfg.channels, cfg.rate.raw, cfg.rate.rate), (1, 30e6, 1e3));
+        // The max ADC rate caps every mode; below 1 MS/s with both channels.
+        s.settings.acquisition.max_adc_rate = 500e3;
+        let cfg = s.hw_config();
+        assert_eq!((cfg.channels, cfg.rate.raw, cfg.rate.id), (2, 500e3, 150));
+        s.settings.time_idx = time_index(1e-6);
+        assert_eq!(s.hw_config().rate.rate, 500e3);
     }
 
     #[test]
@@ -838,6 +958,8 @@ mod tests {
             gen,
             cfg,
             data: [w.clone(), w],
+            min: Default::default(),
+            max: Default::default(),
             clipped: [true; 2],
             range,
             rate,
@@ -905,6 +1027,8 @@ mod tests {
             gen,
             cfg,
             data: [vec![k as f64; 1000], vec![0.0; 1000]],
+            min: [vec![k as f64 - 0.5; 1000], vec![0.0; 1000]],
+            max: [vec![k as f64 + 0.5; 1000], vec![0.0; 1000]],
             clipped: [false; 2],
             range: nominal_range(&cfg),
             rate,

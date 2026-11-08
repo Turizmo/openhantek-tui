@@ -24,32 +24,51 @@ pub fn time_digits(step_ns: u64) -> usize {
         .unwrap_or(9)
 }
 
+/// Digits of the time column for a log: like [`time_digits`], and 10
+/// (0.1 ns) for raw logs, whose steps are the ADC sample time (62.5 ns,
+/// 33.3 ns).
+pub fn log_time_digits(h: &super::format::Header) -> usize {
+    if h.raw {
+        10
+    } else {
+        time_digits(h.step_ns)
+    }
+}
+
 /// `2026-11-13T12:34:56.123Z` for ns since 1970, with `digits` digits.
 pub fn iso_utc(ns: i64, digits: usize) -> String {
-    let secs = ns.div_euclid(1_000_000_000);
-    let frac = ns.rem_euclid(1_000_000_000);
+    iso_utc_ps(ns as i128 * 1000, digits)
+}
+
+/// Like [`iso_utc`] for ps since 1970, with up to 12 digits.
+pub fn iso_utc_ps(ps: i128, digits: usize) -> String {
+    const PS: i128 = 1_000_000_000_000;
+    let secs = ps.div_euclid(PS) as i64;
+    let frac = ps.rem_euclid(PS);
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (y, m, d) = crate::export::civil_from_days(days);
-    let frac = format!("{frac:09}");
+    let frac = format!("{frac:012}");
     format!(
         "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}{}{}Z",
         rem / 3600,
         rem % 3600 / 60,
         rem % 60,
         if digits > 0 { "." } else { "" },
-        &frac[..digits.min(9)]
+        &frac[..digits.min(12)]
     )
 }
 
 fn time_cell(f: &LogFile, step: u64, time: CsvTime, digits: usize) -> String {
-    let ns = step as i128 * f.header.step_ns as i128;
+    // Rounded to the last digit shown.
+    let unit = 10i128.pow(12 - digits.min(12) as u32);
+    let ps = (f.header.step_ps(step) + unit / 2) / unit * unit;
     match time {
-        CsvTime::Iso => iso_utc((f.header.start_ns as i128 + ns) as i64, digits),
+        CsvTime::Iso => iso_utc_ps(f.header.start_ns as i128 * 1000 + ps, digits),
         CsvTime::Seconds => {
-            let s = ns / 1_000_000_000;
-            let frac = format!("{:09}", ns % 1_000_000_000);
-            format!("{s}.{}", &frac[..digits])
+            let s = ps / 1_000_000_000_000;
+            let frac = format!("{:012}", ps % 1_000_000_000_000);
+            format!("{s}.{}", &frac[..digits.min(12)])
         }
     }
 }
@@ -81,7 +100,7 @@ pub fn write_log_csv(
     writeln!(out)?;
     let cells = logged.len() * if h.single() { 1 } else { 3 };
     let empty = ",".repeat(cells);
-    let digits = time_digits(h.step_ns);
+    let digits = log_time_digits(h);
     let mut gaps = f.gaps().into_iter().peekable();
     let mut rows = 0u64;
     let mut err = None;
@@ -165,6 +184,45 @@ mod tests {
             "2026-11-13T12:34:56.123Z"
         );
         assert_eq!(iso_utc(0, 0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            iso_utc_ps(62_500, 10),
+            "1970-01-01T00:00:00.0000000625Z"
+        );
+    }
+
+    #[test]
+    fn exports_raw_logs_in_volts() {
+        use super::super::format::{test_raw_header, ChunkHead, OPEN};
+        let dir = std::env::temp_dir().join(format!("oht-csv-raw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.ohlog");
+        let mut h = test_raw_header([true, false]);
+        h.adc_rate = 30e6;
+        h.channels[0].zero_count = 128.0;
+        h.channels[0].volts_per_count = 0.04;
+        let mut b = h.encode();
+        b.extend_from_slice(
+            &ChunkHead {
+                flags: 0,
+                first: 0,
+                count: OPEN,
+            }
+            .encode(),
+        );
+        b.extend_from_slice(&[128, 153, 103]);
+        std::fs::write(&path, b).unwrap();
+        let f = LogFile::open(&path).unwrap();
+        assert_eq!(f.end(), 3);
+        let mut out = Vec::new();
+        write_log_csv(&mut out, &f, 0..3, CsvTime::Seconds).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "time_s,ch1\n\
+             0.0000000000,0.000000\n\
+             0.0000000333,1.000000\n\
+             0.0000000667,-1.000000\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -61,7 +61,11 @@ pub enum Field {
     TrigPosition,
     TimeDiv,
     Roll,
+    /// The max ADC rate setting.
+    MaxAdc,
     Selected,
+    /// Average / peak / both.
+    TraceMode,
     Interpolation,
     Dots,
     Averaging,
@@ -204,12 +208,18 @@ pub fn categories() -> Vec<Category> {
         },
         Category {
             name: "Timebase",
-            fields: vec![TimeDiv, Roll, Act(Action::RunStop), Act(Action::Autoset)],
+            fields: vec![
+                TimeDiv,
+                Roll,
+                MaxAdc,
+                Act(Action::RunStop),
+                Act(Action::Autoset),
+            ],
         },
         Category {
             name: "Display",
             fields: vec![
-                Selected,
+                TraceMode,
                 Interpolation,
                 Dots,
                 Averaging,
@@ -311,9 +321,36 @@ fn limit_text(l: u64, s: &Settings) -> String {
     if l == 0 {
         return "off".into();
     }
-    let secs = l as f64 / lg::bytes_per_second(s.logger.step, logged_channels(s));
+    let max = s.acquisition.max_adc_rate;
+    let secs = l as f64 / lg::bytes_per_second(s.logger.step, logged_channels(s), max);
     format!("{} ≈ {}", lg::fmt_bytes(l), lg::fmt_span(secs))
 }
+/// Help line of the raw log step: its limits in plain words, the most
+/// important first (the line is cut at the panel width; `?` and the
+/// README have all of it).
+pub fn raw_step_help(adc: f64, bytes_per_second: f64, limit: u64, logged: [bool; 2]) -> String {
+    use crate::logger as lg;
+    let lasts = if limit > 0 {
+        format!(
+            ", so {} lasts ≈ {}",
+            lg::fmt_bytes(limit),
+            lg::fmt_span(limit as f64 / bytes_per_second)
+        )
+    } else {
+        String::new()
+    };
+    let ch2 = if logged == [false, true] {
+        " · CH2 alone still uses 2-channel mode (16 MS/s at most)"
+    } else {
+        " · CH2 alone uses 2-channel mode"
+    };
+    format!(
+        "raw: one 8-bit sample per step at {}, no min/max per step · the file grows {}/s{lasts} · the disk must keep up · analog bandwidth ≈ 20 MHz: finer detail is not real{ch2} · Max ADC rate lowers the rate · ? for more",
+        fmt_si(adc, "S/s"),
+        lg::fmt_bytes(bytes_per_second as u64),
+    )
+}
+
 const NAMES: [&str; 3] = ["CH1", "CH2", "MATH"];
 
 fn slope_name(s: Slope) -> &'static str {
@@ -348,7 +385,9 @@ impl Field {
             TrigPosition => "Position",
             TimeDiv => "Time/div",
             Roll => "Roll mode",
+            MaxAdc => "Max ADC rate",
             Selected => "Selected trace",
+            TraceMode => "Trace mode",
             Interpolation => "Interpolation",
             Dots => "Dots only",
             Averaging => "Averaging",
@@ -433,6 +472,8 @@ impl Field {
             TrigPosition => "Where the trigger point is on the screen, 0 % to 100 %. Keys , .",
             TimeDiv => "Time per division. Keys ← →.",
             Roll => "Slow time bases scroll from right to left, with no trigger.",
+            MaxAdc => "Highest ADC rate in every mode (scope, roll, logger). The ADC always runs at it; slower rates average its samples. Lower it if the USB link loses data.",
+            TraceMode => "average: the mean of the samples behind each point, as a line. peak: the area from the lowest to the highest sample (also over the averaged captures). average + peak: both, the area muted. Key D.",
             Selected => "The trace the arrow keys, cursors and spectrum use. Key Tab.",
             Interpolation => "sin(x)/x draws a smooth line through few samples. Key z.",
             Dots => "Draw only the samples, no lines between them. Key d.",
@@ -531,6 +572,13 @@ impl Field {
                 .map(|t| format!("{}/div", fmt_si(*t, "s")))
                 .collect(),
             Selected => list(&NAMES),
+            MaxAdc => (0..crate::device::protocol::ADC_CAPS.len())
+                .map(crate::device::protocol::cap_label)
+                .collect(),
+            TraceMode => crate::settings::TraceMode::ALL
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect(),
             Interpolation => list(&["sin(x)/x", "linear"]),
             Averaging => AVERAGING
                 .iter()
@@ -580,10 +628,13 @@ impl Field {
                     None => format!("Nyquist / {}", 1u32 << z),
                 })
                 .collect(),
-            LogStep => crate::logger::STEPS
-                .iter()
-                .map(|t| crate::logger::fmt_step(*t))
-                .collect(),
+            LogStep => {
+                let (ch, max) = (logged_channels(s), s.acquisition.max_adc_rate);
+                crate::logger::step_choices(ch, max)
+                    .iter()
+                    .map(|t| crate::logger::step_label(*t, ch, max))
+                    .collect()
+            }
             LogLimit => crate::logger::LIMITS
                 .iter()
                 .map(|l| limit_text(*l, s))
@@ -600,31 +651,37 @@ impl Field {
     pub fn help_text(self, s: &Settings, d: &DeviceInfo) -> String {
         use crate::logger as lg;
         let ch = logged_channels(s);
+        let max = s.acquisition.max_adc_rate;
         match self {
             Field::LogLimit => {
                 let l = s.logger.log_limit;
-                let mut t = lg::limit_estimate(l, s.logger.step, ch);
+                let mut t = lg::limit_estimate(l, s.logger.step, ch, max);
                 if let Some(f) = d.log_free {
                     if l == 0 || f < l {
                         t.push_str(&format!(
                             " · only {} free (≈ {})",
                             lg::fmt_bytes(f),
-                            lg::fmt_span(f as f64 / lg::bytes_per_second(s.logger.step, ch))
+                            lg::fmt_span(f as f64 / lg::bytes_per_second(s.logger.step, ch, max))
                         ));
                     }
                 }
                 t
             }
             Field::LogStep => {
-                let (r, n) = lg::adc_for_step(lg::step_ns(s.logger.step), lg::hw_channels(ch));
+                let step = lg::fit_step(s.logger.step, ch, max);
+                let (r, n) = lg::adc_for_step(lg::step_ns(step), lg::hw_channels(ch, max), max);
                 let count = ch.iter().filter(|&&c| c).count();
+                let bps = lg::bytes_per_second(step, ch, max);
+                if lg::is_raw(step) {
+                    return raw_step_help(r.raw, bps, s.logger.log_limit, ch);
+                }
                 format!(
                     "{} ADC at {}, {} sample{} per step, {}/h for {} channel{}.",
                     self.help(),
                     fmt_si(r.raw, "S/s"),
                     n,
                     if n == 1 { "" } else { "s" },
-                    lg::fmt_bytes((lg::bytes_per_second(s.logger.step, ch) * 3600.0) as u64),
+                    lg::fmt_bytes((bps * 3600.0) as u64),
                     count,
                     if count == 1 { "" } else { "s" }
                 )
@@ -663,6 +720,8 @@ impl Field {
             ),
             TimeDiv => s.time_idx,
             Selected => s.selected,
+            MaxAdc => s.acquisition.cap_idx(),
+            TraceMode => index_of(&crate::settings::TraceMode::ALL, &s.display.trace_mode),
             Interpolation => b(s.display.interpolation == crate::settings::Interpolation::Linear),
             Averaging => index_of(&AVERAGING, &s.display.averaging),
             Persistence => index_of(&PERSISTENCE, &s.display.persistence),
@@ -678,7 +737,17 @@ impl Field {
             AxisBrightness => index_of(&GRID_BRIGHTNESS, &s.display.axis_brightness),
             SpecWindow => index_of(&Window::ALL, &s.display.window),
             SpecZoom => s.display.spectrum_zoom as usize,
-            LogStep => s.logger.step_idx(),
+            LogStep => {
+                let ch = logged_channels(s);
+                let max = s.acquisition.max_adc_rate;
+                let step = crate::logger::fit_step(s.logger.step, ch, max);
+                let all = crate::logger::step_choices(ch, max);
+                if crate::logger::is_raw(step) {
+                    0
+                } else {
+                    1 + crate::logger::nearest(&all[1..], step)
+                }
+            }
             LogLimit => s.logger.limit_idx(),
             LogAxis => index_of(&TimeAxis::ALL, &s.logger.time_axis),
             LogCsvTime => index_of(&CsvTime::ALL, &s.logger.csv_time),
@@ -771,8 +840,17 @@ impl Field {
             SpecWindow => s.display.window = Window::ALL[i.min(Window::ALL.len() - 1)],
             SpecZoom => s.display.spectrum_zoom = (i as u32).min(MAX_SPECTRUM_ZOOM),
             LogStep => {
-                let all = &crate::logger::STEPS;
+                let all = crate::logger::step_choices(logged_channels(s), s.acquisition.max_adc_rate);
                 s.logger.step = all[i.min(all.len() - 1)]
+            }
+            MaxAdc => {
+                let caps = &crate::device::protocol::ADC_CAPS;
+                s.acquisition.max_adc_rate =
+                    crate::device::protocol::raw_rate_of_id(caps[i.min(caps.len() - 1)].0)
+            }
+            TraceMode => {
+                let all = crate::settings::TraceMode::ALL;
+                s.display.trace_mode = all[i.min(all.len() - 1)]
             }
             LogLimit => {
                 let all = &crate::logger::LIMITS;

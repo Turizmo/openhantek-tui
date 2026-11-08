@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 
 use crate::device::protocol::Rate;
 
-/// Log steps in seconds: 0.5 µs (the fastest ADC rate, see
-/// [`ADC_RATES`]) up to one minute.
+/// Log steps in seconds: 0.5 µs up to one minute. The raw step ([`RAW`])
+/// comes before them in the settings panel.
 pub const STEPS: [f64; 26] = [
     0.5e-6, 1e-6, 2e-6, 5e-6, 10e-6, 20e-6, 50e-6, 100e-6, 200e-6, 500e-6, 1e-3, 2e-3, 5e-3, 10e-3,
     20e-3, 50e-3, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0,
@@ -52,78 +52,54 @@ pub const LIMITS: [u64; 13] = [
 /// The default limit: 1 GB.
 pub const LIMIT_DEFAULT: u64 = 1_000_000_000;
 
-/// ADC rates the logger uses (rate id for request 0xE2, and samples per
-/// second). The async USB stream is gapless up to 32 MB/s: 16 MS/s with
-/// both channels ([`MAX_RAW_2CH`]), 30 MS/s with CH1 only
-/// ([`MAX_RAW_1CH`]). 24 MS/s with two channels (48 MB/s) loses about
-/// 0.5 % of the packets, so it is not used.
-pub const ADC_RATES: [(u8, f64); 12] = [
-    (102, 20e3),
-    (104, 40e3),
-    (110, 100e3),
-    (120, 200e3),
-    (140, 400e3),
-    (150, 500e3),
-    (1, 1e6),
-    (2, 2e6),
-    (5, 5e6),
-    (10, 10e6),
-    (16, 16e6),
-    (30, 30e6),
-];
-/// Fastest logger ADC rate with both channels sampled.
-pub const MAX_RAW_2CH: f64 = 16e6;
-/// Fastest logger ADC rate with only CH1 sampled.
-pub const MAX_RAW_1CH: f64 = 30e6;
+/// The step value of the raw steps: one ADC sample per step, stored as
+/// the raw 1-byte ADC value (see [`format`]). The step is then the ADC
+/// sample time: 62.5 ns with two channels at 16 MS/s, 33.3 ns with CH1
+/// alone at 30 MS/s (at the default max ADC rate).
+pub const RAW: f64 = 0.0;
+
+/// True for the raw step value.
+pub fn is_raw(step: f64) -> bool {
+    step <= 0.0
+}
 
 /// Channels the scope samples for a log of `logged` channels: CH1 alone
 /// can use 1-channel mode (twice the rate); CH2 alone cannot (the
 /// firmware's 1-channel mode is CH1).
-pub fn hw_channels(logged: [bool; 2]) -> u8 {
-    if logged == [true, false] {
-        1
-    } else {
-        2
-    }
+pub fn hw_channels(logged: [bool; 2], max_adc: f64) -> u8 {
+    crate::device::protocol::hw_channels(logged != [true, false], max_adc)
 }
 
-/// Samples per step the logger aims for, when the ADC is fast enough.
-pub const SAMPLES_PER_STEP_MIN: u64 = 10;
-
-/// A step in nanoseconds (the file stores it like this).
+/// A step in nanoseconds (the file stores it like this). 0 for raw.
 pub fn step_ns(step: f64) -> u64 {
+    if is_raw(step) {
+        return 0;
+    }
     (step * 1e9).round().max(1.0) as u64
 }
 
-/// The ADC rate for a step, with `channels` (1 or 2, see
-/// [`hw_channels`]) sampled: the lowest rate that gives at least
-/// [`SAMPLES_PER_STEP_MIN`] whole samples per step, else the fastest
-/// rate that gives a whole number of samples. Returns the rate (no
-/// oversampling: the logger bins the raw samples itself) and the
-/// samples per step.
-pub fn adc_for_step(step_ns: u64, channels: u8) -> (Rate, u32) {
-    let max = if channels == 1 {
-        MAX_RAW_1CH
+/// Whole ADC samples in a step of `step_ns` at `raw` S/s, if it is a
+/// whole number (at least 1).
+fn whole(raw: f64, step_ns: u64) -> Option<u64> {
+    let n = raw * step_ns as f64 / 1e9;
+    ((n - n.round()).abs() < 1e-6 && n >= 1.0).then_some(n.round() as u64)
+}
+
+/// The ADC rate and samples per step for a step (`step_ns`, 0 = raw) with
+/// `channels` (1 or 2, see [`hw_channels`]) sampled. The ADC always runs
+/// at the top rate the max ADC rate setting allows: each step is the
+/// min, max and mean of all its raw samples. A step that is not a whole
+/// number of ADC samples (too short for a low max ADC rate) becomes the
+/// shortest step that is (see [`fit_step`]). No oversampling: the logger
+/// bins the raw samples itself.
+pub fn adc_for_step(step_ns: u64, channels: u8, max_adc: f64) -> (Rate, u32) {
+    let (id, raw) = crate::device::protocol::adc_rate(channels, max_adc);
+    let n = if step_ns == 0 {
+        1
     } else {
-        MAX_RAW_2CH
+        let ns = step_ns_fit(step_ns, raw);
+        whole(raw, ns).unwrap_or(1).min(u32::MAX as u64) as u32
     };
-    let rates: Vec<(u8, f64)> = ADC_RATES
-        .iter()
-        .copied()
-        .filter(|(_, raw)| *raw <= max)
-        .collect();
-    let whole = |raw: f64| {
-        let n = raw * step_ns as f64 / 1e9;
-        ((n - n.round()).abs() < 1e-6 && n >= 1.0).then_some(n.round() as u64)
-    };
-    let pick = rates
-        .iter()
-        .find(|(_, raw)| whole(*raw).is_some_and(|n| n >= SAMPLES_PER_STEP_MIN))
-        .or_else(|| rates.iter().rev().find(|(_, raw)| whole(*raw).is_some()))
-        .copied()
-        .unwrap_or(rates[rates.len() - 1]);
-    let (id, raw) = pick;
-    let n = whole(raw).unwrap_or(1).min(u32::MAX as u64) as u32;
     (
         Rate {
             rate: raw,
@@ -135,9 +111,76 @@ pub fn adc_for_step(step_ns: u64, channels: u8) -> (Rate, u32) {
     )
 }
 
-/// Bytes of one record: one value per channel when a step is one
-/// sample, else min, max and mean.
-pub fn record_bytes(channels: usize, samples_per_step: u32) -> usize {
+/// `step_ns`, or the shortest of [`STEPS`] at least as long that is a
+/// whole number of samples at `raw`.
+fn step_ns_fit(step_ns: u64, raw: f64) -> u64 {
+    if whole(raw, step_ns).is_some() {
+        return step_ns;
+    }
+    STEPS
+        .iter()
+        .map(|s| self::step_ns(*s))
+        .find(|&ns| ns >= step_ns && whole(raw, ns).is_some())
+        .unwrap_or_else(|| self::step_ns(STEPS[STEPS.len() - 1]))
+}
+
+/// The step a log of `logged` channels uses for the step setting `step`:
+/// the setting, or when it is shorter than the ADC allows (a low max ADC
+/// rate) the next step that fits. [`RAW`] stays raw.
+pub fn fit_step(step: f64, logged: [bool; 2], max_adc: f64) -> f64 {
+    if is_raw(step) {
+        return RAW;
+    }
+    let (_, raw) = crate::device::protocol::adc_rate(hw_channels(logged, max_adc), max_adc);
+    let ns = step_ns_fit(step_ns(step), raw);
+    STEPS
+        .iter()
+        .copied()
+        .find(|s| step_ns(*s) == ns)
+        .unwrap_or(ns as f64 * 1e-9)
+}
+
+/// The step choices of the settings panel for `logged` channels: raw
+/// first, then the steps of [`STEPS`] that the ADC rate allows.
+pub fn step_choices(logged: [bool; 2], max_adc: f64) -> Vec<f64> {
+    let logged = or_ch1(logged);
+    let (_, raw) = crate::device::protocol::adc_rate(hw_channels(logged, max_adc), max_adc);
+    std::iter::once(RAW)
+        .chain(
+            STEPS
+                .iter()
+                .copied()
+                .filter(|s| whole(raw, step_ns(*s)).is_some()),
+        )
+        .collect()
+}
+
+/// Seconds per step: the ADC sample time for raw.
+pub fn step_secs(step: f64, logged: [bool; 2], max_adc: f64) -> f64 {
+    if is_raw(step) {
+        let logged = or_ch1(logged);
+        let (_, raw) = crate::device::protocol::adc_rate(hw_channels(logged, max_adc), max_adc);
+        1.0 / raw
+    } else {
+        fit_step(step, or_ch1(logged), max_adc)
+    }
+}
+
+/// Text of a step choice: like `2.5 µs`, or `raw (62.5 ns)`.
+pub fn step_label(step: f64, logged: [bool; 2], max_adc: f64) -> String {
+    if is_raw(step) {
+        format!("raw ({})", fmt_step(step_secs(step, logged, max_adc)))
+    } else {
+        fmt_step(step)
+    }
+}
+
+/// Bytes of one record: one byte per channel for raw logs, one f32 when
+/// a step is one sample, else min, max and mean as f32.
+pub fn record_bytes(channels: usize, samples_per_step: u32, raw: bool) -> usize {
+    if raw {
+        return channels;
+    }
     channels * if samples_per_step == 1 { 1 } else { 3 } * 4
 }
 
@@ -150,12 +193,14 @@ fn or_ch1(logged: [bool; 2]) -> [bool; 2] {
     }
 }
 
-/// File bytes per second for a step and the logged channels.
-pub fn bytes_per_second(step: f64, logged: [bool; 2]) -> f64 {
+/// File bytes per second for a step setting and the logged channels.
+pub fn bytes_per_second(step: f64, logged: [bool; 2], max_adc: f64) -> f64 {
     let logged = or_ch1(logged);
-    let (_, n) = adc_for_step(step_ns(step), hw_channels(logged));
+    let raw = is_raw(step);
+    let step = fit_step(step, logged, max_adc);
+    let (_, n) = adc_for_step(step_ns(step), hw_channels(logged, max_adc), max_adc);
     let count = logged.iter().filter(|&&c| c).count();
-    record_bytes(count, n) as f64 / step
+    record_bytes(count, n, raw) as f64 / step_secs(step, logged, max_adc)
 }
 
 /// Bytes like `412 MB` or `1 GB` (powers of 1000, like disk makers).
@@ -203,7 +248,7 @@ pub fn fmt_hms(secs: f64) -> String {
     }
 }
 
-/// The step as text, like `2.5 µs` or `1 min`.
+/// The step as text, like `2.5 µs`, `62.5 ns` or `1 min`.
 pub fn fmt_step(step: f64) -> String {
     if step >= 59.999 {
         format!("{:.0} min", step / 60.0)
@@ -214,20 +259,22 @@ pub fn fmt_step(step: f64) -> String {
 
 /// How long a log of `limit` bytes lasts, like `Limit 1 GB ≈ 11 h 34 min
 /// at 1 ms step`. `logged` are the logged channels.
-pub fn limit_estimate(limit: u64, step: f64, logged: [bool; 2]) -> String {
+pub fn limit_estimate(limit: u64, step: f64, logged: [bool; 2], max_adc: f64) -> String {
+    let bps = bytes_per_second(step, logged, max_adc);
+    let label = step_label(fit_step(step, or_ch1(logged), max_adc), logged, max_adc);
     if limit == 0 {
         return format!(
             "no limit · {}/h at {} step",
-            fmt_bytes((bytes_per_second(step, logged) * 3600.0) as u64),
-            fmt_step(step)
+            fmt_bytes((bps * 3600.0) as u64),
+            label
         );
     }
-    let secs = limit as f64 / bytes_per_second(step, logged);
+    let secs = limit as f64 / bps;
     format!(
         "Limit {} ≈ {} at {} step",
         fmt_bytes(limit),
         fmt_span(secs),
-        fmt_step(step)
+        label
     )
 }
 
@@ -317,71 +364,101 @@ pub fn new_log_path(dir: &Path, now: std::time::SystemTime) -> PathBuf {
 mod tests {
     use super::*;
 
+    const TOP: f64 = crate::device::protocol::MAX_ADC_DEFAULT;
+
     #[test]
     fn adc_rate_per_step() {
-        let cases: [(f64, f64, u32); 11] = [
-            (0.5e-6, 16e6, 8),
-            (1e-6, 10e6, 10),
-            (2e-6, 5e6, 10),
-            (5e-6, 2e6, 10),
-            (10e-6, 1e6, 10),
-            (20e-6, 500e3, 10),
-            (50e-6, 200e3, 10),
-            (100e-6, 100e3, 10),
-            (200e-6, 100e3, 20),
-            (1e-3, 20e3, 20),
-            (60.0, 20e3, 1_200_000),
+        // The ADC always runs at the top rate: 16 MS/s with two channels.
+        let cases: [(f64, u32); 6] = [
+            (0.5e-6, 8),
+            (1e-6, 16),
+            (10e-6, 160),
+            (1e-3, 16_000),
+            (1.0, 16_000_000),
+            (60.0, 960_000_000),
         ];
-        for (step, raw, n) in cases {
-            let (r, got) = adc_for_step(step_ns(step), 2);
-            assert_eq!((r.raw, got), (raw, n), "{step}");
+        for (step, n) in cases {
+            let (r, got) = adc_for_step(step_ns(step), 2, TOP);
+            assert_eq!((r.raw, got), (16e6, n), "{step}");
             assert_eq!(r.oversample, 1);
         }
-        // CH1 alone: 1-channel mode, up to 30 MS/s.
-        assert_eq!(adc_for_step(step_ns(0.5e-6), 1).0.raw, 30e6);
-        assert_eq!(adc_for_step(step_ns(0.5e-6), 1).1, 15);
-        assert_eq!(adc_for_step(step_ns(1e-6), 1).0.raw, 10e6);
+        // CH1 alone: 1-channel mode, 30 MS/s.
+        assert_eq!(adc_for_step(step_ns(0.5e-6), 1, TOP).0.raw, 30e6);
+        assert_eq!(adc_for_step(step_ns(0.5e-6), 1, TOP).1, 15);
+        // Raw: one sample per step.
+        assert_eq!(adc_for_step(0, 2, TOP).1, 1);
+        assert_eq!(adc_for_step(0, 1, TOP).0.raw, 30e6);
         for ch in [1, 2] {
-            let max = if ch == 1 { MAX_RAW_1CH } else { MAX_RAW_2CH };
             for step in STEPS {
-                let (r, n) = adc_for_step(step_ns(step), ch);
-                assert!(r.raw <= max);
+                let (r, n) = adc_for_step(step_ns(step), ch, TOP);
                 assert!((r.raw * step - n as f64).abs() < 1e-6, "{step}");
                 assert_eq!(crate::device::protocol::raw_rate_of_id(r.id), r.raw);
             }
         }
-        assert_eq!(hw_channels([true, false]), 1);
-        assert_eq!(hw_channels([false, true]), 2);
-        assert_eq!(hw_channels([true, true]), 2);
+        assert_eq!(hw_channels([true, false], TOP), 1);
+        assert_eq!(hw_channels([false, true], TOP), 2);
+        assert_eq!(hw_channels([true, true], TOP), 2);
+        assert_eq!(hw_channels([true, false], 400e3), 2);
+    }
+
+    #[test]
+    fn steps_adapt_to_the_max_adc_rate() {
+        const BOTH: [bool; 2] = [true, true];
+        const CH1: [bool; 2] = [true, false];
+        let c = step_choices(BOTH, TOP);
+        assert_eq!(c[0], RAW);
+        assert_eq!(c.len(), STEPS.len() + 1);
+        assert_eq!(step_label(RAW, BOTH, TOP), "raw (62.5 ns)");
+        assert_eq!(step_label(RAW, CH1, TOP), "raw (33.3 ns)");
+        assert_eq!(step_label(RAW, [false, true], TOP), "raw (62.5 ns)");
+        assert_eq!(step_label(RAW, BOTH, 1e6), "raw (1 µs)");
+        // At 400 kS/s the steps start at 2.5 µs... which is not a
+        // 1-2-5 step: 5 µs is the first.
+        let c = step_choices(BOTH, 400e3);
+        assert_eq!(c[1], 5e-6);
+        assert_eq!(fit_step(1e-6, BOTH, 400e3), 5e-6);
+        assert_eq!(fit_step(1e-3, BOTH, 400e3), 1e-3);
+        assert_eq!(adc_for_step(step_ns(1e-6), 2, 400e3).1, 2);
+        assert!(is_raw(fit_step(RAW, BOTH, 400e3)));
     }
 
     #[test]
     fn sizes_and_estimates() {
         const BOTH: [bool; 2] = [true, true];
         const CH1: [bool; 2] = [true, false];
-        assert_eq!(record_bytes(2, 1), 8);
-        assert_eq!(record_bytes(2, 20), 24);
-        assert_eq!(record_bytes(1, 20), 12);
+        assert_eq!(record_bytes(2, 1, false), 8);
+        assert_eq!(record_bytes(2, 20, false), 24);
+        assert_eq!(record_bytes(1, 20, false), 12);
+        assert_eq!(record_bytes(2, 1, true), 2);
         // 2 channels at 1 ms: 24 B per ms = 86.4 MB per hour.
-        assert!((bytes_per_second(1e-3, BOTH) - 24_000.0).abs() < 1e-6);
+        assert!((bytes_per_second(1e-3, BOTH, TOP) - 24_000.0).abs() < 1e-6);
         // 2 channels at 0.5 µs: 24 B per 0.5 µs = 48 MB/s.
-        assert!((bytes_per_second(0.5e-6, BOTH) - 48e6).abs() < 1e-3);
-        assert!((bytes_per_second(0.5e-6, CH1) - 24e6).abs() < 1e-3);
+        assert!((bytes_per_second(0.5e-6, BOTH, TOP) - 48e6).abs() < 1e-3);
+        assert!((bytes_per_second(0.5e-6, CH1, TOP) - 24e6).abs() < 1e-3);
+        // Raw: one byte per channel and sample.
+        assert!((bytes_per_second(RAW, BOTH, TOP) - 32e6).abs() < 1e-3);
+        assert!((bytes_per_second(RAW, CH1, TOP) - 30e6).abs() < 1e-3);
+        assert!((bytes_per_second(RAW, [false, true], TOP) - 16e6).abs() < 1e-3);
+        assert!((bytes_per_second(RAW, BOTH, 1e6) - 2e6).abs() < 1e-3);
         // No channel on: estimated for CH1.
         assert_eq!(
-            bytes_per_second(1e-3, [false, false]),
-            bytes_per_second(1e-3, CH1)
+            bytes_per_second(1e-3, [false, false], TOP),
+            bytes_per_second(1e-3, CH1, TOP)
         );
         assert_eq!(
-            limit_estimate(1_000_000_000, 1e-3, BOTH),
+            limit_estimate(1_000_000_000, 1e-3, BOTH, TOP),
             "Limit 1 GB ≈ 11 h 34 min at 1 ms step"
         );
         assert_eq!(
-            limit_estimate(1_000_000_000, 1e-3, CH1),
+            limit_estimate(1_000_000_000, 1e-3, CH1, TOP),
             "Limit 1 GB ≈ 23 h 8 min at 1 ms step"
         );
         assert_eq!(
-            limit_estimate(0, 1e-3, BOTH),
+            limit_estimate(1_000_000_000, RAW, BOTH, TOP),
+            "Limit 1 GB ≈ 31 s at raw (62.5 ns) step"
+        );
+        assert_eq!(
+            limit_estimate(0, 1e-3, BOTH, TOP),
             "no limit · 86.4 MB/h at 1 ms step"
         );
         assert_eq!(fmt_bytes(412_300_000), "412 MB");

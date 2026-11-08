@@ -39,7 +39,7 @@ impl Rig {
     fn feed(&mut self) {
         self.app.tick();
         let b = block_for(&self.app, &mut self.driver);
-        self.app.handle_event(Event::Block(b));
+        self.app.handle_event(Event::Block(Box::new(b)));
     }
 
     fn key(&mut self, code: KeyCode) {

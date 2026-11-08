@@ -14,3 +14,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.2.1"
 toml_edit = "=0.25.19"
+
+# The tests stream the fake scope at the top rate (32 MB/s) in real time;
+# unoptimized code cannot make and bin the samples that fast.
+[profile.test]
+opt-level = 1

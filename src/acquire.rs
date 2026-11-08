@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 
-use crate::device::hantek::{Captured, Scope6022};
+use crate::device::hantek::{RawPiece, Scope6022};
 use crate::device::protocol::{HwConfig, Rate};
 use crate::device::transport::{is_gone, is_timeout, Transport};
 use crate::device::Connection;
@@ -40,6 +40,8 @@ pub enum Command {
 pub struct LogRequest {
     /// The writer reports here, and its `path` is the file to write.
     pub shared: Shared,
+    /// The step in ns; 0 for a raw log (one ADC sample per step, stored
+    /// as the raw byte).
     pub step_ns: u64,
     /// Channels to log.
     pub channels: [bool; 2],
@@ -50,14 +52,17 @@ pub struct LogRequest {
     pub gains: [usize; 2],
     pub dc: [bool; 2],
     pub cal_freq: u32,
+    /// The max ADC rate setting (S/s with both channels).
+    pub max_adc: f64,
 }
 
 impl LogRequest {
-    /// Hardware settings: no oversampling, streaming; 1-channel mode when
-    /// only CH1 is logged (twice the ADC rate), else both channels.
+    /// Hardware settings: the ADC at the top rate `max_adc` allows, no
+    /// oversampling, streaming; 1-channel mode when only CH1 is logged
+    /// (twice the ADC rate), else both channels.
     pub fn hw_config(&self) -> (HwConfig, u32) {
-        let channels = crate::logger::hw_channels(self.channels);
-        let (rate, n) = crate::logger::adc_for_step(self.step_ns, channels);
+        let channels = crate::logger::hw_channels(self.channels, self.max_adc);
+        let (rate, n) = crate::logger::adc_for_step(self.step_ns, channels, self.max_adc);
         (
             HwConfig {
                 rate,
@@ -76,7 +81,9 @@ impl LogRequest {
 struct LogSession {
     req: LogRequest,
     cfg: HwConfig,
-    binner: Binner,
+    /// Made at the first piece, with the calibration of the scope.
+    binner: Option<Binner>,
+    samples_per_step: u32,
     writer: Writer,
     /// Checks the stream against the clock; `None` until the first piece.
     check: Option<GapCheck>,
@@ -88,13 +95,12 @@ struct LogSession {
 impl LogSession {
     fn new(req: LogRequest) -> Self {
         let (cfg, n) = req.hw_config();
-        let logged = (0..2).filter(|&c| req.channels[c]).collect();
-        let k = [0, 1].map(|c| req.probe[c] as f64 * if req.invert[c] { -1.0 } else { 1.0 });
         let writer = Writer::spawn(req.shared.clone());
         Self {
             req,
             cfg,
-            binner: Binner::new(n, logged, k),
+            binner: None,
+            samples_per_step: n,
             writer,
             check: None,
             restart: false,
@@ -122,14 +128,41 @@ impl LogSession {
                     as f32,
             }
         });
+        let raw = r.step_ns == 0;
         Header {
             start_ns,
-            step_ns: r.step_ns,
+            // A raw log's step is the ADC sample time (rounded here; the
+            // ADC rate gives it exactly).
+            step_ns: if raw {
+                (1e9 / cfg.rate.raw).round().max(1.0) as u64
+            } else {
+                r.step_ns
+            },
             adc_rate: cfg.rate.raw,
             samples_per_step: n,
             channels: ch,
             device: conn.name.clone(),
+            raw,
         }
+    }
+
+    /// The binner, with the calibration of `conn`.
+    fn make_binner(&self, conn: &Connection) -> Binner {
+        let r = &self.req;
+        let hs = self.cfg.high_speed();
+        let lin = [0, 1].map(|c| {
+            let (a, b) = conn.driver.cal.linear(r.gains[c], c, hs);
+            let k = r.probe[c] as f64 * if r.invert[c] { -1.0 } else { 1.0 };
+            (a * k, b * k)
+        });
+        let logged = (0..2).filter(|&c| r.channels[c]).collect();
+        Binner::new(
+            self.samples_per_step,
+            self.cfg.channels,
+            logged,
+            lin,
+            r.step_ns == 0,
+        )
     }
 
     /// True when the writer stopped by itself (size limit, error).
@@ -138,21 +171,26 @@ impl LogSession {
     }
 
     /// Take one piece of the stream.
-    fn piece(&mut self, cap: &Captured, conn: &Connection) {
+    fn piece(&mut self, cap: &RawPiece, conn: &Connection) {
         let raw = self.cfg.rate.raw;
-        // CH1 is always sampled; CH2 only in 2-channel mode.
-        let n = cap.data[0].len() as u64;
+        let n = (cap.data.len() / self.cfg.channels.clamp(1, 2) as usize) as u64;
         if n == 0 && cap.lost == 0 {
             // The samples thrown away at the start of a stream: no data,
             // so nothing to check (a restart stays pending).
             return;
         }
         let now = Instant::now();
-        let at = cap.at.unwrap_or(now);
+        let at = cap.at;
+        if self.binner.is_none() {
+            self.binner = Some(self.make_binner(conn));
+        }
+        let binner = self.binner.as_mut().expect("binner is set");
         match &mut self.check {
             None => {
                 let start = writer::start_time(SystemTime::now(), n as usize, raw);
-                self.writer.send(Msg::Begin(self.header(conn, start)));
+                let header = self.header(conn, start);
+                self.writer.send(Msg::Begin(header));
+                let binner = self.binner.as_mut().expect("binner is set");
                 let mut check = GapCheck::new(
                     raw,
                     Scope6022::<Box<dyn Transport>>::transfer_secs(&self.cfg),
@@ -160,20 +198,21 @@ impl LogSession {
                 check.piece(at, n, 0, false);
                 self.check = Some(check);
                 self.restart = false;
+                binner.push(&cap.data);
             }
             Some(check) => {
                 if let Some(lost) = check.piece(at, n, cap.lost, self.restart) {
-                    self.binner.gap(lost);
+                    binner.gap(lost);
                 }
                 self.restart = false;
+                binner.push(&cap.data);
             }
         }
-        self.binner.push(&cap.data);
-        for m in self.binner.take() {
+        let binner = self.binner.as_mut().expect("binner is set");
+        for m in binner.take() {
             self.writer.send(m);
         }
-        let clipped = (0..2).any(|c| self.req.channels[c] && cap.clipped[c]);
-        if clipped {
+        if binner.take_clipped() {
             self.clip_at = Some(now);
         }
         let recent = self
@@ -183,18 +222,21 @@ impl LogSession {
     }
 
     fn finish(mut self) {
-        self.binner.finish();
-        for m in self.binner.take() {
-            self.writer.send(m);
+        if let Some(b) = &mut self.binner {
+            b.finish();
+            for m in b.take() {
+                self.writer.send(m);
+            }
         }
         self.writer.finish();
     }
 }
 
-/// The rate the logger streams at for a step and the logged channels
-/// (for the UI).
-pub fn log_rate(step_ns: u64, channels: [bool; 2]) -> Rate {
-    crate::logger::adc_for_step(step_ns, crate::logger::hw_channels(channels)).0
+/// The rate the logger streams at for a step (0 = raw), the logged
+/// channels and the max ADC rate (for the UI).
+pub fn log_rate(step_ns: u64, channels: [bool; 2], max_adc: f64) -> Rate {
+    let hw = crate::logger::hw_channels(channels, max_adc);
+    crate::logger::adc_for_step(step_ns, hw, max_adc).0
 }
 
 /// One block of samples, in volts at the BNC.
@@ -202,8 +244,14 @@ pub fn log_rate(step_ns: u64, channels: [bool; 2]) -> Rate {
 pub struct Block {
     pub gen: u64,
     pub cfg: HwConfig,
-    /// CH1 and CH2. A channel that was not sampled is empty.
+    /// CH1 and CH2: the mean of the raw samples behind each sample. A
+    /// channel that was not sampled is empty.
     pub data: [Vec<f64>; 2],
+    /// Lowest and highest raw sample behind each sample (the peak
+    /// display). Empty when each sample is one raw sample (then they are
+    /// `data`).
+    pub min: [Vec<f64>; 2],
+    pub max: [Vec<f64>; 2],
     pub clipped: [bool; 2],
     /// Volts at the BNC of the lowest and highest ADC value per channel.
     pub range: [(f64, f64); 2],
@@ -223,7 +271,8 @@ pub enum Event {
     /// The scope went away. The thread keeps trying to open it again.
     Disconnected(String),
     Error(String),
-    Block(Block),
+    /// Boxed: a block is big, the other events are small.
+    Block(Box<Block>),
 }
 
 /// Opens the scope. Gets a callback for progress texts.
@@ -406,6 +455,8 @@ impl Worker {
                         gen,
                         cfg,
                         data: cap.data,
+                        min: cap.min,
+                        max: cap.max,
                         clipped: cap.clipped,
                         range: cap.range,
                         rate: cap.rate,
@@ -413,11 +464,11 @@ impl Worker {
                     };
                     if cfg.roll {
                         // Roll pieces must all arrive, or the trace gets gaps.
-                        if !self.emit(Event::Block(block)) {
+                        if !self.emit(Event::Block(Box::new(block))) {
                             break;
                         }
                     } else if let Err(TrySendError::Disconnected(_)) =
-                        self.ev_tx.try_send(Event::Block(block))
+                        self.ev_tx.try_send(Event::Block(Box::new(block)))
                     {
                         // A full queue just drops the block: the UI is behind.
                         break;
@@ -452,7 +503,7 @@ impl Worker {
     /// Read one piece of the log stream.
     fn log_step(&mut self, cfg: HwConfig) {
         let conn = self.conn.as_mut().expect("connected");
-        match conn.driver.stream(&cfg) {
+        match conn.driver.stream_raw(&cfg) {
             Ok(cap) => {
                 self.last_error = None;
                 let conn = self.conn.as_ref().expect("connected");
@@ -520,7 +571,7 @@ mod tests {
     use super::*;
     use crate::device::fake::{FakeScope, Wave};
     use crate::device::hantek::Scope6022;
-    use crate::device::protocol::{choose_rate, roll_rate};
+    use crate::device::protocol::{choose_rate, MAX_ADC_DEFAULT};
     use crate::device::Driver;
     use std::sync::{Arc, Mutex};
 
@@ -538,11 +589,7 @@ mod tests {
 
     fn cfg(roll: bool) -> HwConfig {
         HwConfig {
-            rate: if roll {
-                roll_rate(2.0)
-            } else {
-                choose_rate(0.01, true)
-            },
+            rate: choose_rate(if roll { 2.0 } else { 0.01 }, 2, MAX_ADC_DEFAULT),
             channels: 2,
             gains: [5, 5],
             dc: [true; 2],
@@ -554,7 +601,7 @@ mod tests {
     fn next_block(acq: &Acquisition) -> Block {
         for _ in 0..200 {
             if let Some(Event::Block(b)) = acq.recv_timeout(Duration::from_millis(50)) {
-                return b;
+                return *b;
             }
         }
         panic!("no block");

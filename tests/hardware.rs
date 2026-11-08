@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use openhantek_tui::acquire::{Acquisition, Command, LogRequest};
 use openhantek_tui::device::protocol::{
-    choose_rate, gain_index, raw_rate_of_id, HwConfig, Rate, BLOCK_SAMPLES,
+    choose_rate, gain_index, MAX_ADC_DEFAULT, raw_rate_of_id, HwConfig, Rate, BLOCK_SAMPLES,
 };
 use openhantek_tui::device::{open_hardware, Connection};
 use openhantek_tui::dsp::measure::measure;
@@ -24,7 +24,7 @@ fn open() -> Connection {
 fn config(time_per_div: f64, volts_per_div: f64, channels: u8, cal_freq: u32) -> HwConfig {
     let g = gain_index(volts_per_div);
     HwConfig {
-        rate: choose_rate(time_per_div * 10.0, channels == 2),
+        rate: choose_rate(time_per_div * 10.0, channels, MAX_ADC_DEFAULT),
         channels,
         gains: [g, g],
         dc: [true; 2],
@@ -132,7 +132,6 @@ fn hw_roll_stream() {
     let mut c = open();
     // 200 ms/div: 5 kS/s. A 100 Hz calibration signal has 50 samples per period.
     let mut cfg = config(200e-3, 1.0, 2, 100);
-    cfg.rate = openhantek_tui::device::protocol::roll_rate(2.0);
     cfg.roll = true;
     let mut ch1 = Vec::new();
     let t0 = std::time::Instant::now();
@@ -352,6 +351,7 @@ fn log_run(name: &str, channels: [bool; 2]) {
         gains: [g, g],
         dc: [true, true],
         cal_freq: 1000,
+        max_adc: openhantek_tui::device::protocol::MAX_ADC_DEFAULT,
     };
     let (hw, per) = req.hw_config();
     let acq = Acquisition::spawn(Box::new(|status| open_hardware(None, status)));

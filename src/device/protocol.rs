@@ -35,8 +35,9 @@ pub const FIRMWARE_CHUNK: usize = 1023;
 pub const EEPROM_CAL_ADDR: u16 = 0x0008;
 pub const EEPROM_CAL_LEN: usize = 80;
 
-/// One sample rate step. The ADC runs at `raw` samples per second; we
-/// average `oversample` raw samples into one output sample.
+/// One sample rate. The ADC runs at `raw` samples per second; each output
+/// sample is made from `oversample` raw samples (their mean, and their
+/// min and max for the peak display).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rate {
     /// Output samples per second.
@@ -45,53 +46,9 @@ pub struct Rate {
     pub id: u8,
     /// ADC samples per second.
     pub raw: f64,
+    /// Raw samples per output sample (the decimation factor).
     pub oversample: usize,
 }
-
-impl Rate {
-    /// Rates below 10 kS/s always run with both channels.
-    pub fn slow(&self) -> bool {
-        self.rate < 10e3
-    }
-}
-
-const fn r(rate: f64, id: u8, raw: f64, oversample: usize) -> Rate {
-    Rate {
-        rate,
-        id,
-        raw,
-        oversample,
-    }
-}
-
-/// All rates we use, slowest first. 48 MS/s is left out: USB cannot keep up.
-pub const RATES: [Rate; 20] = [
-    r(100.0, 102, 20e3, 200),
-    r(200.0, 104, 40e3, 200),
-    r(500.0, 110, 100e3, 200),
-    r(1e3, 120, 200e3, 200),
-    r(2e3, 140, 400e3, 200),
-    r(5e3, 1, 1e6, 200),
-    r(10e3, 1, 1e6, 100),
-    r(20e3, 2, 2e6, 100),
-    r(50e3, 5, 5e6, 100),
-    r(100e3, 10, 10e6, 100),
-    r(200e3, 10, 10e6, 50),
-    r(500e3, 10, 10e6, 20),
-    r(1e6, 10, 10e6, 10),
-    r(2e6, 10, 10e6, 5),
-    r(5e6, 10, 10e6, 2),
-    r(10e6, 10, 10e6, 1),
-    r(12e6, 12, 12e6, 1),
-    r(15e6, 15, 15e6, 1),
-    r(24e6, 24, 24e6, 1),
-    r(30e6, 30, 30e6, 1),
-];
-
-/// Highest ADC rate with both channels on.
-pub const MAX_RATE_2CH: f64 = 15e6;
-/// Highest ADC rate with only CH1 on.
-pub const MAX_RATE_1CH: f64 = 30e6;
 
 /// ADC rate for a rate id, as the firmware decodes it.
 pub fn raw_rate_of_id(id: u8) -> f64 {
@@ -102,67 +59,116 @@ pub fn raw_rate_of_id(id: u8) -> f64 {
     }
 }
 
+/// The choices of the max ADC rate setting: the rate id with both
+/// channels, and with CH1 alone. The first is the top clean rate of the
+/// async stream (32 MB/s: 16 MS/s with two channels, 30 MS/s with CH1).
+/// 24 MS/s with two channels and 48 MS/s lose packets, so they are not
+/// here. Below 1 MS/s both channels are always sampled.
+pub const ADC_CAPS: [(u8, u8); 8] = [
+    (16, 30),
+    (12, 24),
+    (10, 10),
+    (5, 5),
+    (2, 2),
+    (1, 1),
+    (150, 150),
+    (140, 140),
+];
+/// The default max ADC rate (with both channels): the top clean rate.
+pub const MAX_ADC_DEFAULT: f64 = 16e6;
+
+/// Index into [`ADC_CAPS`] of a max ADC rate setting (S/s with both
+/// channels): the nearest choice.
+pub fn cap_index(max_adc: f64) -> usize {
+    let far = |i: usize| {
+        let r = raw_rate_of_id(ADC_CAPS[i].0);
+        if max_adc > 0.0 && max_adc.is_finite() {
+            (r / max_adc).ln().abs()
+        } else {
+            (i != 0) as u8 as f64
+        }
+    };
+    (0..ADC_CAPS.len())
+        .min_by(|&a, &b| far(a).total_cmp(&far(b)))
+        .unwrap_or(0)
+}
+
+/// Channels the scope samples: CH1 alone (1-channel mode, twice the
+/// rate) when CH2 is not needed, else both. Below 1 MS/s the ADC always
+/// samples both channels.
+pub fn hw_channels(need_ch2: bool, max_adc: f64) -> u8 {
+    let (_, one) = ADC_CAPS[cap_index(max_adc)];
+    if need_ch2 || raw_rate_of_id(one) < 1e6 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The ADC rate (id and S/s) for `channels` (1 or 2) under the max ADC
+/// rate setting `max_adc`.
+pub fn adc_rate(channels: u8, max_adc: f64) -> (u8, f64) {
+    let (two, one) = ADC_CAPS[cap_index(max_adc)];
+    let id = if channels == 1 { one } else { two };
+    (id, raw_rate_of_id(id))
+}
+
+/// Text of a max ADC rate choice, like `16 MS/s · CH1 alone 30 MS/s`.
+pub fn cap_label(i: usize) -> String {
+    let (two, one) = ADC_CAPS[i.min(ADC_CAPS.len() - 1)];
+    let f = |id: u8| crate::si::fmt_si(raw_rate_of_id(id), "S/s");
+    if two == one {
+        f(two)
+    } else {
+        format!("{} · CH1 alone {}", f(two), f(one))
+    }
+}
+
 /// Output samples per block, per channel (as OpenHantek6022).
 pub const BLOCK_SAMPLES: usize = 20_000;
 /// At most this many samples on one screen, so the block has room for the
 /// trigger search before and after the screen.
 pub const MAX_SCREEN_SAMPLES: f64 = 10_000.0;
 
-/// Pick the sample rate for a screen of `screen_time` seconds: the highest
-/// rate that fits `MAX_SCREEN_SAMPLES` on the screen. Like OpenHantek6022,
-/// the top rate of each mode (15 MS/s for 2 channels, 30 MS/s for CH1) is
-/// not picked, because USB is close to its limit there.
-pub fn choose_rate(screen_time: f64, two_channels: bool) -> Rate {
-    let limit = if two_channels {
-        MAX_RATE_2CH
-    } else {
-        MAX_RATE_1CH
-    };
-    RATES
+/// Output rates the scope view can use with the ADC at `raw`: every
+/// 1-2-5 rate from 100 S/s that divides `raw` exactly, and `raw`,
+/// `raw / 2`, `raw / 4`. Slowest first.
+pub fn output_rates(raw: f64) -> Vec<f64> {
+    let raw_i = raw.round() as u64;
+    let mut v: Vec<f64> = (2..8)
+        .flat_map(|e| [1u64, 2, 5].map(|m| m * 10u64.pow(e)))
+        .filter(|&r| r <= raw_i && raw_i.is_multiple_of(r))
+        .map(|r| r as f64)
+        .collect();
+    for d in [4u64, 2, 1] {
+        if raw_i.is_multiple_of(d) {
+            v.push((raw_i / d) as f64);
+        }
+    }
+    v.sort_by(f64::total_cmp);
+    v.dedup();
+    v
+}
+
+/// Pick the sample rate for a screen of `screen_time` seconds: the ADC
+/// at the top rate the max ADC rate setting allows for `channels`, and
+/// the highest output rate that fits [`MAX_SCREEN_SAMPLES`] on the
+/// screen. The output rate is made by decimating the ADC stream.
+pub fn choose_rate(screen_time: f64, channels: u8, max_adc: f64) -> Rate {
+    let (id, raw) = adc_rate(channels, max_adc);
+    let rates = output_rates(raw);
+    let rate = rates
         .iter()
         .rev()
-        .find(|r| r.rate < limit && r.rate * screen_time <= MAX_SCREEN_SAMPLES * 1.0001)
+        .find(|&&r| r * screen_time <= MAX_SCREEN_SAMPLES * 1.0001)
         .copied()
-        .unwrap_or(RATES[0])
-}
-
-/// Fastest ADC rate used in roll mode. Roll mode streams without end
-/// through the async USB stream (gapless up to 32 MB/s), so it can use the
-/// same ADC rates as blocks at the roll time bases (1 MS/s at 100 ms/div,
-/// with 100x oversampling). With one synchronous read at a time it had to
-/// stay at 400 kS/s, or the scope FIFO overflowed between reads.
-pub const MAX_ROLL_RAW: f64 = 1e6;
-
-/// Sample rate for roll mode: the same output rate as [`choose_rate`],
-/// but with the ADC at most at [`MAX_ROLL_RAW`] (less oversampling).
-pub fn roll_rate(screen_time: f64) -> Rate {
-    let r = choose_rate(screen_time, true);
-    if r.raw <= MAX_ROLL_RAW {
-        return r;
-    }
+        .unwrap_or(rates[0]);
     Rate {
-        rate: r.rate,
-        id: 140,
-        raw: MAX_ROLL_RAW,
-        oversample: ((MAX_ROLL_RAW / r.rate).round() as usize).max(1),
+        rate,
+        id,
+        raw,
+        oversample: ((raw / rate).round() as usize).max(1),
     }
-}
-
-/// ADC samples per channel to read for `n` output samples (OpenHantek6022's
-/// grossSampleCount). Always a multiple of 1024, so of 512-byte packets.
-pub fn gross_samples(n: usize) -> usize {
-    ((n + 1024) / 1024 + 2) * 1024
-}
-
-/// Usable ADC samples per channel in a block of `gross` samples.
-pub fn net_samples(gross: usize) -> usize {
-    ((gross - 1024) / 1000 - 1) * 1000
-}
-
-/// ADC samples per channel to throw away at the start of each block. The
-/// ADC is not stable just after sampling starts.
-pub fn skip_samples(gross: usize) -> usize {
-    gross - net_samples(gross)
 }
 
 /// Gain steps. Index g matches the volts/div steps 20 mV .. 5 V.
@@ -332,6 +338,12 @@ impl Calibration {
         s / COUNTS_PER_VOLT[gain] * self.gain[gain][channel]
     }
 
+    /// The calibration as a line: volts at the BNC = `a * raw + b`.
+    pub fn linear(&self, gain: usize, channel: usize, high_speed: bool) -> (f64, f64) {
+        let b = self.volts(0.0, gain, channel, high_speed);
+        (self.volts(1.0, gain, channel, high_speed) - b, b)
+    }
+
     /// Volts at the BNC of the lowest and the highest ADC value (0x00 and
     /// 0xFF): what the input can measure at this gain.
     pub fn range(&self, gain: usize, channel: usize, high_speed: bool) -> (f64, f64) {
@@ -361,24 +373,16 @@ pub struct HwConfig {
     pub dc: [bool; 2],
     /// Calibration output frequency, in Hz.
     pub cal_freq: u32,
-    /// Stream without end and do not trigger (slow time bases).
+    /// Roll mode: append the stream to the screen, do not trigger (slow
+    /// time bases). Else blocks for the trigger.
     pub roll: bool,
 }
 
 impl HwConfig {
-    /// ADC samples per channel in one (non-roll) block.
-    pub fn gross(&self) -> usize {
-        gross_samples(BLOCK_SAMPLES * self.rate.oversample)
-    }
-
-    /// Bytes in one (non-roll) block.
-    pub fn block_bytes(&self) -> usize {
-        self.gross() * self.channels as usize
-    }
-
-    /// True when the high-speed offset bank applies.
+    /// True when the high-speed offset bank applies: the ADC runs at
+    /// 30 MS/s or more.
     pub fn high_speed(&self) -> bool {
-        self.rate.rate >= 30e6
+        self.rate.raw >= 30e6
     }
 }
 
@@ -389,61 +393,119 @@ pub fn nominal_range(cfg: &HwConfig) -> [(f64, f64); 2] {
     [0, 1].map(|c| cal.range(cfg.gains[c], c, cfg.high_speed()))
 }
 
-/// Turns raw ADC bytes into volts, with oversampling. Keeps partial
-/// samples between calls, so a stream can come in pieces.
+/// Sum, count, min and max of the raw samples of one output point.
+#[derive(Clone, Copy, Debug)]
+struct Acc {
+    sum: u64,
+    n: u32,
+    min: u8,
+    max: u8,
+}
+
+impl Acc {
+    const EMPTY: Acc = Acc {
+        sum: 0,
+        n: 0,
+        min: u8::MAX,
+        max: 0,
+    };
+}
+
+/// Decimates interleaved raw ADC bytes: each `factor` raw samples of a
+/// channel make one output point with their min, max and mean (in ADC
+/// counts). Keeps partial points between calls, so a stream can come in
+/// pieces of any size.
 #[derive(Clone, Debug)]
-pub struct Converter {
+pub struct Decimator {
     channels: usize,
-    oversample: usize,
-    gains: [usize; 2],
-    high_speed: bool,
+    factor: u32,
     /// Raw samples per channel still to throw away.
     skip: usize,
-    /// Sum and count of the sample being built, per channel.
-    acc: [(f64, usize); 2],
     /// Next byte belongs to this channel.
     next_ch: usize,
+    acc: [Acc; 2],
+    /// A point had a raw sample at 0x00 or 0xFF (the signal is too big
+    /// for the range). Set by [`Decimator::push`]; clear it yourself.
     pub clipped: [bool; 2],
 }
 
-impl Converter {
-    pub fn new(cfg: &HwConfig, skip: usize) -> Self {
+impl Decimator {
+    /// `channels` interleaved channels (1 or 2), `factor` raw samples per
+    /// point, `skip` raw samples per channel thrown away at the start.
+    pub fn new(channels: u8, factor: usize, skip: usize) -> Self {
         Self {
-            channels: cfg.channels as usize,
-            oversample: cfg.rate.oversample.max(1),
-            gains: cfg.gains,
-            high_speed: cfg.high_speed(),
+            channels: channels.clamp(1, 2) as usize,
+            factor: factor.clamp(1, u32::MAX as usize) as u32,
             skip,
-            acc: [(0.0, 0); 2],
             next_ch: 0,
+            acc: [Acc::EMPTY; 2],
             clipped: [false; 2],
         }
     }
 
-    /// Convert `raw` bytes and append volts to `out` (CH2 stays empty in
-    /// 1-channel mode).
-    pub fn push(&mut self, raw: &[u8], cal: &Calibration, out: &mut [Vec<f64>; 2]) {
+    pub fn factor(&self) -> usize {
+        self.factor as usize
+    }
+
+    /// Take raw bytes. `out(channel, min, max, mean)` gets each finished
+    /// point, in stream order.
+    #[inline]
+    pub fn push(&mut self, mut raw: &[u8], mut out: impl FnMut(usize, u8, u8, f64)) {
+        while self.skip > 0 && !raw.is_empty() {
+            self.next_ch += 1;
+            if self.next_ch == self.channels {
+                self.next_ch = 0;
+                self.skip -= 1;
+            }
+            raw = &raw[1..];
+        }
+        let factor = self.factor;
         for &b in raw {
             let c = self.next_ch;
-            self.next_ch = (self.next_ch + 1) % self.channels;
-            if self.skip > 0 {
-                if self.next_ch == 0 {
-                    self.skip -= 1;
+            self.next_ch = if c + 1 == self.channels { 0 } else { c + 1 };
+            let a = &mut self.acc[c];
+            a.sum += b as u64;
+            a.n += 1;
+            a.min = a.min.min(b);
+            a.max = a.max.max(b);
+            if a.n == factor {
+                let p = std::mem::replace(a, Acc::EMPTY);
+                if p.min == 0 || p.max == 0xFF {
+                    self.clipped[c] = true;
                 }
-                continue;
-            }
-            if b == 0x00 || b == 0xFF {
-                self.clipped[c] = true;
-            }
-            let acc = &mut self.acc[c];
-            acc.0 += b as f64;
-            acc.1 += 1;
-            if acc.1 == self.oversample {
-                let mean = acc.0 / acc.1 as f64;
-                *acc = (0.0, 0);
-                out[c].push(cal.volts(mean, self.gains[c], c, self.high_speed));
+                out(c, p.min, p.max, p.sum as f64 / factor as f64);
             }
         }
+        // A partial point that clipped already: tell it now, not only
+        // when the point is done (a long log step).
+        for c in 0..self.channels {
+            let a = &self.acc[c];
+            if a.n > 0 && (a.min == 0 || a.max == 0xFF) {
+                self.clipped[c] = true;
+            }
+        }
+    }
+
+    /// End the partial points (data was lost, or the stream ends): each
+    /// channel with samples gets a point of what it has. The next byte is
+    /// CH1 again.
+    pub fn flush(&mut self, mut out: impl FnMut(usize, u8, u8, f64)) {
+        for c in 0..self.channels {
+            let p = std::mem::replace(&mut self.acc[c], Acc::EMPTY);
+            if p.n > 0 {
+                if p.min == 0 || p.max == 0xFF {
+                    self.clipped[c] = true;
+                }
+                out(c, p.min, p.max, p.sum as f64 / p.n as f64);
+            }
+        }
+        self.next_ch = 0;
+    }
+
+    /// Drop the partial points; the next byte is CH1.
+    pub fn reset(&mut self) {
+        self.acc = [Acc::EMPTY; 2];
+        self.next_ch = 0;
     }
 }
 
@@ -452,21 +514,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rate_ids_decode_to_raw_rates() {
-        for r in RATES {
-            assert_eq!(raw_rate_of_id(r.id), r.raw, "{r:?}");
-            assert!((r.raw / r.oversample as f64 - r.rate).abs() < 1e-6, "{r:?}");
+    fn caps_and_adc_rates() {
+        assert_eq!(cap_index(16e6), 0);
+        assert_eq!(cap_index(15e6), 0);
+        assert_eq!(cap_index(1e6), 5);
+        assert_eq!(cap_index(400e3), 7);
+        assert_eq!(cap_index(f64::NAN), 0);
+        assert_eq!(adc_rate(2, MAX_ADC_DEFAULT), (16, 16e6));
+        assert_eq!(adc_rate(1, MAX_ADC_DEFAULT), (30, 30e6));
+        assert_eq!(adc_rate(1, 10e6), (10, 10e6));
+        assert_eq!(hw_channels(false, 16e6), 1);
+        assert_eq!(hw_channels(true, 16e6), 2);
+        // Below 1 MS/s both channels are sampled.
+        assert_eq!(hw_channels(false, 500e3), 2);
+        assert_eq!(cap_label(0), "16 MS/s · CH1 alone 30 MS/s");
+        assert_eq!(cap_label(2), "10 MS/s");
+        for (two, one) in ADC_CAPS {
+            assert!(raw_rate_of_id(two) * 2.0 <= 32e6);
+            assert!(raw_rate_of_id(one) <= 30e6);
         }
     }
 
     #[test]
-    fn rate_choice_matches_openhantek() {
-        // (time/div, 2-channel rate, 1-channel rate) from OpenHantek6022.
+    fn rate_choice_decimates_the_top_rate() {
+        // (time/div, 2-channel rate, CH1 rate) at the default max ADC rate.
         let table = [
-            (20e-6, 12e6, 24e6),
-            (50e-6, 12e6, 15e6),
-            (100e-6, 10e6, 10e6),
-            (200e-6, 5e6, 5e6),
+            (20e-6, 16e6, 30e6),
+            (50e-6, 16e6, 15e6),
+            (100e-6, 8e6, 10e6),
+            (200e-6, 4e6, 5e6),
+            (500e-6, 2e6, 2e6),
             (1e-3, 1e6, 1e6),
             (10e-3, 100e3, 100e3),
             (100e-3, 10e3, 10e3),
@@ -474,39 +551,25 @@ mod tests {
             (10.0, 100.0, 100.0),
         ];
         for (tdiv, two, one) in table {
-            assert_eq!(choose_rate(tdiv * 10.0, true).rate, two, "{tdiv} 2ch");
-            assert_eq!(choose_rate(tdiv * 10.0, false).rate, one, "{tdiv} 1ch");
+            let r2 = choose_rate(tdiv * 10.0, 2, MAX_ADC_DEFAULT);
+            let r1 = choose_rate(tdiv * 10.0, 1, MAX_ADC_DEFAULT);
+            assert_eq!((r2.rate, r2.raw), (two, 16e6), "{tdiv} 2ch");
+            assert_eq!((r1.rate, r1.raw), (one, 30e6), "{tdiv} 1ch");
         }
-        // Very fast screens get the fastest rate allowed.
-        assert_eq!(choose_rate(1e-9, true).rate, 12e6);
-        assert_eq!(choose_rate(1e-9, false).rate, 24e6);
-    }
-
-    #[test]
-    fn roll_rate_keeps_the_adc_slow() {
-        for tdiv in [100e-3, 200e-3, 500e-3, 1.0, 10.0] {
-            let r = roll_rate(tdiv * 10.0);
-            assert_eq!(r.rate, choose_rate(tdiv * 10.0, true).rate);
-            assert!(r.raw <= MAX_ROLL_RAW);
-            assert_eq!(raw_rate_of_id(r.id), r.raw);
-            assert!((r.raw / r.oversample as f64 - r.rate).abs() < 1e-9, "{r:?}");
-        }
-        // The same rate and oversampling as a block at 100 ms/div.
-        assert_eq!(roll_rate(1.0), choose_rate(1.0, true));
-        assert_eq!(roll_rate(1.0).oversample, 100);
-    }
-
-    #[test]
-    fn block_sizes_match_openhantek() {
-        assert_eq!(gross_samples(20_000), 22_528);
-        assert_eq!(skip_samples(22_528), 2_528);
-        assert_eq!(gross_samples(200_000), 202_752);
-        assert_eq!(skip_samples(202_752), 2_752);
-        // Net samples always hold a full block after oversampling.
-        for r in RATES {
-            let g = gross_samples(BLOCK_SAMPLES * r.oversample);
-            assert_eq!(g % PACKET_SIZE, 0);
-            assert!(net_samples(g) >= BLOCK_SAMPLES * r.oversample, "{r:?}");
+        // The top rate is used: no decimation on fast screens.
+        assert_eq!(choose_rate(1e-9, 2, MAX_ADC_DEFAULT).oversample, 1);
+        assert_eq!(choose_rate(1e-9, 1, MAX_ADC_DEFAULT).rate, 30e6);
+        // A lower max ADC rate.
+        let r = choose_rate(1e-9, 2, 400e3);
+        assert_eq!((r.rate, r.raw, r.id), (400e3, 400e3, 140));
+        for max in ADC_CAPS.map(|c| raw_rate_of_id(c.0)) {
+            for ch in [1, 2] {
+                for e in -8..2 {
+                    let r = choose_rate(10f64.powi(e), ch, max);
+                    assert_eq!(raw_rate_of_id(r.id), r.raw);
+                    assert!((r.raw / r.oversample as f64 - r.rate).abs() < 1e-6, "{r:?}");
+                }
+            }
         }
     }
 
@@ -602,51 +665,53 @@ mod tests {
         assert!((nominal.volts(128.0 + 24.75, 5, 1, false) - 1.0).abs() < 1e-12);
     }
 
-    fn cfg(channels: u8, oversample: usize) -> HwConfig {
-        HwConfig {
-            rate: Rate {
-                rate: 1e6 / oversample as f64,
-                id: 1,
-                raw: 1e6,
-                oversample,
-            },
-            channels,
-            gains: [5, 5],
-            dc: [true; 2],
-            cal_freq: 1000,
-            roll: false,
-        }
-    }
-
     #[test]
-    fn converter_interleave_skip_and_oversample() {
-        let cal = Calibration::default();
-        // 2 channels, oversample 2, skip 1 sample per channel.
-        let mut conv = Converter::new(&cfg(2, 2), 1);
-        let mut out = [Vec::new(), Vec::new()];
-        // Skipped pair, then CH1 = 128+24.75*k pattern, CH2 = 128.
-        let one = 128 + 25; // close to 1 V
-        let raw = [0u8, 255, one, 128, one, 128, 128, 128];
+    fn decimator_interleave_skip_min_max_mean() {
+        // 2 channels, 2 raw samples per point, skip 1 sample per channel.
+        let mut d = Decimator::new(2, 2, 1);
+        let mut out = Vec::new();
+        let raw = [0u8, 255, 150, 128, 160, 120, 128, 128];
         // Split in odd pieces to test the carry between calls.
-        conv.push(&raw[..3], &cal, &mut out);
-        conv.push(&raw[3..], &cal, &mut out);
-        assert_eq!(out[0].len(), 1);
-        assert_eq!(out[1].len(), 1);
-        assert!((out[0][0] - 25.0 / 24.75).abs() < 1e-9);
-        assert_eq!(out[1][0], 0.0);
+        d.push(&raw[..3], |c, a, b, m| out.push((c, a, b, m)));
+        d.push(&raw[3..], |c, a, b, m| out.push((c, a, b, m)));
+        assert_eq!(out, vec![(0, 150, 160, 155.0), (1, 120, 128, 124.0)]);
         // The skipped 0x00 / 0xFF bytes do not count as clipping.
-        assert_eq!(conv.clipped, [false, false]);
-        conv.push(&[0, 0], &cal, &mut out);
-        assert_eq!(conv.clipped, [true, true]);
+        assert_eq!(d.clipped, [false, false]);
+        // The last 128 128 wait for their second samples.
+        out.clear();
+        d.push(&[0, 0], |c, a, b, m| out.push((c, a, b, m)));
+        assert_eq!(out, vec![(0, 0, 128, 64.0), (1, 0, 128, 64.0)]);
+        assert_eq!(d.clipped, [true, true]);
+        // Clipping shows before its point is done.
+        d.clipped = [false; 2];
+        d.push(&[0xFF], |_, _, _, _| {});
+        assert_eq!(d.clipped, [true, false]);
+        d.reset();
+        // A flush ends partial points.
+        out.clear();
+        d.push(&[100], |c, a, b, m| out.push((c, a, b, m)));
+        d.flush(|c, a, b, m| out.push((c, a, b, m)));
+        assert_eq!(out, vec![(0, 100, 100, 100.0)]);
     }
 
     #[test]
-    fn converter_single_channel() {
-        let cal = Calibration::default();
-        let mut conv = Converter::new(&cfg(1, 1), 0);
-        let mut out = [Vec::new(), Vec::new()];
-        conv.push(&[128, 128, 153], &cal, &mut out);
-        assert_eq!(out[0].len(), 3);
-        assert!(out[1].is_empty());
+    fn decimator_single_channel() {
+        let mut d = Decimator::new(1, 1, 0);
+        let mut n = 0;
+        d.push(&[128, 128, 153], |c, _, _, _| {
+            assert_eq!(c, 0);
+            n += 1
+        });
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn linear_calibration() {
+        let mut cal = Calibration::default();
+        cal.apply_ini("[offset]\nch0\\1000mV=1.5\n[gain]\nch0\\1000mV=1.02\n");
+        let (a, b) = cal.linear(5, 0, false);
+        for raw in [0.0, 100.5, 255.0] {
+            assert!((a * raw + b - cal.volts(raw, 5, 0, false)).abs() < 1e-12);
+        }
     }
 }

@@ -32,6 +32,7 @@ fn request(path: &Path, step: f64, channels: [bool; 2], limit: u64) -> (LogReque
         gains: [5, 5],
         dc: [true, true],
         cal_freq: 1000,
+        max_adc: openhantek_tui::device::protocol::MAX_ADC_DEFAULT,
     };
     (req, shared)
 }
@@ -88,15 +89,16 @@ fn records_without_gaps_at_1_ms() {
     assert_eq!(sh.lock().unwrap().state, LogState::Done(StopReason::User));
     let f = LogFile::open(&path).unwrap();
     assert!(f.gaps().is_empty(), "{:?}", f.gaps());
-    assert_eq!(f.header.samples_per_step, 20);
-    assert_eq!(f.header.adc_rate, 20e3);
+    // The ADC runs at the top rate: 16 000 samples per 1 ms step.
+    assert_eq!(f.header.samples_per_step, 16_000);
+    assert_eq!(f.header.adc_rate, 16e6);
     // Steps match the time: the stream gives as many samples as the
     // clock says (within about one read of 100 ms each way).
     let want = took / 1e-3;
     let got = f.end() as f64;
     println!(
         "1 ms: {got} steps in {took:.3} s ({:.0} kS/s)",
-        got * 20.0 / took / 1e3
+        got * 16_000.0 / took / 1e3
     );
     assert!((got - want).abs() < 250.0, "{got} steps for {want}");
     let r = f.read(100..f.end()).unwrap();
@@ -200,8 +202,8 @@ fn lost_samples_become_a_gap() {
     acq.send(Command::StartLog(req));
     wait_state(&acq, &sh, 10.0, |s| *s == LogState::Recording);
     std::thread::sleep(Duration::from_millis(700));
-    // Half a second of samples does not come (20 kS/s ADC).
-    fake.lock().drop_samples = 10_000;
+    // Half a second of samples does not come (30 MS/s ADC, CH1 alone).
+    fake.lock().drop_samples = 15_000_000;
     std::thread::sleep(Duration::from_millis(1500));
     acq.send(Command::StopLog);
     wait_state(&acq, &sh, 10.0, |s| matches!(s, LogState::Done(_)));
@@ -397,6 +399,7 @@ fn big_log_opens_fast_after_the_summary() {
         samples_per_step: 1,
         channels: [ch.clone(), ch],
         device: "BIG".into(),
+        raw: false,
     };
     let n = mb * 1_000_000 / 8;
     let t0 = Instant::now();

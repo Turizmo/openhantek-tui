@@ -91,6 +91,55 @@ impl Averager {
     }
 }
 
+/// The peak band over the last captures of the average: for each point
+/// the lowest of their minima and the highest of their maxima. A true
+/// sliding window over the last `depth` captures (never an average of
+/// minima or maxima), so the band holds the absolute extremes. Reset it
+/// with the [`Averager`].
+#[derive(Clone, Debug, Default)]
+pub struct PeakHold {
+    /// Min and max of the last captures, oldest first.
+    window: std::collections::VecDeque<(Vec<f64>, Vec<f64>)>,
+}
+
+impl PeakHold {
+    pub fn reset(&mut self) {
+        self.window.clear();
+    }
+
+    /// Add the min and max of one capture; return the min and max over
+    /// the last `depth` captures. A new length starts over.
+    pub fn push(&mut self, min: &[f64], max: &[f64], depth: usize) -> (Vec<f64>, Vec<f64>) {
+        if depth <= 1 {
+            self.reset();
+            return (min.to_vec(), max.to_vec());
+        }
+        if self.window.front().is_some_and(|w| w.0.len() != min.len()) {
+            self.reset();
+        }
+        while self.window.len() >= depth {
+            self.window.pop_front();
+        }
+        self.window.push_back((min.to_vec(), max.to_vec()));
+        let mut lo = min.to_vec();
+        let mut hi = max.to_vec();
+        for (a, b) in &self.window {
+            for (l, v) in lo.iter_mut().zip(a) {
+                *l = l.min(*v);
+            }
+            for (h, v) in hi.iter_mut().zip(b) {
+                *h = h.max(*v);
+            }
+        }
+        (lo, hi)
+    }
+
+    /// Captures in the window.
+    pub fn count(&self) -> usize {
+        self.window.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +186,22 @@ mod tests {
         // Depth 1 means no averaging.
         assert_eq!(avg.push(&[7.0], 1), vec![7.0]);
         assert_eq!(avg.count(), 0);
+    }
+
+    #[test]
+    fn peak_hold_is_a_sliding_window_of_extremes() {
+        let mut p = PeakHold::default();
+        assert_eq!(p.push(&[0.0], &[1.0], 3), (vec![0.0], vec![1.0]));
+        assert_eq!(p.push(&[-5.0], &[9.0], 3), (vec![-5.0], vec![9.0]));
+        assert_eq!(p.push(&[0.0], &[1.0], 3), (vec![-5.0], vec![9.0]));
+        // The -5 / 9 capture is still one of the last 3, then it drops out.
+        assert_eq!(p.push(&[0.0], &[1.0], 3), (vec![-5.0], vec![9.0]));
+        assert_eq!(p.push(&[0.0], &[1.0], 3), (vec![0.0], vec![1.0]));
+        assert_eq!(p.count(), 3);
+        // Never an average: a single wide capture is kept whole.
+        assert_eq!(p.push(&[-1.0, 0.0], &[2.0, 3.0], 3).0, vec![-1.0, 0.0]);
+        assert_eq!(p.count(), 1);
+        assert_eq!(p.push(&[1.0], &[2.0], 1), (vec![1.0], vec![2.0]));
+        assert_eq!(p.count(), 0);
     }
 }

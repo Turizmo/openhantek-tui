@@ -6,13 +6,19 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use super::protocol::*;
-use super::transport::{StreamSetup, Transport};
+use super::transport::{Chunk, StreamSetup, Transport};
 
-/// One captured block, in volts at the BNC.
+/// One captured block or piece of a stream, in volts at the BNC.
 #[derive(Clone, Debug, Default)]
 pub struct Captured {
-    /// Samples per channel. CH2 is empty in 1-channel mode.
+    /// Samples per channel: the mean of the raw samples of each output
+    /// sample. CH2 is empty in 1-channel mode.
     pub data: [Vec<f64>; 2],
+    /// Lowest and highest raw sample behind each output sample (the peak
+    /// display). Empty when each output sample is one raw sample: then
+    /// they are `data`.
+    pub min: [Vec<f64>; 2],
+    pub max: [Vec<f64>; 2],
     /// A raw sample hit 0x00 or 0xFF: the signal is too big for the range.
     pub clipped: [bool; 2],
     /// Output samples per second.
@@ -27,14 +33,60 @@ pub struct Captured {
     pub at: Option<std::time::Instant>,
 }
 
+/// A piece of the stream as raw ADC bytes (the logger bins them itself).
+#[derive(Clone, Debug)]
+pub struct RawPiece {
+    /// Whole frames of interleaved samples (CH1, CH2, CH1, ... with two
+    /// channels), after the unstable samples at the start of the stream.
+    pub data: Vec<u8>,
+    /// Samples per channel the host dropped just before this piece.
+    pub lost: u64,
+    /// When the piece came off the bus.
+    pub at: std::time::Instant,
+}
+
+impl Live {
+    /// Whole points (all channels) in the ring.
+    fn points(&self) -> usize {
+        let n = self.cfg.channels.clamp(1, 2) as usize;
+        self.ring[..n].iter().map(|r| r.len()).min().unwrap_or(0)
+    }
+}
+
+/// Blocks of points [`Scope6022::capture`] keeps for a slow caller.
+pub const MAX_BEHIND: usize = 8;
+
+/// Raw samples per channel thrown away after each start: the ADC is not
+/// stable just after sampling starts.
+pub const SKIP_SAMPLES: usize = 2048;
+
+/// One output point of a channel in ADC counts: mean, min, max.
+#[derive(Clone, Copy, Debug)]
+struct Pt {
+    mean: f32,
+    min: u8,
+    max: u8,
+}
+
+/// The running stream: the settings it was started with, the decimator,
+/// and the points of the block being filled.
+struct Live {
+    cfg: HwConfig,
+    dec: Decimator,
+    /// Raw path: bytes still to throw away at the start.
+    skip_bytes: usize,
+    /// Block mode: the points since the last block, per channel.
+    ring: [Vec<Pt>; 2],
+}
+
 pub struct Scope6022<T: Transport> {
     t: T,
     pub cal: Calibration,
     pub serial: String,
     /// Settings the hardware has now. `None` = unknown, send all.
     sent: Option<HwConfig>,
-    /// Roll mode stream, while running.
-    stream: Option<Converter>,
+    /// The async stream, while running.
+    stream: Option<Live>,
 }
 
 impl<T: Transport> Scope6022<T> {
@@ -93,7 +145,6 @@ impl<T: Transport> Scope6022<T> {
         self.end_stream();
         let old = self.sent;
         let changed = |f: &dyn Fn(&HwConfig) -> u64| old.is_none_or(|o| f(&o) != f(cfg));
-        let rate_index = RATES.iter().position(|r| *r == cfg.rate).unwrap_or(0) as u8;
         if changed(&|c| c.cal_freq as u64) {
             self.t
                 .control_out(REQ_SET_CAL_FREQ, 0, 0, &[cal_freq_code(cfg.cal_freq)])?;
@@ -108,7 +159,7 @@ impl<T: Transport> Scope6022<T> {
         }
         if changed(&|c| c.rate.id as u64) {
             self.t
-                .control_out(REQ_SET_SAMPLERATE, 0, 0, &[cfg.rate.id, rate_index])?;
+                .control_out(REQ_SET_SAMPLERATE, 0, 0, &[cfg.rate.id, 0])?;
         }
         for ch in [1usize, 0] {
             let g = cfg.gains[ch].min(GAIN_STEPS - 1);
@@ -125,7 +176,7 @@ impl<T: Transport> Scope6022<T> {
         Ok(())
     }
 
-    /// Start sampling. Needed before every block.
+    /// Start sampling.
     pub fn start(&mut self) -> Result<()> {
         self.t.control_out(REQ_START, 0, 0, &[0x01])
     }
@@ -143,52 +194,9 @@ impl<T: Transport> Scope6022<T> {
         }
     }
 
-    /// Time to wait for `bytes` of samples, with a good margin.
-    fn timeout_for(cfg: &HwConfig, bytes: usize) -> Duration {
-        let secs = bytes as f64 / (cfg.rate.raw * cfg.channels as f64);
-        Duration::from_secs_f64(secs * 2.0 + 1.0)
-    }
-
     /// Input range of each channel for `cfg`, with this scope's calibration.
     pub fn range(&self, cfg: &HwConfig) -> [(f64, f64); 2] {
         [0, 1].map(|c| self.cal.range(cfg.gains[c], c, cfg.high_speed()))
-    }
-
-    /// Capture one block. The whole block is one bulk transfer: libusb
-    /// keeps the pipe busy, so no samples are lost inside the block.
-    pub fn capture(&mut self, cfg: &HwConfig) -> Result<Captured> {
-        if self.sent != Some(*cfg) {
-            self.configure(cfg)?;
-        }
-        self.end_stream();
-        let gross = cfg.gross();
-        let bytes = cfg.block_bytes();
-        let mut raw = vec![0u8; bytes];
-        self.start()?;
-        let n = self
-            .t
-            .bulk_in(EP_BULK_IN, &mut raw, Self::timeout_for(cfg, bytes))
-            .context("reading samples failed")?;
-        if n < bytes {
-            bail!("short block from the scope: {n} of {bytes} bytes");
-        }
-        let mut conv = Converter::new(cfg, skip_samples(gross));
-        let mut data = [
-            Vec::with_capacity(BLOCK_SAMPLES + 8),
-            Vec::with_capacity(BLOCK_SAMPLES + 8),
-        ];
-        conv.push(&raw, &self.cal, &mut data);
-        for d in &mut data {
-            d.truncate(BLOCK_SAMPLES);
-        }
-        Ok(Captured {
-            data,
-            clipped: conv.clipped,
-            rate: cfg.rate.rate,
-            range: self.range(cfg),
-            lost: 0,
-            at: None,
-        })
     }
 
     /// Sizes of the async stream for `cfg`: transfers of about 20 ms of
@@ -214,13 +222,13 @@ impl<T: Transport> Scope6022<T> {
         Self::stream_setup(cfg).transfer as f64 / (cfg.rate.raw * cfg.channels.clamp(1, 2) as f64)
     }
 
-    /// Roll mode and the logger: the next piece of a stream with no end
-    /// (one transfer). Starts the stream when needed: queues the async
-    /// transfers first, then starts the scope, so no data comes before a
-    /// buffer is ready. On an error the stream ends; the next call starts
-    /// it again.
-    pub fn stream(&mut self, cfg: &HwConfig) -> Result<Captured> {
-        if self.sent != Some(*cfg) {
+    /// The next transfer of the stream for `cfg`. Starts the stream when
+    /// none runs or it runs with other settings: sends the settings that
+    /// changed, queues the async transfers, then starts the scope, so no
+    /// data comes before a buffer is ready. On an error the stream ends;
+    /// the next call starts it again.
+    fn next_chunk(&mut self, cfg: &HwConfig) -> Result<Chunk> {
+        if self.stream.as_ref().is_some_and(|l| l.cfg != *cfg) || self.sent != Some(*cfg) {
             self.configure(cfg)?;
         }
         if self.stream.is_none() {
@@ -229,35 +237,141 @@ impl<T: Transport> Scope6022<T> {
                 self.t.stream_stop();
                 return Err(e);
             }
-            // Throw away the first samples, like a normal block does.
-            self.stream = Some(Converter::new(cfg, 2048));
+            let ch = cfg.channels.clamp(1, 2);
+            self.stream = Some(Live {
+                cfg: *cfg,
+                dec: Decimator::new(ch, cfg.rate.oversample, SKIP_SAMPLES),
+                skip_bytes: SKIP_SAMPLES * ch as usize,
+                ring: Default::default(),
+            });
         }
         let wait = Duration::from_secs_f64(Self::transfer_secs(cfg) * 2.0 + 1.0);
-        let chunk = match self.t.stream_next(wait) {
-            Ok(Some(c)) => c,
+        match self.t.stream_next(wait) {
+            Ok(Some(c)) => Ok(c),
             Ok(None) => {
                 self.end_stream();
-                return Err(anyhow::Error::new(rusb::Error::Timeout).context(format!(
+                Err(anyhow::Error::new(rusb::Error::Timeout).context(format!(
                     "no samples from the scope for {:.1} s",
                     wait.as_secs_f64()
-                )));
+                )))
             }
             Err(e) => {
                 self.end_stream();
-                return Err(e.context("reading samples failed"));
+                Err(e.context("reading samples failed"))
             }
-        };
-        let mut data = [Vec::new(), Vec::new()];
-        let conv = self.stream.as_mut().expect("stream is set");
-        conv.clipped = [false; 2];
-        conv.push(&chunk.data, &self.cal, &mut data);
-        Ok(Captured {
-            data,
-            clipped: conv.clipped,
+        }
+    }
+
+    /// Volts per ADC count and volts at count 0, per channel, for `cfg`.
+    fn lines(&self, cfg: &HwConfig) -> [(f64, f64); 2] {
+        [0, 1].map(|c| self.cal.linear(cfg.gains[c], c, cfg.high_speed()))
+    }
+
+    /// Capture one block of [`BLOCK_SAMPLES`] output samples per channel
+    /// for the trigger. The scope streams without a stop (the async
+    /// stream), the ADC at the rate of `cfg` (the top rate), and each
+    /// piece is decimated as it comes into the points of the next blocks,
+    /// so no raw data is kept. Blocks come in stream order, each right
+    /// after the one before: one transfer can fill several. When data was
+    /// lost, the points before the gap are dropped. A caller that falls
+    /// more than [`MAX_BEHIND`] blocks behind gets the newest one.
+    pub fn capture(&mut self, cfg: &HwConfig) -> Result<Captured> {
+        loop {
+            let live = self.stream.as_mut().filter(|l| l.cfg == *cfg);
+            if live.is_some_and(|l| l.points() >= BLOCK_SAMPLES) {
+                break;
+            }
+            let chunk = self.next_chunk(cfg)?;
+            let live = self.stream.as_mut().expect("stream is set");
+            if chunk.lost > 0 {
+                live.ring[0].clear();
+                live.ring[1].clear();
+                live.dec.reset();
+            }
+            let ring = &mut live.ring;
+            live.dec.push(&chunk.data, |c, min, max, mean| {
+                ring[c].push(Pt {
+                    mean: mean as f32,
+                    min,
+                    max,
+                })
+            });
+            let n = live.points();
+            if n >= MAX_BEHIND * BLOCK_SAMPLES {
+                let drop = (n / BLOCK_SAMPLES - 1) * BLOCK_SAMPLES;
+                for r in &mut live.ring {
+                    r.drain(..drop.min(r.len()));
+                }
+            }
+        }
+        let range = 0..BLOCK_SAMPLES;
+        let lines = self.lines(cfg);
+        let live = self.stream.as_mut().expect("stream is set");
+        let mut out = Captured {
             rate: cfg.rate.rate,
-            range: self.range(cfg),
-            lost: chunk.lost / cfg.channels.clamp(1, 2) as u64,
+            ..Default::default()
+        };
+        let peak = cfg.rate.oversample > 1;
+        for (c, &(a, b)) in lines.iter().enumerate().take(cfg.channels.clamp(1, 2) as usize) {
+            let pts = &live.ring[c][range.clone()];
+            out.data[c] = pts.iter().map(|p| a * p.mean as f64 + b).collect();
+            if peak {
+                // A negative slope would swap them; it is positive.
+                out.min[c] = pts.iter().map(|p| a * p.min as f64 + b).collect();
+                out.max[c] = pts.iter().map(|p| a * p.max as f64 + b).collect();
+            }
+            out.clipped[c] = pts.iter().any(|p| p.min == 0 || p.max == 0xFF);
+            live.ring[c].drain(..BLOCK_SAMPLES);
+        }
+        out.range = self.range(cfg);
+        Ok(out)
+    }
+
+    /// Roll mode: the next piece of the stream (one transfer), decimated
+    /// to the output rate of `cfg`, with min and max per output sample.
+    pub fn stream(&mut self, cfg: &HwConfig) -> Result<Captured> {
+        let chunk = self.next_chunk(cfg)?;
+        let lines = self.lines(cfg);
+        let live = self.stream.as_mut().expect("stream is set");
+        let ch = cfg.channels.clamp(1, 2) as u64;
+        let mut out = Captured {
+            rate: cfg.rate.rate,
+            lost: chunk.lost / ch,
             at: Some(chunk.at),
+            ..Default::default()
+        };
+        if chunk.lost > 0 {
+            live.dec.reset();
+        }
+        let peak = cfg.rate.oversample > 1;
+        live.dec.clipped = [false; 2];
+        let (data, min, max) = (&mut out.data, &mut out.min, &mut out.max);
+        live.dec.push(&chunk.data, |c, lo, hi, mean| {
+            let (a, b) = lines[c];
+            data[c].push(a * mean + b);
+            if peak {
+                min[c].push(a * lo as f64 + b);
+                max[c].push(a * hi as f64 + b);
+            }
+        });
+        out.clipped = live.dec.clipped;
+        out.range = self.range(cfg);
+        Ok(out)
+    }
+
+    /// The logger: the next piece of the stream as raw ADC bytes, after
+    /// the unstable samples at the start.
+    pub fn stream_raw(&mut self, cfg: &HwConfig) -> Result<RawPiece> {
+        let mut chunk = self.next_chunk(cfg)?;
+        let live = self.stream.as_mut().expect("stream is set");
+        let skip = live.skip_bytes.min(chunk.data.len());
+        live.skip_bytes -= skip;
+        chunk.data.drain(..skip);
+        let ch = cfg.channels.clamp(1, 2) as usize;
+        Ok(RawPiece {
+            lost: chunk.lost / ch as u64,
+            data: chunk.data,
+            at: chunk.at,
         })
     }
 }
@@ -267,9 +381,11 @@ mod tests {
     use super::*;
     use crate::device::fake::{FakeScope, Wave};
 
-    fn cfg(rate_idx: usize, channels: u8, gains: [usize; 2]) -> HwConfig {
+    /// Settings for a screen of `screen` seconds at the default max ADC
+    /// rate.
+    fn cfg(screen: f64, channels: u8, gains: [usize; 2]) -> HwConfig {
         HwConfig {
-            rate: RATES[rate_idx],
+            rate: choose_rate(screen, channels, MAX_ADC_DEFAULT),
             channels,
             gains,
             dc: [true; 2],
@@ -285,10 +401,18 @@ mod tests {
         (s, fake)
     }
 
+    fn starts(fake: &FakeScope) -> usize {
+        fake.lock()
+            .calls
+            .iter()
+            .filter(|c| c.request == 0xE3 && c.data == [1])
+            .count()
+    }
+
     #[test]
     fn configure_sends_only_changes() {
         let (mut s, fake) = scope([Wave::Dc(0.0); 2]);
-        let c = cfg(12, 2, [5, 5]);
+        let c = cfg(0.01, 2, [5, 5]);
         s.configure(&c).unwrap();
         let first: Vec<u8> = fake.lock().calls.iter().map(|c| c.request).collect();
         // EEPROM read, then E6 E5 E4 E2 E1 E0.
@@ -297,26 +421,37 @@ mod tests {
         s.configure(&c).unwrap();
         assert!(fake.lock().calls.is_empty());
         // 1 V to 2 V/div: same gain byte, nothing to send.
-        s.configure(&cfg(12, 2, [6, 5])).unwrap();
+        s.configure(&cfg(0.01, 2, [6, 5])).unwrap();
         assert!(fake.lock().calls.is_empty());
-        s.configure(&cfg(12, 2, [2, 5])).unwrap();
+        s.configure(&cfg(0.01, 2, [2, 5])).unwrap();
         let calls = fake.lock().calls.clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(
             (calls[0].request, calls[0].data.clone()),
             (0xE0, vec![10, 2])
         );
+        // A new output rate with the same ADC rate sends nothing either.
+        fake.lock().calls.clear();
+        s.configure(&cfg(0.001, 2, [2, 5])).unwrap();
+        assert!(fake.lock().calls.is_empty());
     }
 
     #[test]
-    fn capture_gives_volts() {
+    fn capture_gives_volts_from_the_top_adc_rate() {
         let (mut s, fake) = scope([Wave::Dc(1.5), Wave::Dc(-0.25)]);
         fake.lock().noise = 0.0;
-        let c = cfg(12, 2, [5, 3]);
+        // 1 ms/div: 1 MS/s out of 16 MS/s.
+        let c = cfg(0.01, 2, [5, 3]);
+        assert_eq!(
+            (c.rate.rate, c.rate.raw, c.rate.oversample),
+            (1e6, 16e6, 16)
+        );
         let block = s.capture(&c).unwrap();
         assert_eq!(block.data[0].len(), BLOCK_SAMPLES);
         assert_eq!(block.data[1].len(), BLOCK_SAMPLES);
+        assert_eq!(block.min[0].len(), BLOCK_SAMPLES);
         assert_eq!(block.rate, 1e6);
+        assert_eq!(fake.lock().rate_id, 16);
         // The fake adds its EEPROM offset; calibration removes it again.
         // Rounding to whole ADC counts leaves at most half a count.
         for v in &block.data[0] {
@@ -327,14 +462,57 @@ mod tests {
         }
         // The junk at the start was skipped, so nothing looks clipped.
         assert_eq!(block.clipped, [false, false]);
-        // Every block starts sampling with E3 [01].
-        let starts = fake
-            .lock()
-            .calls
-            .iter()
-            .filter(|c| c.request == 0xE3 && c.data == [1])
-            .count();
-        assert_eq!(starts, 1);
+        // The stream keeps running: more blocks, one start.
+        for _ in 0..3 {
+            s.capture(&c).unwrap();
+        }
+        assert_eq!(starts(&fake), 1);
+        assert!(fake.lock().started_with_stream);
+    }
+
+    #[test]
+    fn blocks_follow_each_other_without_a_gap() {
+        // A slow ramp: the time of each sample is in its value.
+        let (mut s, fake) = scope([
+            Wave::Triangle {
+                freq: 20.0,
+                amp: 2.0,
+                dc: 0.0,
+            },
+            Wave::Dc(0.0),
+        ]);
+        fake.lock().noise = 0.0;
+        // 100 µs/div: 8 MS/s out of 16, blocks of 2.5 ms.
+        let c = cfg(1e-3, 2, [5, 5]);
+        let a = s.capture(&c).unwrap();
+        let b = s.capture(&c).unwrap();
+        // Rising part of the triangle: b starts one step after a ends.
+        let slope = 2.0 * 2.0 * 2.0 * 20.0 / 8e6; // V per output sample
+        let step = b.data[0][0] - a.data[0][BLOCK_SAMPLES - 1];
+        assert!((step - slope).abs() < 0.05, "{step}");
+    }
+
+    #[test]
+    fn peaks_are_the_raw_extremes() {
+        // A 1 MHz square at 1 ms/div: 16 raw samples per point see both
+        // levels; the mean is between them, min and max are the levels.
+        let (mut s, fake) = scope([
+            Wave::Square {
+                freq: 1e6,
+                low: -1.0,
+                high: 1.0,
+                duty: 0.5,
+            },
+            Wave::Dc(0.0),
+        ]);
+        fake.lock().noise = 0.0;
+        let block = s.capture(&cfg(0.01, 2, [5, 5])).unwrap();
+        let tol = 0.5 / 24.75 + 1e-9;
+        for i in 0..BLOCK_SAMPLES {
+            assert!(block.data[0][i].abs() < 0.2, "{}", block.data[0][i]);
+            assert!((block.min[0][i] + 1.0).abs() <= tol);
+            assert!((block.max[0][i] - 1.0).abs() <= tol);
+        }
     }
 
     #[test]
@@ -342,21 +520,24 @@ mod tests {
         let (mut s, fake) = scope([Wave::Dc(3.0), Wave::Dc(0.0)]);
         fake.lock().noise = 0.0;
         // 3 V at 100 mV/div (x10 gain) is far past the range.
-        let block = s.capture(&cfg(15, 1, [2, 2])).unwrap();
+        let c = cfg(1e-6, 1, [2, 2]);
+        assert_eq!((c.rate.rate, c.rate.oversample), (30e6, 1));
+        let block = s.capture(&c).unwrap();
         assert!(block.data[1].is_empty());
+        assert!(block.min[0].is_empty());
         assert_eq!(block.data[0].len(), BLOCK_SAMPLES);
         assert!(block.clipped[0]);
         assert_eq!(fake.lock().channels, 1);
+        assert_eq!(fake.lock().rate_id, 30);
     }
 
     #[test]
-    fn slow_block_is_one_transfer() {
+    fn lower_max_adc_rate() {
         let (mut s, fake) = scope([Wave::Dc(0.0); 2]);
-        // 10 kS/s with 100x oversampling: about 4 MB in one read.
-        let c = cfg(6, 2, [5, 5]);
-        let block = s.capture(&c).unwrap();
-        assert_eq!(block.data[0].len(), BLOCK_SAMPLES);
-        assert_eq!(fake.lock().bulk_bytes, c.block_bytes());
+        let mut c = cfg(0.01, 2, [5, 5]);
+        c.rate = choose_rate(0.01, 2, 2e6);
+        s.capture(&c).unwrap();
+        assert_eq!(fake.lock().rate_id, 2);
     }
 
     #[test]
@@ -369,34 +550,30 @@ mod tests {
             },
             Wave::Dc(0.0),
         ]);
-        let mut c = cfg(6, 2, [5, 5]);
+        let mut c = cfg(1.0, 2, [5, 5]);
         c.roll = true;
         let mut total = 0;
         for _ in 0..5 {
             let piece = s.stream(&c).unwrap();
             assert_eq!(piece.data[0].len(), piece.data[1].len());
+            assert_eq!(piece.data[0].len(), piece.max[0].len());
             total += piece.data[0].len();
         }
         assert!(total > 400, "total {total}");
         // The transfers were queued before the start command.
         assert!(fake.lock().started_with_stream);
-        // The ADC runs at 1 MS/s x 2: 20 ms is 79 packets, 250 ms 13 transfers.
+        // The ADC runs at 16 MS/s x 2: 20 ms is 1250 packets, more than
+        // the 512 of the biggest transfer; 250 ms is 31 transfers.
         let st = Scope6022::<FakeScope>::stream_setup(&c);
-        assert_eq!((st.transfer, st.transfers), (79 * 512, 13));
+        assert_eq!((st.transfer, st.transfers), (512 * 512, 31));
         // One start for the whole stream.
-        let starts = fake
-            .lock()
-            .calls
-            .iter()
-            .filter(|c| c.request == 0xE3)
-            .count();
-        assert_eq!(starts, 1);
+        assert_eq!(starts(&fake), 1);
     }
 
     #[test]
     fn stream_sizes_stay_in_usbfs_memory() {
-        for (rate_id, ch) in [(16, 2), (30, 1), (10, 2), (102, 2)] {
-            let mut c = cfg(12, ch, [5, 5]);
+        for (rate_id, ch) in [(16, 2), (30, 1), (10, 2), (140, 2)] {
+            let mut c = cfg(0.01, ch, [5, 5]);
             c.rate = Rate {
                 rate: raw_rate_of_id(rate_id),
                 id: rate_id,
@@ -413,19 +590,38 @@ mod tests {
     }
 
     #[test]
-    fn stream_stops_before_a_block() {
+    fn mode_and_setting_changes_restart_the_stream() {
         let (mut s, fake) = scope([Wave::Dc(0.0); 2]);
-        let mut c = cfg(6, 2, [5, 5]);
+        let mut c = cfg(1.0, 2, [5, 5]);
         c.roll = true;
         s.stream(&c).unwrap();
         assert!(fake.lock().stream.is_some());
         c.roll = false;
         s.capture(&c).unwrap();
-        assert!(fake.lock().stream.is_none());
-        c.roll = true;
-        s.stream(&c).unwrap();
+        assert_eq!(starts(&fake), 2);
+        // A new gain: the firmware stops on the command, a new start.
+        c.gains = [2, 5];
+        s.capture(&c).unwrap();
+        assert_eq!(starts(&fake), 3);
         s.stop().unwrap();
         assert!(fake.lock().stream.is_none());
+    }
+
+    #[test]
+    fn raw_stream_skips_the_start() {
+        let (mut s, fake) = scope([Wave::Dc(0.0); 2]);
+        fake.lock().noise = 0.0;
+        let mut c = cfg(1.0, 2, [5, 5]);
+        c.rate.oversample = 1;
+        c.roll = true;
+        let mut n = 0;
+        while n < 100_000 {
+            let p = s.stream_raw(&c).unwrap();
+            assert_eq!(p.data.len() % 2, 0);
+            // No junk bytes from the start.
+            assert!(p.data.iter().all(|b| (120..=135).contains(b)));
+            n += p.data.len();
+        }
     }
 
     #[test]
@@ -444,7 +640,7 @@ mod tests {
         s.load_calibration(Some(
             "[eeprom]\nreplace_eeprom=true\n[offset]\nch0\\1000mV=2\n",
         ));
-        s.capture(&cfg(12, 2, [5, 5])).unwrap();
+        s.capture(&cfg(0.01, 2, [5, 5])).unwrap();
         s.stop().unwrap();
         let writes = fake
             .lock()

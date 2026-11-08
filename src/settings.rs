@@ -443,6 +443,41 @@ pub enum Interpolation {
     Sinc,
 }
 
+/// What a trace shows of the raw samples behind each point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TraceMode {
+    /// The mean as a line.
+    #[default]
+    Average,
+    /// The area between the lowest and the highest raw sample (over the
+    /// samples behind each point and the averaged captures).
+    Peak,
+    /// The mean as a bright line over the peak area, muted.
+    Both,
+}
+
+impl TraceMode {
+    pub const ALL: [TraceMode; 3] = [TraceMode::Average, TraceMode::Peak, TraceMode::Both];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TraceMode::Average => "average",
+            TraceMode::Peak => "peak",
+            TraceMode::Both => "average + peak",
+        }
+    }
+
+    /// The peak area is drawn.
+    pub fn peak(self) -> bool {
+        self != TraceMode::Average
+    }
+
+    /// The mean line is drawn.
+    pub fn line(self) -> bool {
+        self != TraceMode::Peak
+    }
+}
+
 /// How a trace is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TraceStyle {
@@ -607,6 +642,8 @@ pub struct DisplaySettings {
     pub colors: ColorMode,
     /// How CH1, CH2 and MATH are drawn (also in the spectrum).
     pub trace_style: [TraceStyle; 3],
+    /// Mean line, peak area or both (scope and log view).
+    pub trace_mode: TraceMode,
     /// The one cursor style of old files. It only loads: it becomes the
     /// style of each cursor (see [`Settings::sanitize`]).
     #[serde(skip_serializing)]
@@ -637,6 +674,7 @@ impl Default for DisplaySettings {
             measurements: true,
             colors: ColorMode::Auto,
             trace_style: [TraceStyle::BrailleThin; 3],
+            trace_mode: TraceMode::Average,
             cursor_style: None,
             grid_style: GridStyle::Dots,
             grid_extent: GridExtent::Points,
@@ -705,11 +743,37 @@ impl CsvTime {
     }
 }
 
+/// Acquisition settings (the `[acquisition]` table).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AcquisitionSettings {
+    /// Highest ADC rate in S/s with both channels sampled (one of the
+    /// [`crate::device::protocol::ADC_CAPS`] choices; CH1 alone gets its
+    /// pair). Caps the ADC in every mode: blocks, roll and the logger.
+    pub max_adc_rate: f64,
+}
+
+impl Default for AcquisitionSettings {
+    fn default() -> Self {
+        Self {
+            max_adc_rate: crate::device::protocol::MAX_ADC_DEFAULT,
+        }
+    }
+}
+
+impl AcquisitionSettings {
+    /// Index of the setting in [`crate::device::protocol::ADC_CAPS`].
+    pub fn cap_idx(&self) -> usize {
+        crate::device::protocol::cap_index(self.max_adc_rate)
+    }
+}
+
 /// Envelope logger settings (the `[logger]` table).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggerSettings {
-    /// Time step of the log, in seconds (one of [`crate::logger::STEPS`]).
+    /// Time step of the log, in seconds (one of [`crate::logger::STEPS`]),
+    /// or 0 for raw ([`crate::logger::RAW`]: one ADC sample per step).
     pub step: f64,
     /// Stop the log when the file reaches this many bytes; 0 = no limit.
     pub log_limit: u64,
@@ -732,7 +796,8 @@ impl Default for LoggerSettings {
 }
 
 impl LoggerSettings {
-    /// Index of the step in [`crate::logger::STEPS`].
+    /// Index of the step in [`crate::logger::STEPS`] (the nearest; raw
+    /// gives 0).
     pub fn step_idx(&self) -> usize {
         crate::logger::nearest(&crate::logger::STEPS, self.step)
     }
@@ -773,6 +838,7 @@ pub struct Settings {
     pub cal_freq: u32,
     /// Selected trace: 0 = CH1, 1 = CH2, 2 = MATH.
     pub selected: usize,
+    pub acquisition: AcquisitionSettings,
     pub logger: LoggerSettings,
 }
 
@@ -796,6 +862,7 @@ impl Default for Settings {
             display: DisplaySettings::default(),
             cal_freq: 1_000,
             selected: 0,
+            acquisition: AcquisitionSettings::default(),
             logger: LoggerSettings::default(),
         }
     }
@@ -863,7 +930,18 @@ impl Settings {
         }
         self.selected = self.selected.min(2);
         let lg = &mut self.logger;
-        lg.step = crate::logger::STEPS[lg.step_idx()];
+        // Raw is 0 (a negative value too); else the nearest step, so a
+        // hand-typed 35 still works.
+        lg.step = if lg.step.is_nan() {
+            crate::logger::STEP_DEFAULT
+        } else if crate::logger::is_raw(lg.step) {
+            crate::logger::RAW
+        } else {
+            crate::logger::STEPS[lg.step_idx()]
+        };
+        let caps = &crate::device::protocol::ADC_CAPS;
+        self.acquisition.max_adc_rate =
+            crate::device::protocol::raw_rate_of_id(caps[self.acquisition.cap_idx()].0);
         lg.log_limit = crate::logger::LIMITS[lg.limit_idx()];
     }
 

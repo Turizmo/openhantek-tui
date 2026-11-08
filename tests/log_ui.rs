@@ -32,6 +32,7 @@ fn header(step_ns: u64, n: u32) -> Header {
         samples_per_step: n,
         channels: [ch.clone(), ch],
         device: "TESTSCOPE".into(),
+        raw: false,
     }
 }
 

@@ -284,7 +284,11 @@ impl App {
         let shared = log_writer::shared(path.clone(), limit);
         let req = LogRequest {
             shared: shared.clone(),
-            step_ns: logger::step_ns(s.logger.step),
+            step_ns: logger::step_ns(logger::fit_step(
+                s.logger.step,
+                channels,
+                s.acquisition.max_adc_rate,
+            )),
             channels,
             probe: [0, 1].map(|c| s.channels[c].probe),
             invert: [0, 1].map(|c| s.channels[c].invert),
@@ -292,6 +296,7 @@ impl App {
             gains: hw.gains,
             dc: hw.dc,
             cal_freq: hw.cal_freq,
+            max_adc: s.acquisition.max_adc_rate,
         };
         let free = logger::free_space(&dir);
         let warn = free.is_some_and(|f| limit == 0 || f < limit);
@@ -477,7 +482,7 @@ impl App {
     /// Handle one event from the acquisition thread.
     pub fn handle_event(&mut self, ev: Event) -> bool {
         match ev {
-            Event::Block(b) => self.scope.push(b),
+            Event::Block(b) => self.scope.push(*b),
             Event::Status(s) => {
                 self.status = Some(s);
                 true

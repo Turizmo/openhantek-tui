@@ -80,7 +80,9 @@ fn ch1_only_uses_one_channel_and_a_faster_rate() {
     tick_until(&mut app, 10.0, |a| a.scope.frame.is_some());
     assert_eq!(fake.lock().channels, 1);
     let f = app.scope.frame.as_ref().unwrap();
-    assert_eq!(f.rate, 24e6);
+    // The top rate of 1-channel mode, not decimated.
+    assert_eq!(f.rate, 30e6);
+    assert_eq!(fake.lock().rate_id, 30);
     assert!(f.traces[1].is_none());
 }
 

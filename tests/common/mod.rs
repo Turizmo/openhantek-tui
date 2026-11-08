@@ -65,6 +65,8 @@ pub fn block_for(app: &App, d: &mut Driver) -> Block {
         gen: app.scope.gen,
         cfg,
         data: cap.data,
+        min: cap.min,
+        max: cap.max,
         clipped: cap.clipped,
         range: cap.range,
         rate: cap.rate,
