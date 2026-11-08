@@ -103,13 +103,21 @@ impl TrigState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum AutosetStep {
     /// Look at 1 ms/div with the biggest range.
     Fast,
     /// Nothing found: look slower for low frequencies.
     Slow,
+    /// Measure again at the volts/div and time/div the coarse pass picked:
+    /// the biggest range is coarse and its zero can be off by several ADC
+    /// steps, so the offset and trigger level come from this pass. `n`:
+    /// refine passes done; `freq`: the frequency found so far.
+    Refine { n: u8, freq: Option<f64> },
 }
+
+/// Refine passes at most: a volts/div that keeps changing still ends.
+const AUTOSET_REFINES: u8 = 3;
 
 pub struct Scope {
     pub settings: Settings,
@@ -552,14 +560,17 @@ impl Scope {
         let n = found.len().max(1) as f64;
         // Each channel gets its own band of the screen.
         let band = V_DIVS / n;
+        let mut volts_changed = false;
         for (i, (c, m)) in found.iter().enumerate() {
             let ch = &mut self.settings.channels[*c];
             let probe = ch.probe as f64;
             let pp = m.pk_pk.max(1e-3);
+            let old = (ch.volt_idx, ch.volts_fine);
             ch.volt_idx = VOLT_DIVS
                 .iter()
                 .position(|v| pp <= v * probe * band * 0.8)
                 .unwrap_or(VOLT_DIVS.len() - 1);
+            volts_changed |= old != (ch.volt_idx, 1.0);
             let vdiv = ch.volts_per_div();
             let center = V_DIVS / 2.0 - band * (i as f64 + 0.5);
             ch.offset = (center - (m.max + m.min) / 2.0 / vdiv).clamp(-V_DIVS / 2.0, V_DIVS / 2.0);
@@ -571,17 +582,28 @@ impl Scope {
             t.position = 0.5;
             t.slope = crate::dsp::trigger::Slope::Rising;
         }
-        match freq {
-            Some(f) => {
-                // About 3 periods on the screen.
-                self.settings.time_idx = time_index(3.0 / f / H_DIVS);
-                self.notices
-                    .push(format!("Autoset: {}", crate::si::fmt_si(f, "Hz")));
+        match step {
+            AutosetStep::Refine { n, freq: f0 } => {
+                // The time base stays: the coarse pass picked it.
+                let freq = freq.or(f0);
+                if volts_changed && n + 1 < AUTOSET_REFINES {
+                    self.autoset = Some(AutosetStep::Refine { n: n + 1, freq });
+                    return;
+                }
+                match freq {
+                    Some(f) => self
+                        .notices
+                        .push(format!("Autoset: {}", crate::si::fmt_si(f, "Hz"))),
+                    None => self
+                        .notices
+                        .push("Autoset: no periodic signal found".into()),
+                }
             }
-            None => {
-                self.settings.time_idx = time_index(1e-3);
-                self.notices
-                    .push("Autoset: no periodic signal found".into());
+            _ => {
+                // About 3 periods on the screen.
+                self.settings.time_idx = time_index(freq.map_or(1e-3, |f| 3.0 / f / H_DIVS));
+                self.autoset = Some(AutosetStep::Refine { n: 0, freq });
+                return;
             }
         }
         self.autoset = None;
@@ -1098,6 +1120,13 @@ mod tests {
         let mut b = sine_block(gen, rate, 2000.0, 1.5, 0.0);
         b.data[1].clear();
         s.push(b);
+        // The refine pass measures again at the picked settings.
+        assert!(s.autoset_running());
+        s.sync_hw();
+        let rate = s.hw.unwrap().rate.rate;
+        let mut b = sine_block(s.gen, rate, 2000.0, 1.5, 0.0);
+        b.data[1].clear();
+        s.push(b);
         assert!(!s.autoset_running());
         let st = &s.settings;
         // 3 Vpp in 8 divs at 80 %: 0.5 V/div.
@@ -1122,6 +1151,10 @@ mod tests {
         s.sync_hw();
         let rate = s.hw.unwrap().rate.rate;
         s.push(sine_block(s.gen, rate, 20.0, 1.0, 0.0));
+        assert!(s.autoset_running());
+        s.sync_hw();
+        let rate = s.hw.unwrap().rate.rate;
+        s.push(sine_block(s.gen, rate, 20.0, 1.0, 0.0));
         assert!(!s.autoset_running());
         assert!(s.notices.iter().any(|n| n.contains("20 Hz")));
     }
@@ -1137,6 +1170,82 @@ mod tests {
         s.settings.channels[0].volt_idx = 0; // 20 mV/div
         s.reprocess();
         assert!(s.measure(0).unwrap().freq.is_some());
+    }
+
+    /// A frame of the stream processing around `b`, as the app gets it.
+    fn published(s: &Scope, b: Block) -> Published {
+        Published {
+            gen: s.gen,
+            pgen: s.pgen,
+            frame: None,
+            state: TrigState::Waiting,
+            range: b.range,
+            snapshot: Some(b),
+            triggers: 0,
+            averaged: 0,
+            trigger_at: None,
+            points: 0,
+            single_done: false,
+            ac_mean: [0.0; 2],
+        }
+    }
+
+    #[test]
+    fn autoset_takes_level_and_offset_from_the_picked_range() {
+        let mut s = scope();
+        s.settings.channels[1].enabled = false;
+        s.settings.trigger.level = 2.42;
+        s.settings.channels[0].offset = -4.0;
+        s.start_autoset();
+        // A 0 .. 2 V square at 1 kHz; the 5 V/div range reads 1 V high
+        // (its zero is off), the others are right.
+        let block = |s: &mut Scope| {
+            s.sync_hw();
+            s.sync_proc();
+            let rate = s.hw.unwrap().rate.rate;
+            let err = if s.settings.channels[0].volts_per_div() >= 5.0 {
+                1.0
+            } else {
+                0.0
+            };
+            let mut b = sine_block(s.gen, rate, 1000.0, 1.0, 0.0);
+            b.data[0] = b.data[0]
+                .iter()
+                .map(|v| if *v >= 0.0 { 2.0 } else { 0.0 } + err)
+                .collect();
+            b.data[1].clear();
+            published(s, b)
+        };
+        let p = block(&mut s);
+        s.take(p);
+        assert!(s.autoset_running(), "the coarse pass is not the end");
+        // A frame of the old settings does not count.
+        let mut stale = block(&mut s);
+        stale.gen -= 1;
+        s.take(stale);
+        assert!(s.autoset_running());
+        for _ in 0..AUTOSET_REFINES {
+            if !s.autoset_running() {
+                break;
+            }
+            let p = block(&mut s);
+            s.take(p);
+        }
+        assert!(!s.autoset_running());
+        let st = &s.settings;
+        assert!(
+            (st.trigger.level - 1.0).abs() < 0.05,
+            "level {}",
+            st.trigger.level
+        );
+        // 2 Vpp in 8 divs at 80 %: 0.5 V/div, the middle (1 V) on the centre.
+        assert_eq!(st.channels[0].volts_per_div(), 0.5);
+        assert!(
+            (st.channels[0].offset + 2.0).abs() < 0.1,
+            "offset {}",
+            st.channels[0].offset
+        );
+        assert!(s.notices.iter().any(|n| n.contains("1 kHz")));
     }
 
     #[test]
