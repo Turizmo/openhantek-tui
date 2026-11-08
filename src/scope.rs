@@ -14,10 +14,6 @@ use crate::stream::pipeline::{self, Averaging, ProcSettings, Published, Roll, MA
 /// Index of the math trace in [`Frame::traces`].
 pub const MATH: usize = 2;
 
-/// Auto mode keeps the last triggered frame this long (seconds of
-/// signal) before it shows untriggered frames.
-pub const AUTO_TIMEOUT: f64 = 0.1;
-
 /// What is on the screen now.
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
@@ -144,8 +140,6 @@ pub struct Scope {
     adc_range: [Option<(usize, (f64, f64))>; 2],
     /// Mean that AC coupling took away, per channel, in the last block.
     ac_mean: [f64; 2],
-    /// Seconds of signal since the last trigger (Auto mode timeout).
-    untriggered_secs: f64,
     /// Triggers in the average of the last frame.
     pub averaged: usize,
 }
@@ -173,7 +167,6 @@ impl Scope {
             notices: Vec::new(),
             adc_range: [None; 2],
             ac_mean: [0.0; 2],
-            untriggered_secs: 0.0,
             averaged: 0,
         }
     }
@@ -259,7 +252,6 @@ impl Scope {
         self.hw = Some(cfg);
         self.reset_average();
         self.history.clear();
-        self.untriggered_secs = 0.0;
         if roll_changed {
             self.clear_roll();
         }
@@ -352,12 +344,9 @@ impl Scope {
             let state = self.state;
             self.running = true;
             self.reset_average();
-            // Show the block even when it has no trigger (no Auto hold).
-            let waited = std::mem::replace(&mut self.untriggered_secs, f64::INFINITY);
             if !block.roll {
                 self.process(&block);
             }
-            self.untriggered_secs = waited;
             self.running = running;
             self.state = if running { self.state } else { state };
             self.last_block = Some(block);
@@ -436,23 +425,12 @@ impl Scope {
             self.state = TrigState::Roll;
             return true;
         }
+        // A block without a trigger: Auto shows it untriggered (the
+        // stream processing waits for its timeout before it sends one).
         let trig = block.trigger.or_else(|| self.find_trigger(block, &p));
-        match trig {
-            Some(_) => self.untriggered_secs = 0.0,
-            None if p.mode == TriggerMode::Auto => {
-                // Keep the last triggered frame for a while: a block can
-                // miss the edge (a block shorter than the signal period).
-                let len = block.data.iter().map(|d| d.len()).max().unwrap_or(0);
-                self.untriggered_secs += len as f64 / block.rate;
-                let holding = self.frame.as_ref().is_some_and(|f| f.triggered && !f.roll);
-                if holding && self.untriggered_secs < AUTO_TIMEOUT {
-                    return false;
-                }
-            }
-            None => {
-                self.state = TrigState::Waiting;
-                return false;
-            }
+        if trig.is_none() && p.mode != TriggerMode::Auto {
+            self.state = TrigState::Waiting;
+            return false;
         }
         let ac = [0, 1].map(|c| ac_mean(block, &self.settings.channels[c], c));
         let cut = pipeline::cut(block, &p, ac, trig);
@@ -1319,12 +1297,14 @@ mod tests {
     #[test]
     fn cal_wave_ch1_alone_at_30_ms_keeps_the_trigger() {
         // CH1 alone at 30 MS/s: a block (0.67 ms) is shorter than the
-        // 1 ms period, so a third of them have no edge. Auto keeps the
-        // last triggered frame instead of showing them untriggered, and
-        // the average goes on. The trigger source is CH2 (off): it
-        // follows CH1, in 1-channel mode.
+        // 1 ms period, so a third of them have no edge. In Normal mode
+        // those wait, and the average goes on. (The stream processing
+        // has no blocks: it finds every edge, see the pipeline tests.)
+        // The trigger source is CH2 (off): it follows CH1, in 1-channel
+        // mode.
         for avg in [1, 64] {
             let mut s = cal_scope([true, false], 1, [1, 1], avg);
+            s.settings.trigger.mode = TriggerMode::Normal;
             let hw = s.hw.unwrap();
             assert_eq!((hw.channels, hw.rate.rate), (1, 30e6));
             let (shown, trig, sd, big) = cal_run(&mut s, 300);
@@ -1352,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_waits_before_untriggered_frames() {
+    fn untriggered_blocks_leave_the_average_alone() {
         let mut s = scope();
         s.settings.display.averaging = 4;
         // 20000 samples at 1 MS/s: 20 ms per block.
@@ -1364,12 +1344,8 @@ mod tests {
             b.cfg = s.hw.unwrap();
             b
         };
-        // Four blocks (80 ms) without a trigger: the triggered frame stays.
-        for _ in 0..4 {
-            assert!(!s.push(flat(&s)));
-            assert!(s.frame.as_ref().unwrap().triggered);
-        }
-        // The fifth (100 ms): untriggered frames from now on.
+        // A block without a trigger is shown untriggered at once (the
+        // stream processing does the Auto timeout).
         assert!(s.push(flat(&s)));
         assert!(!s.frame.as_ref().unwrap().triggered);
         assert_eq!(s.state, TrigState::Auto);

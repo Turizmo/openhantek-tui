@@ -166,8 +166,9 @@ fn pop_keyboard_enhancement() {
     let _ = ratatui::crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
 }
 
-/// Shortest time between two frames: at most 60 frames per second.
-const FRAME_TIME: Duration = Duration::from_nanos(16_666_667);
+/// Shortest time between two frames: at most 60 frames per second (the
+/// stream processing publishes no faster either).
+use openhantek_tui::stream::pipeline::FRAME_TIME;
 /// Draw at least this often, also when nothing changed (the clock, old
 /// messages going away).
 const IDLE_REDRAW: Duration = Duration::from_millis(500);

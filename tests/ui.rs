@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use openhantek_tui::acquire::Event;
+use openhantek_tui::acquire::{Event, Restart};
 use openhantek_tui::app::App;
 use openhantek_tui::device::fake::{FakeScope, Wave};
 use openhantek_tui::dsp::trigger::Slope;
@@ -348,6 +348,12 @@ fn errors_show_on_the_message_line() {
     r.app
         .handle_event(Event::Error("permission denied. Add udev rules".into()));
     assert!(r.text(150, 40).contains("permission denied"));
+    // A stream that lost data starts again, and says so.
+    r.app.handle_event(Event::Restart(Restart::Overrun));
+    assert!(r.text(150, 40).contains("Processing fell behind"));
+    r.app
+        .handle_event(Event::Restart(Restart::UsbLoss("3.0 ms missing".into())));
+    assert!(r.text(200, 40).contains("USB lost samples (3.0 ms missing)"));
 }
 
 #[test]

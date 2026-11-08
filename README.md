@@ -213,11 +213,16 @@ signal's pk-pk (at least 2 ADC steps), so a small signal at a big
 volts/div still triggers. When the trigger source channel is off and
 the other channel is on, the trigger uses the channel that is on (the
 status line names it): CH1 alone then still samples in 1-channel mode.
-Auto mode keeps the last triggered trace for 100 ms of signal before it
-shows untriggered traces, so a capture that misses the edge (at 30 MS/s
-a capture is 0.67 ms, shorter than the 1 ms of the calibration wave)
-does not make the trace jump. Untriggered traces are not averaged and
-leave the average alone. With averaging on, each capture is first moved
+The trigger looks at the whole stream, never at separate blocks: every
+edge is seen, also one that falls between two USB transfers. After a
+trigger it rearms at the end of that capture (the hold-off), and the
+first edge after that is the next trigger. Auto mode shows untriggered
+traces only when no trigger came for 100 ms of signal or two screens
+(whichever is longer), then one per screen (at most 60 per second) until
+a trigger comes; Normal keeps the last trace and waits; Single takes the
+first edge after you arm it and stops the scope. Untriggered traces are
+not averaged and leave the average alone. Averaging N is the mean of the
+last N triggers (a sliding window). With averaging on, each capture is first moved
 by its sub-sample trigger offset (linear interpolation), so the edge
 sits at the trigger point in every capture and the average does not
 wander by up to a sample.
@@ -791,9 +796,14 @@ record at the end is ignored).
   thread for the libusb events); `fake.rs` is a fake scope that acts like
   the firmware, with a model of the stream (bus times, a host queue that
   drops whole transfers when full, a 40 MB/s link).
-- `src/acquire.rs`: a thread that captures blocks (or roll pieces, or the
-  log) and sends them to the UI.
-- `src/scope.rs`: trigger, averaging, math, roll mode, autoset.
+- `src/stream/`: `ring.rs` is the 64 MiB sample ring the USB side writes
+  and the processing reads; `pipeline.rs` is the processing on it
+  (decimation, trigger, captures, average, peak band, roll mode, math).
+- `src/acquire.rs`: the processing thread: commands, connect, stream
+  start and stop, the pipeline (or the logger), and the newest frame for
+  the UI.
+- `src/scope.rs`: the UI side of the scope: the frame on screen,
+  persistence, measurements, autoset.
 - `src/dsp/`: trigger search, measurements, FFT, math, interpolation.
 - `src/logger/`: the envelope logger: `format.rs` (file layout),
   `binner.rs` (min/max/mean per step), `writer.rs` (writer thread, size
@@ -818,28 +828,41 @@ so no raw data is kept for a screen (at 50 ms/div a screen is 16 MB of
 raw samples). Output rates are the 1-2-5 rates that divide the ADC rate,
 and the ADC rate / 1, 2, 4 (16, 8, 4 MS/s; 30, 15, 7.5 MS/s).
 
-- Trigger modes (blocks): the stream runs on, and each transfer is
-  decimated into the points of the next blocks of 20 000 samples per
-  channel. The UI's software trigger searches each block as before (a
-  block is twice the screen, so pre- and post-trigger fit). Blocks follow
-  each other with no gap, and each is new data (averaging and
-  persistence see independent captures); a block is ready every 1.25 ms
-  at 16 MS/s, more often than the screen draws, so the UI takes the
-  newest and drops the rest. Continuous streaming with the trigger over
-  this block ring was chosen over a start/stop per capture: a start costs
-  the 2048 unstable samples after it and a USB round trip, and the
-  stream is already gapless.
-- Roll mode: each transfer is decimated and appended to the screen.
+- Three threads, one stream. The USB events thread only copies each
+  finished transfer into the ring (with the time it came off the bus)
+  and resubmits it. The processing thread reads the ring as one
+  continuous stream of bytes, numbered from the start: it decimates them
+  into points, the trigger search (an edge scanner that keeps its state
+  from one piece to the next) runs on the points of the source channel in
+  ADC counts, and each trigger cuts its capture (the screen, pre- and
+  post-trigger) out of the ring and decimates it again for the trace and
+  the peak band. The UI takes the newest finished frame when it draws (at
+  most 60 per second); a frame it did not take is replaced, so a slow
+  screen never makes the stream drop data.
+- The ring holds 2 s at the top rate (the longest capture, 50 ms/div,
+  is 0.5 s). It never overwrites what the processing still needs: when
+  the processing falls that far behind, new transfers are dropped and
+  counted, the stream starts again, and the message line says
+  `Processing fell behind ... the stream started again`. A transfer that
+  fails, comes short, or a gap in the bus times (the scope's buffer
+  overflowed) does the same with `USB lost samples (...)`.
+- Settings that change the hardware (gain, rate, channels, roll) start
+  the stream again; settings that only change the processing (trigger
+  level, slope, source, position, averaging, probe, invert, AC, math,
+  fine time/div, the app's calibration) start the trigger search and the
+  average over, and the stream goes on.
+- Roll mode: the same ring, no trigger: the points go onto the screen.
 - The logger: each transfer goes to the binner as raw bytes.
 - A settings change (gain, rate, channels, roll / blocks) sends the
   changed commands (the firmware stops on any command), cancels the
   transfers and starts the stream again; the first 2048 samples after a
   start are thrown away (the ADC is not stable yet).
 
-Measured on the real scope (in a VM, USB 3 port): 800 blocks/s at
-16 MS/s with both channels and 1500 blocks/s at 30 MS/s with CH1, every
-calibration period across the blocks the right length, 21 % and 26 % of
-one CPU core; roll mode at 16 MS/s 11 %.
+Measured before the stream rework, on the real scope (in a VM, USB 3
+port): 800 blocks/s at 16 MS/s with both channels and 1500 blocks/s at
+30 MS/s with CH1, 21 % and 26 % of one CPU core; roll mode at 16 MS/s
+11 %. The decimation and trigger search of the stream processing do
+about 130 MS/s on one core in a debug build (`opt-level = 1`).
 
 **Calibration.** The offsets in the EEPROM have a bank for the ADC at
 30 MS/s and up; it is used whenever the ADC runs at 30 MS/s (now every

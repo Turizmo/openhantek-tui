@@ -888,7 +888,9 @@ impl Pipeline {
         let due = self
             .last_publish
             .is_none_or(|t| now.duration_since(t) >= self.min_publish);
-        if !due || (!last && !self.single_done && !self.hw.roll && !self.dirty) {
+        // The frame of a single trigger always goes out: the stream stops.
+        let single = self.single_done && self.dirty;
+        if (!due && !single) || (!last && !single && !self.hw.roll && !self.dirty) {
             return;
         }
         let rate = self.hw.rate.rate;
