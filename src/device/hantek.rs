@@ -46,15 +46,12 @@ pub struct RawPiece {
 }
 
 impl Live {
-    /// Whole points (all channels) in the ring.
+    /// Whole points (all channels) in the ring, after `head`.
     fn points(&self) -> usize {
         let n = self.cfg.channels.clamp(1, 2) as usize;
-        self.ring[..n].iter().map(|r| r.len()).min().unwrap_or(0)
+        self.ring[..n].iter().map(|r| r.len()).min().unwrap_or(0) - self.head
     }
 }
-
-/// Blocks of points [`Scope6022::capture`] keeps for a slow caller.
-pub const MAX_BEHIND: usize = 8;
 
 /// Raw samples per channel thrown away after each start: the ADC is not
 /// stable just after sampling starts.
@@ -75,8 +72,10 @@ struct Live {
     dec: Decimator,
     /// Raw path: bytes still to throw away at the start.
     skip_bytes: usize,
-    /// Block mode: the points since the last block, per channel.
+    /// Block mode: the points of the next blocks, per channel, from
+    /// `head` on.
     ring: [Vec<Pt>; 2],
+    head: usize,
 }
 
 pub struct Scope6022<T: Transport> {
@@ -243,6 +242,7 @@ impl<T: Transport> Scope6022<T> {
                 dec: Decimator::new(ch, cfg.rate.oversample, SKIP_SAMPLES),
                 skip_bytes: SKIP_SAMPLES * ch as usize,
                 ring: Default::default(),
+                head: 0,
             });
         }
         let wait = Duration::from_secs_f64(Self::transfer_secs(cfg) * 2.0 + 1.0);
@@ -272,9 +272,9 @@ impl<T: Transport> Scope6022<T> {
     /// stream), the ADC at the rate of `cfg` (the top rate), and each
     /// piece is decimated as it comes into the points of the next blocks,
     /// so no raw data is kept. Blocks come in stream order, each right
-    /// after the one before: one transfer can fill several. When data was
-    /// lost, the points before the gap are dropped. A caller that falls
-    /// more than [`MAX_BEHIND`] blocks behind gets the newest one.
+    /// after the one before: one transfer can fill several (13 at 30 MS/s).
+    /// When data was lost (the caller was more than the stream's 2 s queue
+    /// behind), the points before the gap are dropped.
     pub fn capture(&mut self, cfg: &HwConfig) -> Result<Captured> {
         loop {
             let live = self.stream.as_mut().filter(|l| l.cfg == *cfg);
@@ -283,6 +283,11 @@ impl<T: Transport> Scope6022<T> {
             }
             let chunk = self.next_chunk(cfg)?;
             let live = self.stream.as_mut().expect("stream is set");
+            // Less than a block is left: move it to the front (cheap).
+            let head = std::mem::take(&mut live.head);
+            for r in &mut live.ring {
+                r.drain(..head.min(r.len()));
+            }
             if chunk.lost > 0 {
                 live.ring[0].clear();
                 live.ring[1].clear();
@@ -296,17 +301,10 @@ impl<T: Transport> Scope6022<T> {
                     max,
                 })
             });
-            let n = live.points();
-            if n >= MAX_BEHIND * BLOCK_SAMPLES {
-                let drop = (n / BLOCK_SAMPLES - 1) * BLOCK_SAMPLES;
-                for r in &mut live.ring {
-                    r.drain(..drop.min(r.len()));
-                }
-            }
         }
-        let range = 0..BLOCK_SAMPLES;
         let lines = self.lines(cfg);
         let live = self.stream.as_mut().expect("stream is set");
+        let range = live.head..live.head + BLOCK_SAMPLES;
         let mut out = Captured {
             rate: cfg.rate.rate,
             ..Default::default()
@@ -321,8 +319,8 @@ impl<T: Transport> Scope6022<T> {
                 out.max[c] = pts.iter().map(|p| a * p.max as f64 + b).collect();
             }
             out.clipped[c] = pts.iter().any(|p| p.min == 0 || p.max == 0xFF);
-            live.ring[c].drain(..BLOCK_SAMPLES);
         }
+        live.head += BLOCK_SAMPLES;
         out.range = self.range(cfg);
         Ok(out)
     }
@@ -490,6 +488,37 @@ mod tests {
         let slope = 2.0 * 2.0 * 2.0 * 20.0 / 8e6; // V per output sample
         let step = b.data[0][0] - a.data[0][BLOCK_SAMPLES - 1];
         assert!((step - slope).abs() < 0.05, "{step}");
+    }
+
+    #[test]
+    fn every_block_of_a_big_transfer_comes() {
+        // 30 MS/s with CH1: a 256 KiB transfer holds 13 blocks. Each one
+        // must come, in order: a ramp of 1 count per 1000 samples.
+        let (mut s, fake) = scope([
+            Wave::Triangle {
+                freq: 30e6 / 2.0 / 120_000.0,
+                amp: 2.4,
+                dc: 0.0,
+            },
+            Wave::Dc(0.0),
+        ]);
+        fake.lock().noise = 0.0;
+        let c = cfg(1e-6, 1, [5, 5]);
+        assert_eq!((c.rate.raw, c.rate.oversample), (30e6, 1));
+        let mut prev: Option<f64> = None;
+        let mut jumps = 0;
+        for _ in 0..30 {
+            let b = s.capture(&c).unwrap();
+            if let Some(p) = prev {
+                // Next to the last sample of the block before.
+                if (b.data[0][0] - p).abs() > 0.1 {
+                    jumps += 1;
+                }
+            }
+            prev = Some(b.data[0][BLOCK_SAMPLES - 1]);
+        }
+        assert_eq!(jumps, 0);
+        assert_eq!(starts(&fake), 1);
     }
 
     #[test]

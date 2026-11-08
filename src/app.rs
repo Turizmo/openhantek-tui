@@ -855,6 +855,7 @@ impl App {
             connected: self.connected,
             notes: self.device_notes.clone(),
             rate: self.scope.hw.as_ref().map(|h| h.rate.rate),
+            adc_rate: self.scope.hw.as_ref().map(|h| h.rate.raw),
             running: self.scope.running,
             export_dir: self.export_dir.display().to_string(),
             recording: self.recording(),

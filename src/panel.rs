@@ -135,8 +135,10 @@ pub struct DeviceInfo {
     pub connected: bool,
     /// Notes from connecting, like where the calibration came from.
     pub notes: Vec<String>,
-    /// ADC sample rate, when known.
+    /// Output sample rate, when known.
     pub rate: Option<f64>,
+    /// ADC sample rate, when known (the output rate decimates it).
+    pub adc_rate: Option<f64>,
     pub running: bool,
     pub export_dir: String,
     pub settings_file: String,
@@ -502,7 +504,7 @@ impl Field {
             CalFreq => "Frequency of the 2 Vpp square wave on the calibration pins. Keys g G.",
             DevModel | DevSerial | DevFirmware | DevState => "Read from the scope.",
             DevCalibration => "Where the calibration values came from.",
-            DevRate => "Sample rate the ADC runs at now.",
+            DevRate => "Sample rate of the traces now, and the ADC rate it is made from (the mean of each few ADC samples).",
             ExportDir => "Exports go here. Set it with --export-dir.",
             SettingsFile => "Settings and keys. Changes are saved here on quit, in place. Set it with --config.",
             ConfigWarnings => "Problems in the config file; those entries use their defaults.",
@@ -1079,7 +1081,13 @@ impl Field {
                             n.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; ")
                         }
                     }
-                    DevRate => d.rate.map_or("--".into(), |r| fmt_si(r, "S/s")),
+                    DevRate => match (d.rate, d.adc_rate) {
+                        (Some(r), Some(a)) if (a - r).abs() > 0.5 => {
+                            format!("{} (ADC {})", fmt_si(r, "S/s"), fmt_si(a, "S/s"))
+                        }
+                        (Some(r), _) => fmt_si(r, "S/s"),
+                        _ => "--".into(),
+                    },
                     ExportDir => d.export_dir.clone(),
                     SettingsFile => d.settings_file.clone(),
                     ConfigWarnings => match d.config_warnings.len() {
