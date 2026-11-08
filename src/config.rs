@@ -615,41 +615,88 @@ pub fn load(path: &Path, old: Option<&Path>) -> Loaded {
 
 /// Find or make the item at `path` in a `toml_edit` table, for setting a
 /// value. Missing tables are made; a missing array-of-tables entry is
-/// made when it is the next one.
+/// made when it is the next one. A key or table that is new to the file
+/// (like a setting added after the file was made) gets its comment.
 fn item_mut<'a>(t: &'a mut dyn toml_edit::TableLike, path: &[Seg]) -> Option<&'a mut Item> {
+    item_mut_at(t, path, &mut Vec::new(), true)
+}
+
+/// [`item_mut`] below `done` (the keys walked so far). `comments`: the
+/// table may hold comments (not an inline table).
+fn item_mut_at<'a>(
+    t: &'a mut dyn toml_edit::TableLike,
+    path: &[Seg],
+    done: &mut Vec<String>,
+    comments: bool,
+) -> Option<&'a mut Item> {
     let (first, rest) = path.split_first()?;
     let Seg::Key(k) = first else { return None };
+    done.push(k.clone());
+    let full = done.join(".");
     if rest.is_empty() {
-        if t.get(k).is_none() {
+        if !t.contains_key(k) {
             t.insert(k, Item::None);
+            if let (true, Some(c), Some(mut key)) = (comments, comment_for(&full), t.key_mut(k)) {
+                key.leaf_decor_mut().set_prefix(format!("# {c}\n"));
+            }
         }
-        return t.get_mut(k);
+        // Not `get_mut`: it hides the `Item::None` of a new key.
+        return Some(t.entry(k).or_insert(Item::None));
     }
-    if t.get(k).is_none() {
+    if !t.contains_key(k) {
         let new = match rest[0] {
             Seg::Index(_) => Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
-            Seg::Key(_) => Item::Table(Table::new()),
+            Seg::Key(_) => {
+                let mut sub = Table::new();
+                match TABLE_COMMENTS.iter().find(|(n, _)| *n == full) {
+                    Some((_, c)) => sub.decor_mut().set_prefix(format!("\n# {c}\n")),
+                    None => sub.decor_mut().set_prefix("\n"),
+                }
+                Item::Table(sub)
+            }
         };
         t.insert(k, new);
     }
     let item = t.get_mut(k)?;
     match &rest[0] {
-        Seg::Key(_) => item_mut(item.as_table_like_mut()?, rest),
+        Seg::Key(_) => {
+            let comments = comments && !item.is_inline_table();
+            item_mut_at(item.as_table_like_mut()?, rest, done, comments)
+        }
         Seg::Index(i) => {
             let tail = &rest[1..];
-            let sub: &mut dyn toml_edit::TableLike = match item {
+            let (sub, comments): (&mut dyn toml_edit::TableLike, bool) = match item {
                 Item::ArrayOfTables(a) => {
                     while a.len() <= *i {
-                        a.push(Table::new());
+                        let mut sub = Table::new();
+                        sub.decor_mut().set_prefix("\n");
+                        a.push(sub);
                     }
-                    a.get_mut(*i)?
+                    (a.get_mut(*i)?, comments)
                 }
-                Item::Value(toml_edit::Value::Array(a)) => a.get_mut(*i)?.as_inline_table_mut()?,
+                Item::Value(toml_edit::Value::Array(a)) => {
+                    (a.get_mut(*i)?.as_inline_table_mut()?, false)
+                }
                 _ => return None,
             };
-            item_mut(sub, tail)
+            item_mut_at(sub, tail, done, comments)
         }
     }
+}
+
+/// Set the value at `path` in the file, made with its comment when it is
+/// new. False: the file has no place for it.
+fn write_value(doc: &mut DocumentMut, path: &[Seg], v: &toml::Value) -> bool {
+    let Some(item) = item_mut(doc.as_table_mut(), path) else {
+        return false;
+    };
+    let mut value = edit_value(v);
+    if let Item::Value(old) = item {
+        // Keep the spaces and a comment after the value.
+        *value.decor_mut() = old.decor().clone();
+    }
+    *item = Item::Value(value);
+    true
 }
 
 /// What [`save`] did.
@@ -694,6 +741,7 @@ pub fn save(target: &SaveTarget, now: &Settings) -> Result<Saved> {
             paths.push(p);
         }
     }
+    let mut failed = Vec::new();
     for p in paths {
         let (a, b) = (get(&base, &p), get(&new, &p));
         if a == b {
@@ -701,15 +749,10 @@ pub fn save(target: &SaveTarget, now: &Settings) -> Result<Saved> {
         }
         match b {
             Some(v) => {
-                let Some(item) = item_mut(doc.as_table_mut(), &p) else {
-                    continue;
-                };
-                let mut value = edit_value(v);
-                if let Item::Value(old) = item {
-                    // Keep the spaces and a comment after the value.
-                    *value.decor_mut() = old.decor().clone();
+                if !write_value(&mut doc, &p, v) {
+                    // Like a table in the file that is a plain value.
+                    failed.push(path_text(&p));
                 }
-                *item = Item::Value(value);
             }
             None => {
                 // The value is gone (like log_dir set back to none).
@@ -726,6 +769,13 @@ pub fn save(target: &SaveTarget, now: &Settings) -> Result<Saved> {
         }
     }
     write_atomic(path, &doc.to_string())?;
+    if !failed.is_empty() {
+        bail!(
+            "{} has no place for {} (the other settings are saved)",
+            path.display(),
+            failed.join(", ")
+        );
+    }
     Ok(Saved::Written)
 }
 
@@ -833,6 +883,85 @@ mod tests {
         let back = load(&path, None);
         assert_eq!(back.settings, s);
         assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn calibration_is_saved_into_a_file_made_before_it() {
+        let dir = temp_dir("cal");
+        let path = dir.join("config.toml");
+        // A file of an older version: no [calibration] table.
+        let text = generate(&Settings::default());
+        let cut = text.find("\n# The app's own calibration").unwrap();
+        let keys = text.find("\n# Key bindings").unwrap();
+        assert!(cut < keys);
+        let old = format!("{}{}", &text[..cut], &text[keys..]);
+        assert!(!old.contains("[calibration]"));
+        std::fs::write(&path, &old).unwrap();
+        let l = load(&path, None);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        let target = l.save.unwrap();
+        let mut s = l.settings.clone();
+        s.calibration.zero_ch1 = [128.5; 8];
+        s.calibration.zero_ch1_30m[3] = 131.25;
+        assert_eq!(save(&target, &s).unwrap(), Saved::Written);
+        let after = std::fs::read_to_string(&path).unwrap();
+        let c = comment_for("calibration.zero_ch1").unwrap();
+        assert!(after.contains(&format!("# {c}\nzero_ch1 = [")), "{after}");
+        let back = load(&path, None);
+        assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+        assert_eq!(back.settings.calibration, s.calibration);
+        assert_eq!(back.settings, s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_setting_goes_into_an_old_minimal_file() {
+        let old = "# my old file\ncal_freq = 1000\n\n[keys]\nquit = \"q\"\n";
+        let mut doc: DocumentMut = old.parse().unwrap();
+        let defaults = to_table(&Settings::default());
+        for (p, v) in leaves(&defaults) {
+            assert!(write_value(&mut doc, &p, &v), "{}", path_text(&p));
+        }
+        let text = doc.to_string();
+        assert!(
+            text.starts_with("# my old file\ncal_freq = 1000\n"),
+            "{text}"
+        );
+        let t: toml::Table = toml::from_str(&text).unwrap();
+        for (p, v) in leaves(&defaults) {
+            assert_eq!(get(&t, &p), Some(&v), "{}", path_text(&p));
+            let key = path_key(&p);
+            if key != "cal_freq" {
+                if let Some(c) = comment_for(&key) {
+                    assert!(text.contains(&format!("# {c}\n")), "{key}: {text}");
+                }
+            }
+        }
+        let (s, w) = settings_from_table(&t);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s, Settings::default());
+        assert!(keys_table(&doc).1.is_empty());
+    }
+
+    #[test]
+    fn a_value_with_no_place_in_the_file_is_an_error() {
+        let dir = temp_dir("noplace");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "calibration = 5\n").unwrap();
+        let target = SaveTarget {
+            path: path.clone(),
+            base: Settings::default(),
+        };
+        let mut s = Settings::default();
+        s.calibration.zero_ch2 = [127.0; 8];
+        s.cal_freq = 2000;
+        let e = save(&target, &s).unwrap_err().to_string();
+        assert!(e.contains("calibration.zero_ch2"), "{e}");
+        // The other values are saved.
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("cal_freq = 2000"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
