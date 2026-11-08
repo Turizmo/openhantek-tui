@@ -349,9 +349,10 @@ pub fn peak_columns(
 }
 
 /// Draw trace `t` in the trace mode: the mean line, the peak area in the
-/// trace colour, or the line over the area in `muted`. The area goes on
-/// `band_layer` under the lines, or for the braille styles on the line's
-/// layer (one colour per braille cell: the cells join, no holes).
+/// trace colour, or the line over the area in `muted`. With both, the
+/// area goes on `band_layer` under the lines: the line owns every cell it
+/// uses, so it looks the same as the line alone, and the area fills only
+/// the cells around it.
 #[allow(clippy::too_many_arguments)]
 fn draw_trace(
     plot: &mut Plot,
@@ -378,10 +379,8 @@ fn draw_trace(
         }
         return;
     };
-    let braille = matches!(style, TraceStyle::BrailleThin | TraceStyle::BrailleBold);
     match mode {
         TraceMode::Peak => plot.band(&cols, style, layer, color),
-        _ if braille => plot.band(&cols, style, layer, muted),
         _ => plot.band(&cols, style, band_layer, muted),
     }
 }

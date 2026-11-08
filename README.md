@@ -391,9 +391,11 @@ highest raw sample, and with averaging on, the lowest and highest of the
 last N captures (N = the averaging depth, a sliding window; never an
 average of minima or maxima). It starts over when the average does. With
 one ADC sample per point (the fastest time bases) the area is as thin as
-the line. The braille styles fill it with dots (on the line's cells, so
-it has no holes), box lines with `░` and ascii lines with `:`, under all
-trace lines; old traces of the persistence draw their area in their
+the line. The braille styles fill it with dots, box lines with `░` and
+ascii lines with `:`, under all trace lines. In `average + peak` the line
+looks exactly as in `average`: it owns every cell (and so every braille
+dot) it uses, and the muted area fills only the cells around it. The
+log view does the same. Old traces of the persistence draw their area in their
 faded colour. The math trace's area holds every value the function can
 take from the two areas (division has none). Measurements, cursors, the
 trigger, FFT and export use the mean.

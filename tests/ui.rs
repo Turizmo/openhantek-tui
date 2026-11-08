@@ -1718,3 +1718,58 @@ fn max_adc_rate_setting_caps_the_scope() {
     assert_eq!(opts[0], "16 MS/s · CH1 alone 30 MS/s");
     assert_eq!(openhantek_tui::panel::Field::MaxAdc.value(s, &Default::default()), "2 MS/s");
 }
+
+/// The cells of a buffer in colour `c`: position, symbol.
+fn cells_in(buf: &ratatui::buffer::Buffer, c: ratatui::style::Color) -> Vec<(usize, String)> {
+    buf.content()
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.fg == c && x.symbol() != " ")
+        .map(|(i, x)| (i, x.symbol().to_string()))
+        .collect()
+}
+
+#[test]
+fn both_mode_line_looks_like_average_mode() {
+    // A square on CH1 and a sine on CH2: flat lines, edges and slopes.
+    let sq = Wave::Square {
+        freq: 1e6,
+        low: -1.0,
+        high: 1.0,
+        duty: 0.5,
+    };
+    let sine = Wave::Sine {
+        freq: 500.0,
+        amp: 1.0,
+        dc: 0.0,
+    };
+    let mut r = Rig::new([sq, sine]);
+    r.app.scope.settings.channels[0].offset = 0.0;
+    r.feed();
+    r.feed();
+    let pal = openhantek_tui::theme::Palette::for_setting(r.app.scope.settings.display.colors);
+    for style in TraceStyle::ALL {
+        for dots in [false, true] {
+            let d = &mut r.app.scope.settings.display;
+            d.trace_style = [style; 3];
+            d.dots = dots;
+            d.trace_mode = TraceMode::Average;
+            let avg = r.buffer(120, 30);
+            r.app.scope.settings.display.trace_mode = TraceMode::Both;
+            let both = r.buffer(120, 30);
+            for t in 0..2 {
+                // The line owns the same cells with the same symbols.
+                let (a, b) = (cells_in(&avg, pal.trace[t]), cells_in(&both, pal.trace[t]));
+                assert!(a.len() > 20, "{style:?} CH{}: {}", t + 1, a.len());
+                assert_eq!(a, b, "{style:?} dots {dots} CH{}", t + 1);
+                // The muted area is only in both, around the line.
+                assert!(cells_in(&avg, pal.muted(t)).is_empty());
+                if t == 0 {
+                    let m = cells_in(&both, pal.muted(t));
+                    assert!(m.len() > 50, "{style:?} muted {}", m.len());
+                    assert!(m.iter().all(|(i, _)| !a.iter().any(|(j, _)| i == j)));
+                }
+            }
+        }
+    }
+}

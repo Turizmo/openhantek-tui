@@ -244,11 +244,10 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
                 ranges[dc] = Some((yd(a.max), yd(a.min)));
             }
         }
-        let braille = matches!(style, TraceStyle::BrailleThin | TraceStyle::BrailleBold);
         match mode {
             TraceMode::Peak => plot.band(&ranges, style, layer, pal.trace[t]),
-            // The braille area on the line's layer: the cells join.
-            _ if braille => plot.band(&ranges, style, layer, pal.muted(t)),
+            // Under the lines: the line owns its cells and looks the same
+            // as the line alone; the muted area fills around it.
             _ => plot.band(&ranges, style, band_layer, pal.muted(t)),
         }
     }

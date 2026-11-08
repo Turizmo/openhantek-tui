@@ -479,7 +479,7 @@ impl Field {
             TimeDiv => "Time per division. Keys ← →.",
             Roll => "Slow time bases scroll from right to left, with no trigger.",
             MaxAdc => "Highest ADC rate in every mode (scope, roll, logger). The ADC always runs at it; slower rates average its samples. Lower it if the USB link loses data.",
-            TraceMode => "average: the mean of the samples behind each point, as a line. peak: the area from the lowest to the highest sample (also over the averaged captures). average + peak: both, the area muted. Key D.",
+            TraceMode => "average: the mean of the samples behind each point, as a line. peak: the area from the lowest to the highest sample (also over the averaged captures). average + peak: the same line as average, the muted area only around it. Key D.",
             Selected => "The trace the arrow keys, cursors and spectrum use. Key Tab.",
             Interpolation => "sin(x)/x draws a smooth line through few samples. Key z.",
             Dots => "Draw only the samples, no lines between them. Key d.",

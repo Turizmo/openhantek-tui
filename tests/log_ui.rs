@@ -568,3 +568,36 @@ fn raw_log_in_the_log_view_and_csv() {
     assert_eq!(lines.len(), 32);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn log_view_both_mode_line_looks_like_average_mode() {
+    let (mut app, dir) = app_with_log("both-line");
+    let pal = openhantek_tui::theme::Palette::for_setting(app.scope.settings.display.colors);
+    let buffer = |app: &App| {
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| ui::draw(f, app)).unwrap();
+        term.backend().buffer().clone()
+    };
+    let cells = |buf: &ratatui::buffer::Buffer, c| -> Vec<(usize, String)> {
+        buf.content()
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.fg == c && x.symbol() != " ")
+            .map(|(i, x)| (i, x.symbol().to_string()))
+            .collect()
+    };
+    for style in TraceStyle::ALL {
+        app.scope.settings.display.trace_style = [style; 3];
+        app.scope.settings.logger.trace_mode = TraceMode::Average;
+        let avg = buffer(&app);
+        app.scope.settings.logger.trace_mode = TraceMode::Both;
+        let both = buffer(&app);
+        for t in 0..2 {
+            let (a, b) = (cells(&avg, pal.trace[t]), cells(&both, pal.trace[t]));
+            assert!(a.len() > 20, "{style:?} CH{}: {}", t + 1, a.len());
+            assert_eq!(a, b, "{style:?} CH{}", t + 1);
+        }
+        assert!(!cells(&both, pal.muted(0)).is_empty(), "{style:?}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
