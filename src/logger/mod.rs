@@ -4,7 +4,7 @@
 //!
 //! - [`format`]: the file layout (header, chunks, records).
 //! - [`binner`]: turns samples into records, one per step.
-//! - [`writer`]: the writer thread (buffering, fsync, size limit).
+//! - [`writer`]: the writer thread (buffering, write-back, size limit).
 //! - [`reader`]: reads a log, also while it is being written.
 //! - [`pyramid`]: min/max/mean summaries for fast zoomed-out drawing.
 //! - [`csv`]: CSV export of a log.

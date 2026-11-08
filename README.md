@@ -786,8 +786,10 @@ readers use the ADC rate.
 Step `i` starts at `start + i * step`. A new chunk starts only after a
 gap, so a log is usually one chunk. Missing step numbers between chunks
 are the gap. The writer thread buffers in memory, hands the data to the
-OS 4 times a second (the log view reads it from there) and fsyncs every
-2 s; the record count of the open chunk is written when it closes. A
+OS 4 times a second (the log view reads it from there) and starts the
+disk write of each piece at once (`sync_file_range`, no fsync while the
+log runs: in a VM an fsync every 2 s held the USB completions back for
+60-90 ms); the file is synced when the log stops. The record count of the open chunk is written when it closes. A
 killed program leaves a file that reads up to the last write (a cut
 record at the end is ignored).
 

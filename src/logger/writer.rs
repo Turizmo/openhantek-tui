@@ -1,8 +1,15 @@
 //! The writer thread: takes records from the acquisition thread and
 //! writes them to the log file. Buffers in memory, hands the data to the
 //! OS a few times a second (so a killed app leaves a readable file up to
-//! there, and the log view sees new data), and fsyncs every few seconds.
-//! Stops by itself when the file reaches the size limit.
+//! there, and the log view sees new data), and starts the disk write of
+//! each piece at once, so little data waits in the page cache. Syncs the
+//! file when the log ends. Stops by itself when the file reaches the size
+//! limit.
+//!
+//! No fsync while the log runs: a sync of the dirty pages of a few
+//! seconds (60 MB at 30 MB/s) stalled the USB completions of a VM for
+//! 60-90 ms each time. `sync_file_range(SYNC_FILE_RANGE_WRITE)` only
+//! starts the write-back, with no disk cache flush, and does not stall.
 
 use std::fs::File;
 use std::io::Write;
@@ -85,7 +92,8 @@ pub fn shared(path: PathBuf, limit: u64) -> Shared {
 
 /// How often buffered data goes to the OS.
 pub const FLUSH_EVERY: Duration = Duration::from_millis(250);
-/// How often the file is synced to the disk.
+/// How often the file is synced to the disk where the write-back of each
+/// piece cannot be started (not Linux).
 pub const SYNC_EVERY: Duration = Duration::from_secs(2);
 /// Flush early when the buffer gets this big.
 const BUFFER_MAX: usize = 4 << 20;
@@ -277,6 +285,7 @@ impl W {
     fn flush(&mut self) -> std::io::Result<()> {
         if let Some(f) = &mut self.file {
             f.write_all(&self.buf)?;
+            start_writeback(f, self.size - self.buf.len() as u64, self.buf.len() as u64);
         }
         self.buf.clear();
         self.last_flush = Instant::now();
@@ -302,7 +311,7 @@ impl W {
         if self.last_flush.elapsed() >= FLUSH_EVERY {
             self.flush()?;
         }
-        if self.last_sync.elapsed() >= SYNC_EVERY {
+        if cfg!(not(target_os = "linux")) && self.last_sync.elapsed() >= SYNC_EVERY {
             if let Some(f) = &self.file {
                 f.sync_data()?;
             }
@@ -337,6 +346,30 @@ pub fn start_time(now: SystemTime, samples: usize, rate: f64) -> i64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i64)
 }
+
+/// Start writing `len` bytes at `offset` of `f` to the disk, without
+/// waiting and without a disk cache flush. Only a hint: the sync at the
+/// end reports errors.
+#[cfg(target_os = "linux")]
+fn start_writeback(f: &File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+    if len == 0 {
+        return;
+    }
+    // SAFETY: a valid open file descriptor; no memory is passed.
+    unsafe {
+        libc::sync_file_range(
+            f.as_raw_fd(),
+            offset as libc::off64_t,
+            len as libc::off64_t,
+            libc::SYNC_FILE_RANGE_WRITE,
+        );
+    }
+}
+
+/// Elsewhere the file is synced every [`SYNC_EVERY`] instead.
+#[cfg(not(target_os = "linux"))]
+fn start_writeback(_f: &File, _offset: u64, _len: u64) {}
 
 #[cfg(test)]
 mod tests {
