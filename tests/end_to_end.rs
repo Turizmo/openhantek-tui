@@ -160,6 +160,82 @@ fn autoset_on_the_fake_scope() {
     assert_eq!(s.time_per_div(), 500e-6);
 }
 
+#[test]
+fn zero_calibration_on_the_fake_scope() {
+    let dir = std::env::temp_dir().join(format!("oht-e2e-zero-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("config.toml");
+    let loaded = openhantek_tui::config::load(&path, None);
+    let (mut app, fake) = live_app([Wave::Dc(0.0), Wave::Dc(0.0)], loaded.settings);
+    app.save_target = loaded.save;
+    // The 30 MS/s bank of this scope reads 3.5 counts high (not in its
+    // EEPROM): CH1 alone shows 0 V as +0.14 V at 1 V/div.
+    fake.lock().fast_zero_shift = [3.5, 0.0];
+    tick_until(&mut app, 5.0, |a| a.connected);
+    let before = app.scope.settings.clone();
+    // Z asks first; any key but y says no.
+    app.handle_key(key('Z'));
+    assert!(app.ask_zero_cal);
+    app.handle_key(key('n'));
+    assert!(!app.ask_zero_cal && app.zero_cal.is_none());
+    app.handle_key(key('Z'));
+    app.handle_key(key('y'));
+    assert!(app.zero_cal.is_some());
+    tick_until(&mut app, 30.0, |a| a.zero_cal.is_none());
+    let m = app.current_message().unwrap().text.clone();
+    assert!(m.contains("Zero calibration done: 24 values"), "{m}");
+    assert!(m.contains("saved in the config file"), "{m}");
+    assert!(m.contains("Biggest change +3."), "{m}");
+    assert!(m.contains("at 30 MS/s)"), "{m}");
+    let cal = &app.scope.settings.calibration;
+    for g in 0..8 {
+        assert!((cal.zero_ch1[g] - 126.0).abs() < 0.2, "{cal:?}");
+        assert!((cal.zero_ch2[g] - 131.0).abs() < 0.2, "{cal:?}");
+        assert!((cal.zero_ch1_30m[g] - 129.5).abs() < 0.2, "{cal:?}");
+    }
+    // The user's settings are back, with the new calibration.
+    let mut back = app.scope.settings.clone();
+    back.calibration = before.calibration.clone();
+    assert_eq!(back, before);
+    // Saved in the config file at once.
+    let text = std::fs::read_to_string(&path).unwrap();
+    let t: toml::Table = toml::from_str(&text).unwrap();
+    let z = t["calibration"]["zero_ch1_30m"].as_array().unwrap();
+    assert!((z[5].as_float().unwrap() - 129.5).abs() < 0.2, "{text}");
+    // CH1 alone at 30 MS/s now reads 0 V.
+    app.scope.settings.channels[1].enabled = false;
+    app.scope.settings.channels[0].offset = 0.0;
+    app.tick();
+    assert!(app.scope.hw.unwrap().high_speed());
+    app.scope.frame = None;
+    tick_until(&mut app, 10.0, |a| a.scope.measure(0).is_some());
+    let mean = app.scope.measure(0).unwrap().mean;
+    assert!(mean.abs() < 0.02, "{mean}");
+    // Clear: the EEPROM values again (0.14 V high at 30 MS/s).
+    app.action(openhantek_tui::panel::Action::ClearZeroCal);
+    assert_eq!(app.scope.settings.calibration.zero_count(), 0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let t: toml::Table = toml::from_str(&text).unwrap();
+    let z = t["calibration"]["zero_ch1_30m"].as_array().unwrap();
+    assert_eq!(z[5].as_float(), Some(0.0));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn zero_calibration_fails_with_a_signal_and_restores_the_settings() {
+    let (mut app, _fake) = live_app([SINE_1K, Wave::Dc(0.0)], Settings::default());
+    tick_until(&mut app, 5.0, |a| a.connected);
+    let before = app.scope.settings.clone();
+    app.handle_key(key('Z'));
+    app.handle_key(key('y'));
+    tick_until(&mut app, 30.0, |a| a.zero_cal.is_none());
+    let m = app.current_message().unwrap();
+    // 3 Vpp at 20 mV/div: out of range (a smaller one: "has a signal").
+    assert!(m.error && m.text.contains("CH1 is out of range"), "{m:?}");
+    assert_eq!(app.scope.settings, before);
+    assert_eq!(app.scope.settings.calibration.zero_count(), 0);
+}
+
 fn key(c: char) -> ratatui::crossterm::event::KeyEvent {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let code = match c {

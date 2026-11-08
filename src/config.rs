@@ -106,6 +106,10 @@ pub const COMMENTS: &[(&str, &str)] = &[
     ("logger.time_axis", "log view time labels: \"Clock\" (UTC) or \"Seconds\""),
     ("logger.csv_time", "log CSV time column: \"Iso\" (UTC) or \"Seconds\""),
     ("logger.trace_mode", "log view: \"Average\" (mean line), \"Peak\" (min..max area) or \"Both\""),
+    ("calibration.zero_ch1", "CH1 ADC count of 0 V per gain (20m 50m 100m 200m 500m 1 2 5 V/div), ADC below 30 MS/s; 0 = EEPROM value"),
+    ("calibration.zero_ch2", "CH2 ADC count of 0 V per gain, like zero_ch1; 0 = EEPROM value"),
+    ("calibration.zero_ch1_30m", "CH1 alone at 30 MS/s: ADC count of 0 V per gain; 0 = EEPROM value"),
+    ("calibration.gain", "gain correction of CH1, CH2 from the calibration output (0.7 .. 1.3); 1 = none"),
 ];
 
 /// Comments above the tables.
@@ -118,6 +122,7 @@ const TABLE_COMMENTS: &[(&str, &str)] = &[
     ("display", "How the screen looks."),
     ("acquisition", "How the scope samples."),
     ("logger", "Envelope logger (chart recorder)."),
+    ("calibration", "The app's own calibration (Settings › Calibration). Wins over the EEPROM, which is never written."),
 ];
 
 /// Settings that are optional: missing from a file of defaults.

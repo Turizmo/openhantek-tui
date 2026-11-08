@@ -6,6 +6,9 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::acquire::{Acquisition, Command, Event, LogRequest};
+use crate::calib::{ZeroCal, ZeroOutcome};
+use crate::config::SaveTarget;
+use crate::device::protocol::AppCal;
 use crate::export;
 use crate::keys::{Act, KeyMap, View};
 use crate::logger::view::LogView;
@@ -107,6 +110,14 @@ pub struct App {
     /// Free bytes in the log folder, checked about once a second.
     pub log_free: Option<u64>,
     free_at: Option<Instant>,
+    /// The config file to save to (on quit, and right after a
+    /// calibration). `None`: never save.
+    pub save_target: Option<SaveTarget>,
+    /// The zero calibration waits for `y` (the inputs grounded).
+    pub ask_zero_cal: bool,
+    /// The running zero calibration.
+    pub zero_cal: Option<ZeroCal>,
+    sent_cal: Option<AppCal>,
 }
 
 fn next_in<T: PartialEq + Copy>(list: &[T], v: T) -> T {
@@ -142,6 +153,10 @@ impl App {
             log_dir_override: None,
             log_free: None,
             free_at: None,
+            save_target: None,
+            ask_zero_cal: false,
+            zero_cal: None,
+            sent_cal: None,
         };
         app.sync();
         app
@@ -176,6 +191,10 @@ impl App {
         let mut changed = false;
         while let Some(ev) = self.acq.as_ref().and_then(|a| a.try_recv()) {
             changed |= self.handle_event(ev);
+        }
+        if self.zero_cal.as_ref().is_some_and(|z| z.timed_out()) {
+            self.end_zero_cal(Err("no data from the scope".into()));
+            changed = true;
         }
         changed |= self.log_tick();
         changed | self.sync()
@@ -482,7 +501,12 @@ impl App {
     /// Handle one event from the acquisition thread.
     pub fn handle_event(&mut self, ev: Event) -> bool {
         match ev {
-            Event::Block(b) => self.scope.push(*b),
+            Event::Block(b) => {
+                if self.zero_cal.is_some() && b.gen == self.scope.gen {
+                    self.zero_cal_block(&b);
+                }
+                self.scope.push(*b)
+            }
             Event::Status(s) => {
                 self.status = Some(s);
                 true
@@ -524,6 +548,13 @@ impl App {
             self.notify(n, false);
             changed = true;
         }
+        let cal = self.scope.settings.calibration.app_cal();
+        if self.sent_cal != Some(cal) {
+            self.sent_cal = Some(cal);
+            if let Some(a) = &self.acq {
+                a.send(Command::Calibration(cal));
+            }
+        }
         if let Some((gen, cfg)) = self.scope.sync_hw() {
             if let Some(a) = &self.acq {
                 a.send(Command::Configure { gen, cfg });
@@ -553,6 +584,21 @@ impl App {
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
         if ctrl_c {
             self.quit = true;
+            return;
+        }
+        if std::mem::take(&mut self.ask_zero_cal) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.start_zero_cal(),
+                _ => self.notify("No zero calibration", false),
+            }
+            return;
+        }
+        if self.zero_cal.is_some() {
+            if key.code == KeyCode::Esc || self.keys.is(Act::Quit, &key) {
+                self.end_zero_cal(Err("stopped".into()));
+            } else {
+                self.notify("Zero calibration runs: Esc stops it", false);
+            }
             return;
         }
         if let Some(d) = self.confirm_delete.take() {
@@ -775,6 +821,7 @@ impl App {
             Act::ExportCsv => self.action(Action::ExportCsv),
             Act::ExportJson => self.action(Action::ExportJson),
             Act::Reset => self.action(Action::Reset),
+            Act::ZeroCal => self.action(Action::ZeroCal),
             _ => return,
         }
         self.changed();
@@ -839,13 +886,119 @@ impl App {
                     self.ask_delete_log(&p);
                 }
             }
+            Action::ZeroCal => self.ask_zero_cal(),
+            Action::ClearZeroCal => {
+                self.scope.settings.calibration.clear_zero();
+                let saved = self.save_calibration();
+                self.notify(
+                    format!("Zero calibration cleared: the EEPROM values again{saved}"),
+                    false,
+                );
+            }
             Action::Reset => {
                 let keep = self.scope.settings.selected;
+                // The calibration is not a setting to reset.
+                let cal = self.scope.settings.calibration.clone();
                 self.scope.settings = Settings::default();
                 self.scope.settings.selected = keep;
+                self.scope.settings.calibration = cal;
                 self.scope.history.clear();
                 self.notify("Settings reset to defaults", false);
             }
+        }
+    }
+
+    /// Ask for the grounded inputs before the zero calibration.
+    fn ask_zero_cal(&mut self) {
+        if self.recording() {
+            self.notify("Stop the logger before the zero calibration", true);
+        } else if !self.connected {
+            self.notify("Zero calibration needs the scope", true);
+        } else {
+            self.panel_open = false;
+            self.show_log = false;
+            self.ask_zero_cal = true;
+        }
+    }
+
+    /// Start the zero calibration (the inputs are grounded).
+    pub fn start_zero_cal(&mut self) {
+        let z = ZeroCal::new(self.scope.settings.clone(), self.scope.running);
+        self.scope.settings = z.settings();
+        self.scope.set_running(true);
+        self.notify(z.progress(), false);
+        self.zero_cal = Some(z);
+        self.sync();
+    }
+
+    /// A block for the zero calibration.
+    fn zero_cal_block(&mut self, b: &crate::acquire::Block) {
+        let Some(z) = &mut self.zero_cal else {
+            return;
+        };
+        match z.block(b) {
+            ZeroOutcome::Busy => {}
+            ZeroOutcome::Next => {
+                self.scope.settings = z.settings();
+                let text = z.progress();
+                self.notify(text, false);
+            }
+            ZeroOutcome::Done(cal) => self.end_zero_cal(Ok(cal)),
+            ZeroOutcome::Failed(e) => self.end_zero_cal(Err(e)),
+        }
+    }
+
+    /// End the zero calibration: the user's settings back, with the new
+    /// zero values when it worked (saved in the config file at once).
+    fn end_zero_cal(&mut self, result: Result<crate::settings::CalibrationSettings, String>) {
+        let Some(z) = self.zero_cal.take() else {
+            return;
+        };
+        let cal = self.scope.settings.calibration.clone();
+        self.scope.settings = z.saved.clone();
+        self.scope.settings.calibration = cal;
+        self.scope.set_running(z.was_running);
+        match result {
+            Ok(cal) => {
+                self.scope.settings.calibration = cal;
+                let saved = self.save_calibration();
+                let (d, at) = &z.biggest;
+                self.notify(
+                    format!(
+                        "Zero calibration done: {} values{saved}. Biggest change {d:+.1} counts ({at})",
+                        self.scope.settings.calibration.zero_count()
+                    ),
+                    false,
+                );
+            }
+            Err(e) => self.notify(format!("Zero calibration failed: {e}"), true),
+        }
+        self.sync();
+    }
+
+    /// Put the user's settings back if a helper has the scope (before
+    /// the settings are saved on quit).
+    pub fn close_helpers(&mut self) {
+        if self.zero_cal.is_some() {
+            self.end_zero_cal(Err("stopped".into()));
+        }
+    }
+
+    /// Save the calibration in the config file now (only it: the other
+    /// settings are saved on quit). Returns a note for the message.
+    fn save_calibration(&mut self) -> String {
+        let Some(t) = &mut self.save_target else {
+            return " (not saved: no config file)".into();
+        };
+        let mut s = t.base.clone();
+        s.calibration = self.scope.settings.calibration.clone();
+        s.sanitize();
+        match crate::config::save(t, &s) {
+            Ok(_) => {
+                t.base = s;
+                ", saved in the config file".into()
+            }
+            Err(e) => format!(" (not saved: {e:#})"),
         }
     }
 

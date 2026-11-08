@@ -681,7 +681,7 @@ fn settings_panel_opens_and_closes() {
     assert!(r.app.panel_open);
     let t = r.text(140, 40);
     assert!(t.contains("Settings · Channel 1"), "{t}");
-    assert!(t.contains("Calibration output"));
+    assert!(t.contains("Calibration"));
     assert!(t.contains("hjkl") || t.contains("j/k move"));
     // The plot is still drawn above the panel.
     assert!(t.contains("1▸"));

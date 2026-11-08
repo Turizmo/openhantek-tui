@@ -829,6 +829,92 @@ impl LoggerSettings {
     }
 }
 
+/// The app's own calibration (the `[calibration]` table): zero offsets
+/// from the zero calibration and gain corrections from the probe helper.
+/// They win over the scope's EEPROM values, which are never written.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CalibrationSettings {
+    /// ADC count of 0 V on CH1 per gain step (20 mV .. 5 V/div), with the
+    /// ADC below 30 MS/s. 0 = not set: the EEPROM value.
+    pub zero_ch1: [f64; 8],
+    /// The same for CH2.
+    pub zero_ch2: [f64; 8],
+    /// CH1 alone at 30 MS/s (the EEPROM's high-speed bank).
+    pub zero_ch1_30m: [f64; 8],
+    /// Gain correction of CH1 and CH2 from the calibration output; 1 = none.
+    pub gain: [f64; 2],
+}
+
+impl Default for CalibrationSettings {
+    fn default() -> Self {
+        Self {
+            zero_ch1: [0.0; 8],
+            zero_ch2: [0.0; 8],
+            zero_ch1_30m: [0.0; 8],
+            gain: [1.0; 2],
+        }
+    }
+}
+
+/// Lowest and highest gain correction the app takes (±30 %).
+pub const GAIN_CORRECTION: (f64, f64) = (0.7, 1.3);
+
+impl CalibrationSettings {
+    /// The values for the driver.
+    pub fn app_cal(&self) -> crate::device::protocol::AppCal {
+        let mut a = crate::device::protocol::AppCal::default();
+        for g in 0..8 {
+            a.zero[0][g] = [self.zero_ch1[g], self.zero_ch2[g]];
+            a.zero[1][g] = [self.zero_ch1_30m[g], 0.0];
+        }
+        a.gain = self.gain;
+        a
+    }
+
+    /// How many zero values are set.
+    pub fn zero_count(&self) -> usize {
+        [self.zero_ch1, self.zero_ch2, self.zero_ch1_30m]
+            .iter()
+            .flatten()
+            .filter(|z| **z > 0.0)
+            .count()
+    }
+
+    /// True when channel `c` has a gain correction.
+    pub fn has_gain(&self, c: usize) -> bool {
+        self.gain[c] != 1.0
+    }
+
+    /// Forget the zero values: the EEPROM values again.
+    pub fn clear_zero(&mut self) {
+        let d = Self::default();
+        self.zero_ch1 = d.zero_ch1;
+        self.zero_ch2 = d.zero_ch2;
+        self.zero_ch1_30m = d.zero_ch1_30m;
+    }
+
+    /// Fix hand-edited values: a zero outside the ADC range is not set, a
+    /// gain outside [`GAIN_CORRECTION`] is none.
+    pub fn sanitize(&mut self) {
+        for z in self
+            .zero_ch1
+            .iter_mut()
+            .chain(&mut self.zero_ch2)
+            .chain(&mut self.zero_ch1_30m)
+        {
+            if !(z.is_finite() && (1.0..=254.0).contains(z)) {
+                *z = 0.0;
+            }
+        }
+        for g in &mut self.gain {
+            if !(g.is_finite() && (GAIN_CORRECTION.0..=GAIN_CORRECTION.1).contains(g)) {
+                *g = 1.0;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -849,6 +935,7 @@ pub struct Settings {
     pub selected: usize,
     pub acquisition: AcquisitionSettings,
     pub logger: LoggerSettings,
+    pub calibration: CalibrationSettings,
 }
 
 impl Default for Settings {
@@ -873,6 +960,7 @@ impl Default for Settings {
             selected: 0,
             acquisition: AcquisitionSettings::default(),
             logger: LoggerSettings::default(),
+            calibration: CalibrationSettings::default(),
         }
     }
 }
@@ -952,6 +1040,7 @@ impl Settings {
         self.acquisition.max_adc_rate =
             crate::device::protocol::raw_rate_of_id(caps[self.acquisition.cap_idx()].0);
         lg.log_limit = crate::logger::LIMITS[lg.limit_idx()];
+        self.calibration.sanitize();
     }
 
     /// Time per division, with the fine factor.

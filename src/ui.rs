@@ -107,15 +107,25 @@ pub fn draw(f: &mut TermFrame, app: &App) {
     draw_confirm(f, app, area, &pal);
 }
 
-/// The y / n question before a log is deleted: a small box in the middle
-/// of the screen, over everything.
+/// The question before the zero calibration.
+pub const ZERO_CAL_QUESTION: &str =
+    "Ground the CH1 and CH2 probe tips (or the BNC inputs), then press y. Any other key: no.";
+
+/// The y / n question before a log is deleted or the zero calibration
+/// runs: a small box in the middle of the screen, over everything.
 fn draw_confirm(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
-    let Some(d) = &app.confirm_delete else {
+    let (title, q) = if let Some(d) = &app.confirm_delete {
+        (" Delete log ", d.question())
+    } else if app.ask_zero_cal {
+        (" Zero calibration ", ZERO_CAL_QUESTION.to_string())
+    } else {
         return;
     };
-    let q = d.question();
-    let w = (q.chars().count() as u16 + 4).min(area.width);
-    let h = 3.min(area.height);
+    let len = q.chars().count() as u16 + 1;
+    let w = (len + 3).min(area.width);
+    // A long question wraps when the screen is narrow.
+    let lines = len.div_ceil(w.saturating_sub(2).max(1));
+    let h = (2 + lines).min(area.height);
     let popup = Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + (area.height - h) / 2,
@@ -124,13 +134,14 @@ fn draw_confirm(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     };
     f.render_widget(Clear, popup);
     let block = Block::bordered()
-        .title(" Delete log ")
+        .title(title)
         .border_style(Style::default().fg(pal.trigger));
     f.render_widget(
         Paragraph::new(Line::styled(
             format!(" {q}"),
             Style::default().add_modifier(Modifier::BOLD),
         ))
+        .wrap(Wrap { trim: false })
         .block(block),
         popup,
     );

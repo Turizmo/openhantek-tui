@@ -2,6 +2,7 @@
 
 pub mod acquire;
 pub mod app;
+pub mod calib;
 pub mod config;
 pub mod device;
 pub mod dsp;

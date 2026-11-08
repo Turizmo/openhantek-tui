@@ -96,6 +96,9 @@ pub struct FakeState {
     pub noise: f64,
     /// ADC count for 0 V, per channel (also written into the fake EEPROM).
     pub zero: [u8; 2],
+    /// Counts added to the zero with the ADC at 30 MS/s or more (not in
+    /// the EEPROM), like a scope whose high-speed offsets are off.
+    pub fast_zero_shift: [f64; 2],
     pub eeprom: [u8; 256],
     pub gain_byte: [u8; 2],
     pub rate_id: u8,
@@ -173,6 +176,7 @@ impl FakeScope {
                 waves,
                 noise: 0.6,
                 zero,
+                fast_zero_shift: [0.0; 2],
                 eeprom,
                 gain_byte: [1, 1],
                 rate_id: 1,
@@ -238,7 +242,12 @@ impl FakeState {
     fn clean(&self, ch: usize, t: f64) -> f32 {
         let cal_freq = cal_freq_of_code(self.cal_code);
         let v = self.waves[ch].at(t, cal_freq);
-        (self.zero[ch] as f64 + v * counts_per_volt(self.gain_byte[ch])) as f32
+        let shift = if self.raw_rate() >= 30e6 {
+            self.fast_zero_shift[ch]
+        } else {
+            0.0
+        };
+        (self.zero[ch] as f64 + shift + v * counts_per_volt(self.gain_byte[ch])) as f32
     }
 
     /// Make the sample tables if the settings changed: one period of each
@@ -252,7 +261,7 @@ impl FakeState {
             self.gain_byte,
             self.cal_code,
             self.zero,
-            format!("{:?}", self.waves),
+            format!("{:?} {:?}", self.waves, self.fast_zero_shift),
             self.noise.to_bits(),
         );
         if self.table_key.as_ref() == Some(&key) {

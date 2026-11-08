@@ -87,6 +87,7 @@ fn main() -> Result<()> {
     }
     app.keys = keys;
     app.settings_path = save.as_ref().map(|t| t.path.clone());
+    app.save_target = save;
     app.log_dir_override = args.log_dir.clone();
     if let Some(p) = &args.open_log {
         app.open_log(p);
@@ -128,7 +129,8 @@ fn main() -> Result<()> {
         pop_keyboard_enhancement();
     }
     ratatui::restore();
-    if let Some(t) = &save {
+    app.close_helpers();
+    if let Some(t) = &app.save_target {
         if let Err(e) = config::save(t, &app.scope.settings) {
             eprintln!("Could not save the settings: {e:#}");
         }

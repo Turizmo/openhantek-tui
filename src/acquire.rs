@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Result;
 
 use crate::device::hantek::{RawPiece, Scope6022};
-use crate::device::protocol::{HwConfig, Rate};
+use crate::device::protocol::{AppCal, HwConfig, Rate};
 use crate::device::transport::{is_gone, is_timeout, Transport};
 use crate::device::Connection;
 use crate::logger::binner::Binner;
@@ -32,6 +32,9 @@ pub enum Command {
     /// no blocks go to the UI.
     StartLog(LogRequest),
     StopLog,
+    /// Use the app's own calibration (from the config file) from now on,
+    /// also after a reconnect. Never written to the scope.
+    Calibration(AppCal),
     Quit,
 }
 
@@ -334,6 +337,8 @@ struct Worker {
     quit: bool,
     last_error: Option<String>,
     log: Option<LogSession>,
+    /// The app's calibration, put into each connection.
+    app_cal: AppCal,
 }
 
 impl Worker {
@@ -348,6 +353,7 @@ impl Worker {
             quit: false,
             last_error: None,
             log: None,
+            app_cal: AppCal::default(),
         }
     }
 
@@ -368,6 +374,12 @@ impl Worker {
                 self.log = Some(LogSession::new(req));
             }
             Command::StopLog => self.stop_log(),
+            Command::Calibration(cal) => {
+                self.app_cal = cal;
+                if let Some(c) = &mut self.conn {
+                    c.driver.cal.app = cal;
+                }
+            }
             Command::Quit => self.quit = true,
         }
     }
@@ -543,7 +555,8 @@ impl Worker {
             let _ = tx.send(Event::Status(s.to_string()));
         };
         match (self.opener)(&mut status) {
-            Ok(conn) => {
+            Ok(mut conn) => {
+                conn.driver.cal.app = self.app_cal;
                 let ev = Event::Connected {
                     name: conn.name.clone(),
                     notes: conn.notes.clone(),

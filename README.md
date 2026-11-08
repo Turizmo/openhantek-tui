@@ -35,6 +35,8 @@ Features:
 - Calibration output frequency from 32 Hz to 100 kHz
 - Uses the calibration in the scope EEPROM and the OpenHantek6022
   calibration file, if you have one (it never writes the EEPROM)
+- Zero calibration of its own (`Z`, probes grounded): 0 V of every
+  gain and ADC rate bank, saved in the config file over the EEPROM values
 - Export the screen as CSV or JSON; headless `--measure` mode for scripts
 - Envelope logger (chart recorder): records min, max and mean per time
   step (0.5 µs to 1 min) without gaps, from the ADC at 16 MS/s with both
@@ -164,6 +166,7 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `D` | trace mode: average / peak (min..max area) / both |
 | `z` | sin(x)/x / linear interpolation |
 | `g` `G` | calibration output frequency up / down |
+| `Z` | zero calibration (ground the inputs first, see [Calibration](#calibration)) |
 | `E` | export the screen as CSV |
 | `W` | export the screen as JSON |
 | `R` | reset all settings |
@@ -445,6 +448,28 @@ the same hue (about 5 steps); in 16 colours the newer half is the normal
 colour and the older half also has the dim attribute. With box lines, old
 traces of different ages still join where they cross (the joined cell
 takes the newer colour), so they stay connected lines.
+
+## Calibration
+
+The scope's EEPROM holds a zero (ADC count of 0 V) per gain and channel,
+in two banks: one for the ADC below 30 MS/s and one for 30 MS/s and up
+(CH1 alone). openhantek-tui reads them and never writes the EEPROM. Its
+own calibration goes into the config file (`[calibration]`) and wins over
+the EEPROM values where it has one. Settings › Calibration shows where
+the zero comes from (`EEPROM` or `app, 24 values`).
+
+**Zero calibration** (`Z`, or Settings › Calibration › Zero calibration).
+Ground both inputs: the probe tip on its own ground clip, or a shorted
+BNC. The app asks first (`y` starts, any other key does not), then steps
+through every gain (20 mV to 5 V/div at the BNC) with both channels at
+16 MS/s, then with CH1 alone at 30 MS/s, and measures the mean of a few
+blocks at each step; the message line shows the progress (16 steps, a
+second or two). `Esc` stops it. A signal, a clipping input or a zero far
+from the middle stops it with an error and changes nothing. At the end
+your settings are back, the 24 values (CH1 and CH2 below 30 MS/s, CH1 at
+30 MS/s) are saved in the config file at once, and the message shows the
+biggest change against the zero used before. Clear zero calibration
+forgets them: the EEPROM values again.
 
 ## Measurement panel
 
@@ -787,8 +812,9 @@ one CPU core; roll mode at 16 MS/s 11 %.
 30 MS/s and up; it is used whenever the ADC runs at 30 MS/s (now every
 time base with CH1 alone). On the test scope that bank reads about 3.5
 ADC counts high (0.15 V at 1 V/div), while the 16 MS/s bank is right; if
-yours does too, recalibrate with OpenHantek6022, or set the max ADC rate
-to 12 / 24 MS/s.
+yours does too, run the [zero calibration](#calibration) (`Z`): it
+measures both banks and keeps the values in the config file, not in the
+EEPROM. Or set the max ADC rate to 12 / 24 MS/s.
 
 ## Tests
 

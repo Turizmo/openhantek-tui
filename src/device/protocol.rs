@@ -236,6 +236,31 @@ pub struct Calibration {
     pub ini_offset: [[f64; 2]; GAIN_STEPS],
     /// Extra gain factor from the ini file.
     pub ini_gain: [[f64; 2]; GAIN_STEPS],
+    /// Values of the app's own calibration (the config file). They win
+    /// over the EEPROM and the ini file.
+    pub app: AppCal,
+}
+
+/// The app's own calibration, from the config file: never from or to the
+/// EEPROM.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AppCal {
+    /// ADC count that means 0 V, per bank (like
+    /// [`Calibration::offset`]), gain index and channel. 0 = not set:
+    /// the EEPROM value (and the ini offset) is used.
+    pub zero: [[[f64; 2]; GAIN_STEPS]; 2],
+    /// Gain correction factor per channel (from the calibration output),
+    /// on top of the other gain values. 1 = none.
+    pub gain: [f64; 2],
+}
+
+impl Default for AppCal {
+    fn default() -> Self {
+        Self {
+            zero: [[[0.0; 2]; GAIN_STEPS]; 2],
+            gain: [1.0; 2],
+        }
+    }
 }
 
 impl Default for Calibration {
@@ -245,6 +270,7 @@ impl Default for Calibration {
             gain: [[1.0; 2]; GAIN_STEPS],
             ini_offset: [[0.0; 2]; GAIN_STEPS],
             ini_gain: [[1.0; 2]; GAIN_STEPS],
+            app: AppCal::default(),
         }
     }
 }
@@ -330,12 +356,33 @@ impl Calibration {
         count
     }
 
+    /// ADC count that means 0 V: the app's zero when it has one, else
+    /// the EEPROM offset plus the ini offset.
+    pub fn zero(&self, gain: usize, channel: usize, high_speed: bool) -> f64 {
+        let bank = high_speed as usize;
+        let app = self.app.zero[bank][gain][channel];
+        if app > 0.0 {
+            app
+        } else {
+            self.offset[bank][gain][channel] + self.ini_offset[gain][channel]
+        }
+    }
+
+    /// The EEPROM (and ini) zero, without the app's value.
+    pub fn device_zero(&self, gain: usize, channel: usize, high_speed: bool) -> f64 {
+        self.offset[high_speed as usize][gain][channel] + self.ini_offset[gain][channel]
+    }
+
+    /// Volts at the BNC per ADC count, with every gain value.
+    fn volts_per_count(&self, gain: usize, channel: usize) -> f64 {
+        self.ini_gain[gain][channel] / COUNTS_PER_VOLT[gain]
+            * self.gain[gain][channel]
+            * self.app.gain[channel]
+    }
+
     /// Volts at the BNC for an (averaged) ADC value.
     pub fn volts(&self, raw: f64, gain: usize, channel: usize, high_speed: bool) -> f64 {
-        let bank = high_speed as usize;
-        let s = (raw - self.offset[bank][gain][channel] - self.ini_offset[gain][channel])
-            * self.ini_gain[gain][channel];
-        s / COUNTS_PER_VOLT[gain] * self.gain[gain][channel]
+        (raw - self.zero(gain, channel, high_speed)) * self.volts_per_count(gain, channel)
     }
 
     /// The calibration as a line: volts at the BNC = `a * raw + b`.
@@ -354,10 +401,7 @@ impl Calibration {
 
     /// ADC value for a voltage at the BNC (the inverse of [`Self::volts`]).
     pub fn raw(&self, volts: f64, gain: usize, channel: usize, high_speed: bool) -> f64 {
-        let bank = high_speed as usize;
-        volts * COUNTS_PER_VOLT[gain] / self.gain[gain][channel] / self.ini_gain[gain][channel]
-            + self.offset[bank][gain][channel]
-            + self.ini_offset[gain][channel]
+        volts / self.volts_per_count(gain, channel) + self.zero(gain, channel, high_speed)
     }
 }
 
@@ -703,6 +747,32 @@ mod tests {
             n += 1
         });
         assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn app_calibration_wins_over_the_eeprom() {
+        let mut ee = [0xFFu8; 80];
+        // CH1 1 V/div: 132 at low speed, 136 at 30 MS/s (high by 4).
+        ee[10] = 132;
+        ee[16 + 10] = 136;
+        let mut cal = Calibration::from_eeprom(&ee);
+        cal.apply_ini("[offset]\nch0\\1000mV=1\n");
+        assert_eq!(cal.zero(5, 0, true), 137.0);
+        // An app zero for the 30 MS/s bank only.
+        cal.app.zero[1][5][0] = 132.5;
+        assert_eq!(cal.zero(5, 0, true), 132.5);
+        assert_eq!(cal.zero(5, 0, false), 133.0);
+        assert_eq!(cal.device_zero(5, 0, true), 137.0);
+        assert!(cal.volts(132.5, 5, 0, true).abs() < 1e-12);
+        // The app gain scales the volts; raw stays the inverse.
+        cal.app.gain[0] = 1.1;
+        let v = cal.volts(132.5 + 24.75, 5, 0, true);
+        assert!((v - 1.1).abs() < 1e-9, "{v}");
+        for v in [-2.0, 0.0, 0.7] {
+            assert!((cal.volts(cal.raw(v, 5, 0, true), 5, 0, true) - v).abs() < 1e-9);
+        }
+        // CH2 is not touched.
+        assert_eq!(cal.volts(128.0 + 24.75, 5, 1, false), 1.0);
     }
 
     #[test]

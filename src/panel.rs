@@ -37,6 +37,10 @@ pub enum Action {
     OpenLog(usize),
     /// Ask to delete recent log number `i` (newest first).
     DeleteLog(usize),
+    /// Zero calibration (asks for grounded inputs first).
+    ZeroCal,
+    /// Forget the app's zero values: the EEPROM values again.
+    ClearZeroCal,
 }
 
 /// One setting in the panel.
@@ -90,6 +94,8 @@ pub enum Field {
     CursorColour(usize),
     MeasPanel,
     CalFreq,
+    /// Where the zero values come from.
+    CalZero,
     DevModel,
     DevSerial,
     DevFirmware,
@@ -253,8 +259,13 @@ pub fn categories() -> Vec<Category> {
             fields: vec![MeasPanel, Selected],
         },
         Category {
-            name: "Calibration output",
-            fields: vec![CalFreq],
+            name: "Calibration",
+            fields: vec![
+                CalFreq,
+                CalZero,
+                Act(Action::ZeroCal),
+                Act(Action::ClearZeroCal),
+            ],
         },
         Category {
             name: "Device",
@@ -421,7 +432,8 @@ impl Field {
             CursorColour(2) => "Voltage A colour",
             CursorColour(_) => "Voltage B colour",
             MeasPanel => "Show panel",
-            CalFreq => "Frequency",
+            CalFreq => "Output frequency",
+            CalZero => "Zero",
             DevModel => "Model",
             DevSerial => "Serial",
             DevFirmware => "Firmware",
@@ -453,6 +465,8 @@ impl Field {
                 Action::ExportLogRange => "Export A–B CSV",
                 Action::OpenLog(_) => "Open log",
                 Action::DeleteLog(_) => "Delete log",
+                Action::ZeroCal => "Zero calibration",
+                Action::ClearZeroCal => "Clear zero calibration",
             },
         }
     }
@@ -502,6 +516,7 @@ impl Field {
             CursorPos(_) => "Space: on/off. Voltage of the selected trace. Keys j k J K; v hides all.",
             MeasPanel => "The measurement panel on the right. Key M.",
             CalFreq => "Frequency of the 2 Vpp square wave on the calibration pins. Keys g G.",
+            CalZero => "Where the 0 V values come from: the app's zero calibration (config file) or the scope's EEPROM.",
             DevModel | DevSerial | DevFirmware | DevState => "Read from the scope.",
             DevCalibration => "Where the calibration values came from.",
             DevRate => "Sample rate of the traces now, and the ADC rate it is made from (the mean of each few ADC samples).",
@@ -530,6 +545,8 @@ impl Field {
                 Action::ExportLogRange => "Save the open log between cursors A and B as CSV. Key E in the log view.",
                 Action::OpenLog(_) => "Open a log.",
                 Action::DeleteLog(_) => "Delete a log and its .idx file.",
+                Action::ZeroCal => "Ground the probe tips (or BNC inputs), then y: measures 0 V of every gain, both channels at 16 MS/s and CH1 alone at 30 MS/s. Saved in the config file, never the EEPROM. Key Z.",
+                Action::ClearZeroCal => "Forget the zero calibration: the EEPROM values again.",
             },
         }
     }
@@ -542,7 +559,7 @@ impl Field {
                 Kind::Number
             }
             Roll | DevModel | DevSerial | DevFirmware | DevState | DevCalibration | DevRate
-            | ExportDir | SettingsFile | ConfigWarnings | LogDir | LogFree => Kind::Info,
+            | CalZero | ExportDir | SettingsFile | ConfigWarnings | LogDir | LogFree => Kind::Info,
             Act(_) => Kind::Action,
             _ => Kind::Choice,
         }
@@ -1097,6 +1114,10 @@ impl Field {
                     },
                     LogDir => tail(&d.log_dir, 24),
                     LogFree => d.log_free.map_or("--".into(), crate::logger::fmt_bytes),
+                    CalZero => match s.calibration.zero_count() {
+                        0 => "EEPROM".into(),
+                        n => format!("app, {n} values"),
+                    },
                     _ => String::new(),
                 }
             }
@@ -2127,7 +2148,7 @@ mod tests {
         assert!((s.trigger.level - 1.1).abs() < 1e-12);
         // The calibration frequency steps through its fixed steps, and a
         // typed value snaps to the nearest one.
-        goto(&mut p, &mut s, "Calibration output", "Frequency");
+        goto(&mut p, &mut s, "Calibration", "Output frequency");
         key(&mut p, &mut s, KeyCode::Enter);
         key(&mut p, &mut s, KeyCode::Char('k'));
         assert_eq!(s.cal_freq, 1_200);
