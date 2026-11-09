@@ -34,6 +34,10 @@ pub struct Frame {
     pub clipped: [bool; 2],
     /// Output samples per second.
     pub rate: f64,
+    /// Measurements of CH1, CH2 and MATH over a longer record than the
+    /// screen (from the stream's ring), when the stream made them. They
+    /// see whole periods the screen may not hold.
+    pub long: Option<[Option<Measurements>; 3]>,
 }
 
 impl Frame {
@@ -448,7 +452,7 @@ impl Scope {
             // average as it is.
             cut
         } else if depth > 1 {
-            self.avg.add(&cut, depth);
+            self.avg.add(&cut, depth, p.peak);
             self.avg.value(&cut, depth)
         } else {
             self.avg.reset();
@@ -495,11 +499,17 @@ impl Scope {
     /// at least a quarter division: smaller ones are mostly noise.
     pub fn measure(&self, t: usize) -> Option<Measurements> {
         let f = self.frame.as_ref()?;
-        let v = f.visible_samples(t, &self.settings)?;
-        if v.len() < 2 {
-            return None;
-        }
-        let mut m = measure(v, f.dt);
+        let long = f.long.as_ref().and_then(|l| l[t].clone());
+        let mut m = match long {
+            Some(m) => m,
+            None => {
+                let v = f.visible_samples(t, &self.settings)?;
+                if v.len() < 2 {
+                    return None;
+                }
+                measure(v, f.dt)
+            }
+        };
         let per_div = if t == MATH {
             self.settings.math.units_per_div()
         } else {
@@ -927,6 +937,8 @@ mod tests {
     fn averaged_peak_keeps_the_extremes_of_the_last_captures() {
         let mut s = scope();
         s.settings.display.averaging = 4;
+        // The band is averaged only when it is drawn.
+        s.settings.display.trace_mode = TraceMode::Peak;
         // One capture with a big spike, then small ones.
         s.push(peaky_block(1, 2.0));
         for _ in 0..3 {

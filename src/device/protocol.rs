@@ -455,6 +455,72 @@ impl Acc {
     };
 }
 
+/// Min, max and sum of some ADC bytes.
+#[inline]
+fn span(bytes: impl Iterator<Item = u8>) -> (u8, u8, u64) {
+    bytes.fold((u8::MAX, 0, 0), |(lo, hi, sum), b| {
+        (lo.min(b), hi.max(b), sum + b as u64)
+    })
+}
+
+/// [`span`] of both channels of interleaved bytes (CH1 first), in one
+/// pass. Long pieces go 16 samples per channel at a time, in lanes the
+/// compiler turns into SIMD; short ones (a point of a few samples) one
+/// pair at a time.
+#[inline]
+fn span2(bytes: &[u8]) -> [(u8, u8, u64); 2] {
+    const L: usize = 16;
+    if bytes.len() >= 32 * L {
+        let (mut lo, mut hi) = ([[u8::MAX; L]; 2], [[0u8; L]; 2]);
+        let mut sum = [0u64; 2];
+        let mut blocks = bytes.chunks_exact(2 * L);
+        // u32 lane sums: 2^15 blocks at most between two flushes.
+        let mut s = [[0u32; L]; 2];
+        for (k, blk) in blocks.by_ref().enumerate() {
+            for j in 0..L {
+                let (a, b) = (blk[2 * j], blk[2 * j + 1]);
+                lo[0][j] = lo[0][j].min(a);
+                hi[0][j] = hi[0][j].max(a);
+                s[0][j] += a as u32;
+                lo[1][j] = lo[1][j].min(b);
+                hi[1][j] = hi[1][j].max(b);
+                s[1][j] += b as u32;
+            }
+            if k % (1 << 15) == (1 << 15) - 1 {
+                for c in 0..2 {
+                    sum[c] += s[c].iter().map(|&x| x as u64).sum::<u64>();
+                    s[c] = [0; L];
+                }
+            }
+        }
+        let tail = span2(blocks.remainder());
+        return [0, 1].map(|c| {
+            (
+                lo[c].iter().copied().fold(tail[c].0, u8::min),
+                hi[c].iter().copied().fold(tail[c].1, u8::max),
+                sum[c] + s[c].iter().map(|&x| x as u64).sum::<u64>() + tail[c].2,
+            )
+        });
+    }
+    let (mut lo, mut hi, mut sum) = ([u8::MAX; 2], [0u8; 2], [0u64; 2]);
+    // u32 sums inside pieces of 2^24 bytes (no overflow), which the
+    // compiler handles better.
+    for part in bytes.chunks(1 << 24) {
+        let mut s = [0u32; 2];
+        for pair in part.chunks_exact(2) {
+            for c in 0..2 {
+                let b = pair[c];
+                lo[c] = lo[c].min(b);
+                hi[c] = hi[c].max(b);
+                s[c] += b as u32;
+            }
+        }
+        sum[0] += s[0] as u64;
+        sum[1] += s[1] as u64;
+    }
+    [0, 1].map(|c| (lo[c], hi[c], sum[c]))
+}
+
 /// Decimates interleaved raw ADC bytes: each `factor` raw samples of a
 /// channel make one output point with their min, max and mean (in ADC
 /// counts). Keeps partial points between calls, so a stream can come in
@@ -504,21 +570,34 @@ impl Decimator {
             raw = &raw[1..];
         }
         let factor = self.factor;
-        for &b in raw {
-            let c = self.next_ch;
-            self.next_ch = if c + 1 == self.channels { 0 } else { c + 1 };
-            let a = &mut self.acc[c];
-            a.sum += b as u64;
-            a.n += 1;
-            a.min = a.min.min(b);
-            a.max = a.max.max(b);
-            if a.n == factor {
-                let p = std::mem::replace(a, Acc::EMPTY);
-                if p.min == 0 || p.max == 0xFF {
+        // One byte at a time, until a point starts at CH1 (then whole
+        // points go in one go below) or the bytes end.
+        let aligned = |me: &Self| me.next_ch == 0 && me.acc.iter().all(|a| a.n == 0);
+        while !raw.is_empty() && !aligned(self) {
+            self.byte(raw[0], &mut out);
+            raw = &raw[1..];
+        }
+        // Whole points: min, max and sum in tight loops the compiler
+        // vectorizes (the stream is up to 30 MB/s; a byte at a time was
+        // most of the processing).
+        let f = factor as usize;
+        let frame = self.channels * f;
+        let mut chunks = raw.chunks_exact(frame);
+        for chunk in &mut chunks {
+            let points = if self.channels == 1 {
+                [span(chunk.iter().copied()), (0, 0, 0)]
+            } else {
+                span2(chunk)
+            };
+            for (c, &(lo, hi, sum)) in points.iter().enumerate().take(self.channels) {
+                if lo == 0 || hi == 0xFF {
                     self.clipped[c] = true;
                 }
-                out(c, p.min, p.max, p.sum as f64 / factor as f64);
+                out(c, lo, hi, sum as f64 / factor as f64);
             }
+        }
+        for &b in chunks.remainder() {
+            self.byte(b, &mut out);
         }
         // A partial point that clipped already: tell it now, not only
         // when the point is done (a long log step).
@@ -527,6 +606,60 @@ impl Decimator {
             if a.n > 0 && (a.min == 0 || a.max == 0xFF) {
                 self.clipped[c] = true;
             }
+        }
+    }
+
+    /// [`Decimator::push`] into `out`: the mean of each point, per
+    /// channel. Without decimation (factor 1) the bytes go straight in,
+    /// in a loop the compiler vectorizes.
+    pub fn push_means(&mut self, mut raw: &[u8], out: &mut [Vec<f64>; 2]) {
+        if self.factor == 1 && self.skip == 0 {
+            // Byte by byte up to a CH1 byte, then whole frames.
+            while !raw.is_empty() && self.next_ch != 0 {
+                self.byte(raw[0], &mut |c, _, _, m| out[c].push(m));
+                raw = &raw[1..];
+            }
+            let ch = self.channels;
+            let whole = raw.len() / ch * ch;
+            let (body, rest) = raw.split_at(whole);
+            if ch == 1 {
+                out[0].extend(body.iter().map(|&b| b as f64));
+                if body.iter().any(|&b| b == 0 || b == 0xFF) {
+                    self.clipped[0] = true;
+                }
+            } else {
+                for (c, o) in out.iter_mut().enumerate() {
+                    let it = body.iter().skip(c).step_by(2);
+                    o.extend(it.clone().map(|&b| b as f64));
+                    if it.clone().any(|&b| b == 0 || b == 0xFF) {
+                        self.clipped[c] = true;
+                    }
+                }
+            }
+            for &b in rest {
+                self.byte(b, &mut |c, _, _, m| out[c].push(m));
+            }
+        } else {
+            self.push(raw, |c, _, _, m| out[c].push(m));
+        }
+    }
+
+    /// Take one byte.
+    #[inline]
+    fn byte(&mut self, b: u8, out: &mut impl FnMut(usize, u8, u8, f64)) {
+        let c = self.next_ch;
+        self.next_ch = if c + 1 == self.channels { 0 } else { c + 1 };
+        let a = &mut self.acc[c];
+        a.sum += b as u64;
+        a.n += 1;
+        a.min = a.min.min(b);
+        a.max = a.max.max(b);
+        if a.n == self.factor {
+            let p = std::mem::replace(a, Acc::EMPTY);
+            if p.min == 0 || p.max == 0xFF {
+                self.clipped[c] = true;
+            }
+            out(c, p.min, p.max, p.sum as f64 / self.factor as f64);
         }
     }
 
@@ -556,6 +689,48 @@ impl Decimator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_paths_give_what_a_byte_at_a_time_gives() {
+        // Noise-like bytes with the extremes in them.
+        let mut x = 12345u32;
+        let raw: Vec<u8> = (0..20_011)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (x >> 16) as u8
+            })
+            .collect();
+        for ch in [1u8, 2] {
+            for factor in [1usize, 3, 16, 300, 1000] {
+                let slow = {
+                    let mut d = Decimator::new(ch, factor, 5);
+                    let mut out = Vec::new();
+                    for b in &raw {
+                        d.push(std::slice::from_ref(b), |c, lo, hi, m| out.push((c, lo, hi, m)));
+                    }
+                    (out, d.clipped)
+                };
+                for piece in [7usize, 4096, raw.len()] {
+                    let mut d = Decimator::new(ch, factor, 5);
+                    let mut out = Vec::new();
+                    for p in raw.chunks(piece) {
+                        d.push(p, |c, lo, hi, m| out.push((c, lo, hi, m)));
+                    }
+                    assert_eq!((out, d.clipped), slow, "ch {ch} factor {factor} piece {piece}");
+                    let mut d = Decimator::new(ch, factor, 5);
+                    let mut means: [Vec<f64>; 2] = Default::default();
+                    for p in raw.chunks(piece) {
+                        d.push_means(p, &mut means);
+                    }
+                    for (c, got) in means.iter().enumerate().take(ch as usize) {
+                        let want: Vec<f64> =
+                            slow.0.iter().filter(|p| p.0 == c).map(|p| p.3).collect();
+                        assert_eq!(*got, want, "means ch {ch} factor {factor} piece {piece}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn caps_and_adc_rates() {

@@ -20,7 +20,14 @@ Features:
 - Software trigger: Auto / Normal / Single, rising / falling / both edges,
   CH1 or CH2, level and position, with hysteresis against noise
 - Measurements: Vpp, max, min, mean, RMS, AC RMS, amplitude, top, base,
-  frequency, period, duty cycle, pulse widths, rise and fall time
+  frequency, period, duty cycle, pulse widths, rise and fall time. They
+  look at more of the stream than the screen (up to 2M ADC samples back,
+  70 ms at 30 MS/s), until each channel shows 4 periods: a screen with
+  less than one period still gets its frequency, and Vpp sees every
+  period. Max, min, Vpp, rise and fall time come from the raw ADC
+  samples (not the means of a few that a slower time/div draws), so
+  they do not change with the time/div. They do not use averaging. Roll mode and a stopped capture
+  that is drawn again measure the screen.
 - Four cursors (time A and B, voltage A and B), each with its own on/off,
   line style and colour; ΔT, 1/ΔT, ΔV and the value of each channel at
   the time cursors in the measurement panel
@@ -28,6 +35,7 @@ Features:
   windows, in dBV, with peak readout and zoom
 - XY mode
 - Averaging, persistence (old traces fade by age), sin(x)/x interpolation
+  or samples only (only the real samples, one dot each)
 - Trace mode: the mean as a line, the peak area (the lowest to the
   highest ADC sample behind each point, also over the averaged captures),
   or both
@@ -165,9 +173,8 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `Alt` + `[` `]` `{` `}` `+` `-` `,` `.` | a tenth of the normal step (fine) |
 | `A` | averaging: 1 2 4 8 16 32 64 |
 | `P` | persistence: 0 2 4 8 16 traces |
-| `d` | dots / lines |
 | `D` | trace mode: average / peak (min..max area) / both |
-| `z` | sin(x)/x / linear interpolation |
+| `z` | interpolation: sin(x)/x / linear / samples only |
 | `g` `G` | calibration output frequency up / down |
 | `Z` | zero calibration (ground the inputs first, see [Calibration](#calibration)) |
 | `C` | probe helper on the calibration output (see [Calibration](#calibration)) |
@@ -421,8 +428,8 @@ alone 24 MS/s`, then `10 MS/s`, `5 MS/s`, `2 MS/s`, `1 MS/s`, `500 kS/s`,
 fastest time bases then show the capped rate; the logger's steps and
 its raw step follow (Device › Sample rate shows `1 MS/s (ADC 16 MS/s)`).
 
-Dots (`d`), persistence (`P`) and interpolation
-(`z`) work with every style. Settings files from older versions still
+Persistence (`P`) and interpolation (`z`, also samples only)
+work with every style. Settings files from older versions still
 load: the old style names `Classic` and `Thin` read as `braille thin`,
 `Bold` as `braille bold`.
 

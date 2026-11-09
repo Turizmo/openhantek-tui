@@ -24,6 +24,7 @@ use crate::acquire::Block;
 use crate::device::hantek::SKIP_SAMPLES;
 use crate::device::protocol::{AppCal, Calibration, Decimator, HwConfig};
 use crate::dsp::math::{combine, MathMode};
+use crate::dsp::measure::{edge_times, edges, measure, top_base_counts, Measurements};
 use crate::dsp::trigger::{EdgeScanner, Slope};
 use crate::dsp::{Averager, PeakHold};
 use crate::scope::{Frame, TrigState, MATH};
@@ -37,6 +38,38 @@ pub const FRAME_TIME: Duration = Duration::from_nanos(16_666_667);
 
 /// Raw frames decimated in one go, between two looks at the captures.
 const CHUNK_FRAMES: u64 = 1 << 18;
+
+/// Raw frames the long measurement may look back: about 70 ms at
+/// 30 MS/s, 130 ms at 16 MS/s (one period of 8 to 15 Hz). The ring keeps
+/// them (at most a quarter of it). A flat signal reads them all each time:
+/// about 20 ms of work per [`MEASURE_TIME`].
+pub const MEASURE_FRAMES: u64 = 1 << 21;
+
+/// Points of the first record the long measurement tries; each next one
+/// is 8 times as long.
+const MEASURE_START: u64 = 4096;
+
+/// Most points one measurement looks at: a longer record takes the mean
+/// of a few points for each.
+const MEASURE_POINTS: u64 = 1 << 16;
+
+/// Whole periods a record should hold for its timing values.
+const MEASURE_PERIODS: f64 = 4.0;
+
+/// Edges of each kind the rise and fall times are the mean of.
+const RAW_EDGES: usize = 4;
+
+/// Points the trigger search looks at as one: a block with no edge in it
+/// goes in one step.
+const SCAN_BLOCK: usize = 64;
+
+/// Fewest points the trigger level and the AC mean take their signal
+/// stats from. A screen of a few points (20 ns/div) would retune the
+/// trigger every few samples: millions of times a second.
+const STATS_MIN: u64 = 4096;
+
+/// Shortest time between two long measurements.
+pub const MEASURE_TIME: Duration = Duration::from_millis(250);
 
 /// How far inside the input range the trigger level goes when the
 /// user's level is outside it: 5 % of the range.
@@ -69,6 +102,10 @@ pub struct ProcSettings {
     pub cal: AppCal,
     /// Counts the single trigger arms: a new value arms it again.
     pub arm: u64,
+    /// The peak band is drawn (trace mode peak or both): only then the
+    /// average keeps the band of each capture (64 captures of a long
+    /// screen, merged at each publish, were a third of the work).
+    pub peak: bool,
 }
 
 impl ProcSettings {
@@ -88,6 +125,7 @@ impl ProcSettings {
             math: s.math.enabled.then_some(s.math.mode),
             cal: s.calibration.app_cal(),
             arm,
+            peak: s.display.trace_mode != crate::settings::TraceMode::Average,
         }
     }
 
@@ -297,6 +335,7 @@ pub fn frame(
         roll,
         clipped,
         rate,
+        long: None,
     }
 }
 
@@ -317,14 +356,16 @@ impl Averaging {
         }
     }
 
-    /// Add one triggered capture.
-    pub fn add(&mut self, cut: &Cut, depth: usize) {
+    /// Add one triggered capture. Without `peak` its band is not kept:
+    /// [`Averaging::value`] then shows the band of the last capture.
+    pub fn add(&mut self, cut: &Cut, depth: usize, peak: bool) {
         for c in 0..2 {
             if let Some(t) = &cut.traces[c] {
                 self.avg[c].add(t, depth);
             }
-            if let Some((lo, hi)) = &cut.peak[c] {
-                self.peaks[c].add(lo, hi, depth);
+            match &cut.peak[c] {
+                Some((lo, hi)) if peak => self.peaks[c].add(lo, hi, depth),
+                _ => self.peaks[c].reset(),
             }
         }
     }
@@ -525,6 +566,28 @@ pub struct Published {
     pub ac_mean: [f64; 2],
 }
 
+/// Lowest and highest of `v` (no NaN), in a loop the compiler vectorizes
+/// (`f64::min` keeps it from that).
+#[inline]
+fn min_max(v: &[f64]) -> (f64, f64) {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &x in v {
+        lo = if x < lo { x } else { lo };
+        hi = if x > hi { x } else { hi };
+    }
+    (lo, hi)
+}
+
+/// A long record for the measurements: its traces at the probe tip, their
+/// measurements and the raw frames behind them.
+struct Record {
+    ms: [Option<Measurements>; 3],
+    traces: [Option<Vec<f64>>; 3],
+    frames: std::ops::Range<u64>,
+    /// Raw frames per sample of the traces.
+    per: u64,
+}
+
 /// Running min, max and mean of each channel over a screen of points.
 #[derive(Clone, Copy, Debug)]
 struct Stats {
@@ -542,15 +605,18 @@ impl Stats {
         n: 0,
     };
 
-    fn add(&mut self, v: f64) {
-        self.min = self.min.min(v);
-        self.max = self.max.max(v);
-        self.sum += v;
-        self.n += 1;
-    }
-
     fn mean(&self) -> f64 {
         self.sum / self.n.max(1) as f64
+    }
+
+    /// [`Stats::add`] for each of `v`.
+    fn add_all(&mut self, v: &[f64]) {
+        let (lo, hi) = min_max(v);
+        let sum: f64 = v.iter().sum();
+        self.min = self.min.min(lo);
+        self.max = self.max.max(hi);
+        self.sum += sum;
+        self.n += v.len() as u64;
     }
 }
 
@@ -584,7 +650,9 @@ pub struct Pipeline {
     src: usize,
     scanner: EdgeScanner,
     stats: [Stats; 2],
-    /// Stats of the last whole screen.
+    /// The points of the chunk being scanned, per channel.
+    scan_buf: [Vec<f64>; 2],
+    /// Stats of the last whole screen (at least [`STATS_MIN`] points).
     last_stats: Option<[Stats; 2]>,
     pending: VecDeque<Pending>,
     avg: Averaging,
@@ -605,6 +673,12 @@ pub struct Pipeline {
     /// should be; see [`Pipeline::set_proc`]).
     lost: u64,
     roll: Roll,
+    /// The last long measurement (see [`Pipeline::measure_long`]).
+    long: Option<[Option<Measurements>; 3]>,
+    last_measure: Option<Instant>,
+    /// Shortest time between two long measurements ([`MEASURE_TIME`];
+    /// tests 0).
+    pub min_measure: Duration,
     /// Shortest time between two publishes ([`FRAME_TIME`]; tests 0).
     pub min_publish: Duration,
     /// Every accepted trigger, as a point index (tests).
@@ -643,6 +717,7 @@ impl Pipeline {
             src: 0,
             scanner: EdgeScanner::new(0.0, Slope::Rising, 0.0, first),
             stats: [Stats::EMPTY; 2],
+            scan_buf: Default::default(),
             last_stats: None,
             pending: VecDeque::new(),
             avg: Averaging::default(),
@@ -656,6 +731,9 @@ impl Pipeline {
             single_done: false,
             lost: 0,
             roll: Roll::default(),
+            long: None,
+            last_measure: None,
+            min_measure: MEASURE_TIME,
             min_publish: FRAME_TIME,
             trigger_log: None,
         };
@@ -695,6 +773,8 @@ impl Pipeline {
         self.avg.reset();
         self.last = None;
         self.dirty = false;
+        self.long = None;
+        self.last_measure = None;
         self.triggers = 0;
         self.last_trigger = at;
         self.last_status = at;
@@ -786,11 +866,12 @@ impl Pipeline {
             self.publish(ring, out, false);
         }
         self.publish(ring, out, true);
-        ring.keep_from(self.keep());
+        ring.keep_from(self.keep(ring));
     }
 
-    /// The first raw frame still needed.
-    fn keep(&self) -> u64 {
+    /// The first raw frame still needed: the captures to come and the
+    /// history of the long measurement.
+    fn keep(&self, ring: &Ring) -> u64 {
         if self.hw.roll {
             // Roll mode takes each point as it comes.
             return self.frame_pos;
@@ -800,14 +881,233 @@ impl Pipeline {
         if let Some(c) = self.pending.front() {
             p = p.min(c.start);
         }
-        p * self.os
+        let history = MEASURE_FRAMES.min((ring.size() / self.ch / 4) as u64);
+        (p * self.os).min(self.frame_pos.saturating_sub(history))
+    }
+
+    /// Measure over a longer record than the screen, ending at the newest
+    /// point: from the screen's length up, 8 times longer each try, until
+    /// each channel's record holds [`MEASURE_PERIODS`] periods, or the
+    /// ring has no more ([`MEASURE_FRAMES`]). So a screen with less than
+    /// a period still gets its frequency, and the levels see every
+    /// period. Then the levels and the edges from the raw samples (see
+    /// [`Pipeline::raw_levels`], [`Pipeline::raw_edges`]). At most once
+    /// per [`Pipeline::min_measure`] unless `now`.
+    fn measure_long(&mut self, ring: &Ring, now: bool) {
+        let t = Instant::now();
+        if !now
+            && self
+                .last_measure
+                .is_some_and(|l| t.duration_since(l) < self.min_measure)
+        {
+            return;
+        }
+        self.last_measure = Some(t);
+        let end = self.pts[..self.ch].iter().copied().min().unwrap_or(0);
+        let held = ring.kept().div_ceil(self.os).max(self.first);
+        if end <= held + 2 {
+            return;
+        }
+        let (d, _, _) = self.p.window(self.hw.rate.rate);
+        let most = (MEASURE_FRAMES / self.os).max(capture_len(d) as u64);
+        let most = most.min(end - held);
+        let mut len = (capture_len(d) as u64).max(MEASURE_START).min(most);
+        let mut rec = None;
+        while let Some(r) = self.record(ring, end - len, len) {
+            let time = len as f64 / self.hw.rate.rate;
+            // Noise on a flat part has edges too: like the screen, a
+            // frequency counts from a quarter division up.
+            let enough = r.ms[..self.ch].iter().enumerate().all(|(c, m)| {
+                m.as_ref()
+                    .filter(|m| m.pk_pk >= 0.25 * self.p.vdiv[c])
+                    .and_then(|m| m.freq)
+                    .is_some_and(|f| f * time >= MEASURE_PERIODS)
+            });
+            rec = Some(r);
+            if enough || len >= most {
+                break;
+            }
+            len = (len * 8).min(most);
+        }
+        let Some(mut rec) = rec else {
+            return;
+        };
+        self.raw_levels(ring, &mut rec);
+        self.raw_edges(ring, &mut rec);
+        self.long = Some(rec.ms);
+    }
+
+    /// Volts at the probe tip of each ADC count, per channel.
+    fn lut(&self) -> [[f64; 256]; 2] {
+        let ac = self.ac_mean();
+        [0, 1].map(|c| {
+            let (a, b) = self.lines[c];
+            let k = self.p.k(c);
+            std::array::from_fn(|x| (a * x as f64 + b - ac[c]) * k)
+        })
+    }
+
+    /// Top, base and amplitude of CH1 and CH2 from a histogram of the raw
+    /// samples of the record (every 5th to 11th one: plenty, and no
+    /// period locks to the step), not of its points: the same at every
+    /// time/div.
+    fn raw_levels(&self, ring: &Ring, rec: &mut Record) {
+        let ch = self.ch;
+        let mut hist = [[0u64; 256]; 2];
+        let read = ring.try_read(rec.frames.clone(), |a, b| {
+            let n = (a.len() + b.len()) / ch;
+            let get = |i: usize| if i < a.len() { a[i] } else { b[i - a.len()] };
+            let (mut f, mut seed) = (0usize, 0x9E37_79B9u32);
+            while f < n {
+                for (c, h) in hist.iter_mut().enumerate().take(ch) {
+                    h[get(f * ch + c) as usize] += 1;
+                }
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                f += 5 + (seed >> 29) as usize;
+            }
+        });
+        if read.is_none() {
+            return;
+        }
+        let lut = self.lut();
+        for c in 0..ch {
+            if let (Some(m), Some((t, b))) = (rec.ms[c].as_mut(), top_base_counts(&hist[c])) {
+                let (vt, vb) = (lut[c][t], lut[c][b]);
+                m.top = vt.max(vb);
+                m.base = vt.min(vb);
+                m.amplitude = m.top - m.base;
+            }
+        }
+    }
+
+    /// Rise and fall times from the raw ADC samples, not from points
+    /// (means of a few samples, more at a slower time/div): so they do
+    /// not change with the time/div. The record's points show where its
+    /// newest edges are; a small raw window around each of the last
+    /// [`RAW_EDGES`] rising and falling ones is measured. A trace without
+    /// a frequency gets none: a value from the points would change with
+    /// the time/div.
+    fn raw_edges(&self, ring: &Ring, rec: &mut Record) {
+        let lut = self.lut();
+        let raw = self.hw.rate.raw;
+        let per = rec.per as f64;
+        let ch = self.ch;
+        for i in 0..3 {
+            let (Some(t), Some(m)) = (&rec.traces[i], &mut rec.ms[i]) else {
+                continue;
+            };
+            let found = m.freq.is_some() && (i == MATH || m.pk_pk >= 0.25 * self.p.vdiv[i]);
+            let (rise, fall) = (m.rise, m.fall);
+            (m.rise, m.fall) = (None, None);
+            if !found {
+                continue;
+            }
+            let (rising, falling) = edges(t, m.top, m.base);
+            // Half a window: the edge as the points see it and a few
+            // points either side, at most a quarter period.
+            let slow = rise.into_iter().chain(fall).fold(0.0, f64::max);
+            let quarter = m.freq.map_or(f64::INFINITY, |f| raw / f / 4.0);
+            let half = (slow * raw + 4.0 * per).min(quarter).max(32.0) as u64;
+            let (top, base) = (m.top, m.base);
+            let mut times = [Vec::new(), Vec::new()];
+            for (k, list) in [rising, falling].iter().enumerate() {
+                for &e in list.iter().rev().take(RAW_EDGES) {
+                    let mid = rec.frames.start + ((e + 0.5) * per) as u64;
+                    let from = mid.saturating_sub(half).max(rec.frames.start);
+                    let to = (mid + half).min(rec.frames.end);
+                    let Some([a, b]) = ring.try_read(from..to, |x, y| {
+                        let mut v: [Vec<f64>; 2] = Default::default();
+                        for (j, &byte) in x.iter().chain(y).enumerate() {
+                            v[j % ch].push(lut[j % ch][byte as usize]);
+                        }
+                        v
+                    }) else {
+                        continue;
+                    };
+                    let mut w = [Some(a), (ch == 2).then_some(b), None];
+                    w[MATH] = math_trace(self.p.math, &w);
+                    if let Some(v) = &w[i] {
+                        let (r, f) = edge_times(v, Some((top, base)));
+                        times[k].extend(if k == 0 { r } else { f });
+                    }
+                }
+            }
+            let mean = |v: &[f64]| {
+                (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64 / raw)
+            };
+            m.rise = mean(&times[0]);
+            m.fall = mean(&times[1]);
+        }
+    }
+
+    /// The record of `len` points from point `start`, measured at the
+    /// probe tip. A sample is the mean of a few points when there are more
+    /// than [`MEASURE_POINTS`]. Max, min and Vpp are those of the raw
+    /// samples, so they do not change with the time/div. None when the
+    /// ring no longer holds them.
+    fn record(&self, ring: &Ring, start: u64, len: u64) -> Option<Record> {
+        let group = len.div_ceil(MEASURE_POINTS).max(1);
+        let per = self.os * group;
+        let frames = start * self.os..(start + len) * self.os;
+        // One decimation by `per`, in the decimator's fast loops.
+        let mut dec = Decimator::new(self.ch as u8, per as usize, 0);
+        let mut v: [Vec<f64>; 2] = Default::default();
+        let mut lo = [u8::MAX; 2];
+        let mut hi = [0u8; 2];
+        ring.try_read(frames.clone(), |a, b| {
+            let mut out = |c: usize, l: u8, h: u8, m: f64| {
+                lo[c] = lo[c].min(l);
+                hi[c] = hi[c].max(h);
+                v[c].push(m);
+            };
+            dec.push(a, &mut out);
+            dec.push(b, &mut out);
+        })?;
+        let ac = self.ac_mean();
+        let mut traces: [Option<Vec<f64>>; 3] = Default::default();
+        let mut levels = [(0.0, 0.0); 2];
+        for c in 0..self.ch {
+            if v[c].len() < 2 {
+                continue;
+            }
+            let (a, b) = self.lines[c];
+            let k = self.p.k(c);
+            let volts = |x: f64| (a * x + b - ac[c]) * k;
+            let mut t = std::mem::take(&mut v[c]);
+            for x in &mut t {
+                *x = volts(*x);
+            }
+            let (l, h) = (volts(lo[c] as f64), volts(hi[c] as f64));
+            levels[c] = (l.min(h), l.max(h));
+            traces[c] = Some(t);
+        }
+        traces[MATH] = math_trace(self.p.math, &traces);
+        let dt = per as f64 / self.hw.rate.raw;
+        let mut ms: [Option<Measurements>; 3] = Default::default();
+        for (i, t) in traces.iter().enumerate() {
+            let Some(t) = t.as_ref().filter(|t| t.len() >= 2) else {
+                continue;
+            };
+            let mut m = measure(t, dt);
+            if i < 2 {
+                (m.min, m.max) = levels[i];
+                m.pk_pk = m.max - m.min;
+            }
+            ms[i] = Some(m);
+        }
+        Some(Record {
+            ms,
+            traces,
+            frames,
+            per,
+        })
     }
 
     /// Decimate raw frames up to `to` into points; look for triggers.
     fn scan_chunk(&mut self, ring: &Ring, to: u64) {
         let (d, pre, _) = self.p.window(self.hw.rate.rate);
         let len = capture_len(d) as u64;
-        let screen = d as u64;
+        let screen = (d as u64).max(STATS_MIN);
         let src = self.src;
         let first = self.first;
         let frames = self.frame_pos..to;
@@ -820,44 +1120,71 @@ impl Pipeline {
             pending,
             single_from,
             trigger_log,
+            scan_buf,
             ..
         } = self;
+        // The points of the chunk, per channel; then they go through the
+        // stats and the trigger search in blocks (a sample at a time was
+        // most of the work at the fast time bases).
+        for b in scan_buf.iter_mut() {
+            b.clear();
+        }
+        ring.read(frames, |a, b| {
+            dec.push_means(a, scan_buf);
+            dec.push_means(b, scan_buf);
+        });
+        for c in 0..2 {
+            pts[c] += scan_buf[c].len() as u64;
+        }
         let mut retune = false;
-        let mut cb = |c: usize, _lo: u8, _hi: u8, mean: f64| {
-            pts[c] += 1;
-            let s = &mut stats[c];
-            s.add(mean);
-            if c != src {
-                return;
+        let mut on_edge = |scanner: &mut EdgeScanner, t: f64| {
+            let tf = t.floor() as u64;
+            let ok_start = tf >= first + (pre + MARGIN) as u64;
+            let ok_single = single_from.is_none_or(|a| t >= a);
+            if ok_start && ok_single {
+                let start = tf - (pre + MARGIN) as u64;
+                pending.push_back(Pending { t, start });
+                // Rearm at the end of the capture.
+                scanner.hold_until((start + len) as f64);
+                if let Some(log) = trigger_log.as_mut() {
+                    log.push(t);
+                }
+                if single_from.is_some() {
+                    // One is enough; later edges are not wanted.
+                    scanner.hold_until(f64::INFINITY);
+                }
             }
-            if s.n >= screen {
+        };
+        let n = scan_buf[src].len();
+        let mut at = 0;
+        while at < n {
+            // Up to the end of the stats screen, then the stats roll over.
+            let left = screen.saturating_sub(stats[src].n).max(1);
+            let end = n.min(at + left as usize);
+            for c in 0..2 {
+                let b = &scan_buf[c];
+                if c == src || at < b.len() {
+                    stats[c].add_all(&b[at..end.min(b.len())]);
+                }
+            }
+            for block in scan_buf[src][at..end].chunks(SCAN_BLOCK) {
+                let (lo, hi) = min_max(block);
+                if scanner.skip_block(block.len(), lo, hi, block[block.len() - 1]) {
+                    continue;
+                }
+                for &v in block {
+                    if let Some(t) = scanner.step(v) {
+                        on_edge(scanner, t);
+                    }
+                }
+            }
+            if stats[src].n >= screen {
                 *last_stats = Some(*stats);
                 *stats = [Stats::EMPTY; 2];
                 retune = true;
             }
-            if let Some(t) = scanner.step(mean) {
-                let tf = t.floor() as u64;
-                let ok_start = tf >= first + (pre + MARGIN) as u64;
-                let ok_single = single_from.is_none_or(|a| t >= a);
-                if ok_start && ok_single {
-                    let start = tf - (pre + MARGIN) as u64;
-                    pending.push_back(Pending { t, start });
-                    // Rearm at the end of the capture.
-                    scanner.hold_until((start + len) as f64);
-                    if let Some(log) = trigger_log {
-                        log.push(t);
-                    }
-                    if single_from.is_some() {
-                        // One is enough; later edges are not wanted.
-                        scanner.hold_until(f64::INFINITY);
-                    }
-                }
-            }
-        };
-        ring.read(frames, |a, b| {
-            dec.push(a, &mut cb);
-            dec.push(b, &mut cb);
-        });
+            at = end;
+        }
         if retune {
             self.retune();
         }
@@ -879,7 +1206,7 @@ impl Pipeline {
             let rel = c.t - c.start as f64;
             block.trigger = Some(rel);
             let cut = cut(&block, &self.p, self.ac_mean(), Some(rel));
-            self.avg.add(&cut, self.p.averaging);
+            self.avg.add(&cut, self.p.averaging, self.p.peak);
             self.triggers += 1;
             self.last_trigger = c.t as u64;
             self.last = Some((cut, block, c.t));
@@ -946,9 +1273,10 @@ impl Pipeline {
             return;
         }
         if self.dirty {
+            self.measure_long(ring, single);
             let (cut, block, t) = self.last.as_ref().expect("a capture");
             let v = self.avg.value(cut, self.p.averaging);
-            let frame = frame(
+            let mut frame = frame(
                 &self.p,
                 v.traces,
                 v.peak,
@@ -958,6 +1286,7 @@ impl Pipeline {
                 false,
                 block.clipped,
             );
+            frame.long = self.long.clone();
             self.dirty = false;
             self.last_publish = Some(now);
             out(Box::new(Published {
@@ -991,8 +1320,9 @@ impl Pipeline {
         self.last_status = pts;
         self.last_publish = Some(now);
         let (frame, state) = if auto {
+            self.measure_long(ring, false);
             let c = cut(&block, &self.p, self.ac_mean(), None);
-            let f = frame(
+            let mut f = frame(
                 &self.p,
                 c.traces,
                 c.peak,
@@ -1002,6 +1332,7 @@ impl Pipeline {
                 false,
                 block.clipped,
             );
+            f.long = self.long.clone();
             (Some(f), TrigState::Auto)
         } else {
             (None, TrigState::Waiting)
@@ -1099,10 +1430,23 @@ mod tests {
         piece: usize,
         ring_size: usize,
     ) -> (Pipeline, Vec<Box<Published>>) {
+        run_measuring(cfg, p, bytes, piece, ring_size, MEASURE_TIME)
+    }
+
+    /// [`run`] with a long measurement at most once per `every`.
+    fn run_measuring(
+        cfg: HwConfig,
+        p: ProcSettings,
+        bytes: &[u8],
+        piece: usize,
+        ring_size: usize,
+        every: Duration,
+    ) -> (Pipeline, Vec<Box<Published>>) {
         let ring = Arc::new(Ring::new(ring_size));
         let w = ring.reset(cfg.channels);
         let cal = fake_cal();
         let mut pl = Pipeline::new(1, 1, cfg, &cal, p, 0);
+        pl.min_measure = every;
         pl.min_publish = Duration::ZERO;
         pl.trigger_log = Some(Vec::new());
         let mut got = Vec::new();
@@ -1164,6 +1508,89 @@ mod tests {
                 assert_eq!(pl.triggers(), log.len() as u64 - pl.pending.len() as u64);
             }
         }
+    }
+
+    /// The long measurement of the newest frame with a frame.
+    fn long_of(got: &[Box<Published>]) -> [Option<Measurements>; 3] {
+        got.iter()
+            .rev()
+            .find_map(|p| p.frame.as_ref().and_then(|f| f.long.clone()))
+            .expect("a frame with a long measurement")
+    }
+
+    #[test]
+    fn long_measurement_sees_periods_the_screen_does_not() {
+        // 20 µs/div: the screen holds 200 µs, a fifth of the 1 kHz period.
+        let s = settings(20e-6, 1);
+        let cfg = hw(s.coarse_screen_time(), 2);
+        let fake = FakeScope::new([Wave::CalOut, Wave::CalOut]);
+        let bytes = raw(&fake, &cfg, 1_500_000);
+        let p = ProcSettings::of(&s, 0);
+        let (_, got) = run_measuring(cfg, p, &bytes, 1 << 18, 1 << 24, Duration::ZERO);
+        let f = got.iter().rev().find_map(|p| p.frame.as_ref()).unwrap();
+        // The screen alone has no whole period.
+        let screen = measure(f.traces[0].as_ref().unwrap(), f.dt);
+        assert_eq!(screen.freq, None);
+        let long = long_of(&got);
+        for (c, m) in long[..2].iter().enumerate() {
+            let m = m.as_ref().unwrap();
+            let freq = m.freq.expect("a frequency");
+            assert!((freq - 1000.0).abs() < 5.0, "CH{} {freq}", c + 1);
+            assert!((m.duty.unwrap() - 0.5).abs() < 0.02, "{m:?}");
+            assert!((m.pk_pk - 2.0).abs() < 0.2, "{m:?}");
+            assert!(m.rise.is_some(), "{m:?}");
+        }
+    }
+
+    #[test]
+    fn rise_and_fall_do_not_change_with_the_time_base() {
+        // A 10 kHz sine: 10 % to 90 % takes 2 asin(0.8) / (2 pi f).
+        let want = 2.0 * 0.8f64.asin() / (std::f64::consts::TAU * 1e4);
+        let sine = Wave::Sine {
+            freq: 1e4,
+            amp: 1.5,
+            dc: 0.0,
+        };
+        let mut first: Option<(f64, f64)> = None;
+        for div in [200e-9, 5e-6, 100e-6, 1e-3] {
+            let s = settings(div, 1);
+            let cfg = hw(s.coarse_screen_time(), 2);
+            let fake = FakeScope::new([sine, sine]);
+            let bytes = raw(&fake, &cfg, 1_000_000);
+            let p = ProcSettings::of(&s, 0);
+            let (_, got) = run(cfg, p, &bytes, 1 << 18, 1 << 25);
+            let m = long_of(&got)[0].clone().unwrap();
+            let (rise, fall) = (m.rise.unwrap(), m.fall.unwrap());
+            eprintln!("{div} s/div (x{}): rise {rise:e} fall {fall:e}", cfg.rate.oversample);
+            // Near the theory (top and base come from 8 bit steps) and
+            // the same at every time base.
+            for v in [rise, fall] {
+                assert!((v - want).abs() < 0.05 * want, "{div}: {v:e}, want {want:e}");
+            }
+            let (r0, f0) = *first.get_or_insert((rise, fall));
+            assert!((rise - r0).abs() < 0.01 * r0, "{div}: rise {rise:e}, first {r0:e}");
+            assert!((fall - f0).abs() < 0.01 * f0, "{div}: fall {fall:e}, first {f0:e}");
+        }
+    }
+
+    #[test]
+    fn long_measurement_takes_means_for_slow_signals() {
+        // 100 Hz at 1 µs/div: 4 periods are 40 ms, more points than one
+        // measurement takes, so it measures means of a few points each.
+        let s = settings(1e-6, 1);
+        let mut cfg = hw(s.coarse_screen_time(), 2);
+        cfg.cal_freq = 100;
+        let fake = FakeScope::new([Wave::CalOut, Wave::CalOut]);
+        let frames = (0.06 * cfg.rate.rate * cfg.rate.oversample as f64) as usize;
+        let bytes = raw(&fake, &cfg, frames);
+        let p = ProcSettings::of(&s, 0);
+        let (_, got) = run(cfg, p, &bytes, 1 << 18, 1 << 25);
+        let long = long_of(&got);
+        let m = long[0].as_ref().unwrap();
+        let freq = m.freq.expect("a frequency");
+        assert!((freq - 100.0).abs() < 1.0, "{freq}");
+        // Levels of every point, not of the means.
+        assert!((m.max - 2.0).abs() < 0.1 && m.min.abs() < 0.1, "{m:?}");
     }
 
     #[test]

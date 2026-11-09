@@ -75,10 +75,15 @@ pub fn measure(samples: &[f64], dt: f64) -> Measurements {
     m.period = Some(period * dt);
     m.freq = Some(1.0 / (period * dt));
 
-    // Pulse widths: from each rising edge to the next falling edge.
+    // Pulse widths: from each rising edge to the next falling edge. Both
+    // lists are in order, so one pass finds them (noise has many edges).
     let mut widths = Vec::new();
+    let mut j = 0;
     for &r in &edges.rising {
-        if let Some(&f) = edges.falling.iter().find(|&&f| f > r) {
+        while edges.falling.get(j).is_some_and(|&f| f <= r) {
+            j += 1;
+        }
+        if let Some(&f) = edges.falling.get(j) {
             if f - r < period * 1.5 {
                 widths.push(f - r);
             }
@@ -93,21 +98,84 @@ pub fn measure(samples: &[f64], dt: f64) -> Measurements {
 
     let lo = base + 0.1 * (top - base);
     let hi = base + 0.9 * (top - base);
+    let reach = (period / 2.0).ceil() as usize + 1;
     m.rise = mean_of(
         edges
             .rising
             .iter()
-            .filter_map(|&e| transition(samples, e, lo, hi)),
+            .filter_map(|&e| transition(samples, e, lo, hi, reach)),
     )
     .map(|s| s * dt);
     m.fall = mean_of(
         edges
             .falling
             .iter()
-            .filter_map(|&e| transition(samples, e, hi, lo)),
+            .filter_map(|&e| transition(samples, e, hi, lo, reach)),
     )
     .map(|s| s * dt);
     m
+}
+
+/// Mean 10 % to 90 % rise time and 90 % to 10 % fall time, in samples, of
+/// the edges in `samples` between the levels `(top, base)`: those of a
+/// longer record, so a short piece with only an edge or two works, or
+/// with None the top and base of `samples`. An edge cut off by an end of
+/// `samples` does not count.
+pub fn edge_times(samples: &[f64], levels: Option<(f64, f64)>) -> (Option<f64>, Option<f64>) {
+    let (top, base) = levels.unwrap_or_else(|| {
+        let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        top_base(samples, min, max)
+    });
+    let amp = top - base;
+    if amp.is_nan() || amp <= 0.0 || samples.len() < 2 {
+        return (None, None);
+    }
+    let (lo, hi) = (base + 0.1 * amp, base + 0.9 * amp);
+    let edges = find_edges(samples, base, top);
+    let reach = samples.len();
+    let rise = mean_of(
+        edges
+            .rising
+            .iter()
+            .filter_map(|&e| transition(samples, e, lo, hi, reach)),
+    );
+    let fall = mean_of(
+        edges
+            .falling
+            .iter()
+            .filter_map(|&e| transition(samples, e, hi, lo, reach)),
+    );
+    (rise, fall)
+}
+
+/// Rising and falling edges of `samples` through the middle of `base` and
+/// `top` (with a band of 10 % of the swing against noise), as fractional
+/// sample indexes, in order.
+pub fn edges(samples: &[f64], top: f64, base: f64) -> (Vec<f64>, Vec<f64>) {
+    let e = find_edges(samples, base, top);
+    (e.rising, e.falling)
+}
+
+/// Top and base of a histogram of ADC counts (`hist[count]`), as counts,
+/// like [`top_base`]: the biggest peak (with its neighbours) in the top
+/// and in the bottom 40 % of the range, when it holds 10 % of the samples,
+/// else the highest and lowest count. None for an empty histogram.
+pub fn top_base_counts(hist: &[u64; 256]) -> Option<(usize, usize)> {
+    let lo = hist.iter().position(|&n| n > 0)?;
+    let hi = hist.iter().rposition(|&n| n > 0)?;
+    let n: u64 = hist.iter().sum();
+    let span = hi - lo;
+    let peak = |r: std::ops::Range<usize>| {
+        let bin = r.clone().max_by_key(|&b| hist[b])?;
+        let a = bin.saturating_sub(1).max(r.start);
+        let b = (bin + 1).min(r.end - 1);
+        let count: u64 = hist[a..=b].iter().sum();
+        (count * 10 >= n).then_some(bin)
+    };
+    let top = peak(lo + (span * 6).div_ceil(10)..hi + 1).unwrap_or(hi);
+    let base = peak(lo..lo + span * 4 / 10 + 1).unwrap_or(lo);
+    Some((top, base))
 }
 
 /// Find top and base levels with a histogram. A square wave has two big
@@ -121,7 +189,8 @@ fn top_base(samples: &[f64], min: f64, max: f64) -> (f64, f64) {
     }
     let mut hist = [0usize; BINS];
     for &v in samples {
-        let b = (((v - min) / span) * (BINS - 1) as f64).round() as usize;
+        // + 0.5 and a cut: `round` is a slow library call.
+        let b = (((v - min) / span) * (BINS - 1) as f64 + 0.5) as usize;
         hist[b.min(BINS - 1)] += 1;
     }
     let n = samples.len();
@@ -196,14 +265,17 @@ fn cross(i: usize, prev: f64, v: f64, level: f64) -> f64 {
 }
 
 /// Time in samples for the signal to go from `from` to `to` around the edge
-/// at `edge`. Works for both rising (from < to) and falling edges.
-fn transition(samples: &[f64], edge: f64, from: f64, to: f64) -> Option<f64> {
+/// at `edge`. Works for both rising (from < to) and falling edges. It
+/// looks at most `reach` samples to each side (half a period: an edge
+/// takes no longer, and noise with many edges stays fast).
+fn transition(samples: &[f64], edge: f64, from: f64, to: f64, reach: usize) -> Option<f64> {
     let rising = to > from;
     let past = |v: f64, level: f64| if rising { v >= level } else { v <= level };
     let e = edge.floor() as usize;
     // Walk back to the last sample before the `from` level.
     let mut i = e.min(samples.len() - 1);
-    while i > 0 && past(samples[i], from) {
+    let stop = e.saturating_sub(reach);
+    while i > stop && past(samples[i], from) {
         i -= 1;
     }
     if past(samples[i], from) || i + 1 >= samples.len() {
@@ -212,10 +284,11 @@ fn transition(samples: &[f64], edge: f64, from: f64, to: f64) -> Option<f64> {
     let t_from = cross(i + 1, samples[i], samples[i + 1], from);
     // Walk forward to the first sample past the `to` level.
     let mut j = e + 1;
-    while j < samples.len() && !past(samples[j], to) {
+    let end = samples.len().min(e + 1 + reach);
+    while j < end && !past(samples[j], to) {
         j += 1;
     }
-    if j >= samples.len() || j == 0 {
+    if j >= end || j == 0 {
         return None;
     }
     let t_to = cross(j, samples[j - 1], samples[j], to);

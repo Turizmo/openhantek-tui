@@ -170,6 +170,43 @@ impl EdgeScanner {
         edge
     }
 
+    /// Which side of the level and hysteresis bands `v` is on. Two
+    /// samples in one zone give the same arm state, and no edge is
+    /// between them.
+    #[inline]
+    fn zone(&self, v: f64) -> u8 {
+        let (l, h) = (self.level, self.hysteresis);
+        if v < l - h {
+            0
+        } else if v < l {
+            1
+        } else if v == l {
+            2
+        } else if v <= l + h {
+            3
+        } else {
+            4
+        }
+    }
+
+    /// Take the `n` samples of a block with the lowest `min`, the highest
+    /// `max` and the last `last`, when they can hold no edge and change no
+    /// arm state: all in the zone of the sample before. Returns false (and
+    /// takes nothing) otherwise; then [`EdgeScanner::step`] each sample.
+    #[inline]
+    pub fn skip_block(&mut self, n: usize, min: f64, max: f64, last: f64) -> bool {
+        let Some(prev) = self.prev else {
+            return false;
+        };
+        let z = self.zone(prev);
+        if self.zone(min) != z || self.zone(max) != z {
+            return false;
+        }
+        self.prev = Some(last);
+        self.next += n as u64;
+        true
+    }
+
     /// Take the samples `points`, the first at index `first` (a jump
     /// from [`EdgeScanner::next`] starts the search over there). Stops at
     /// the first edge and returns it; push the rest of the piece (from

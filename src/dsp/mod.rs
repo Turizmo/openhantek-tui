@@ -178,12 +178,14 @@ impl PeakHold {
         };
         let mut lo = l0.clone();
         let mut hi = h0.clone();
+        // Plain compares, which the compiler vectorizes (`f64::min` it
+        // does not): 64 captures of 10 000 points, 30 times a second.
         for (a, b) in &self.window {
-            for (l, v) in lo.iter_mut().zip(a) {
-                *l = l.min(*v);
+            for (l, &v) in lo.iter_mut().zip(a) {
+                *l = if v < *l { v } else { *l };
             }
-            for (h, v) in hi.iter_mut().zip(b) {
-                *h = h.max(*v);
+            for (h, &v) in hi.iter_mut().zip(b) {
+                *h = if v > *h { v } else { *h };
             }
         }
         (lo, hi)
