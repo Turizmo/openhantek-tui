@@ -441,7 +441,8 @@ impl Plot {
         color: Color,
     ) {
         match (style, dots) {
-            (TraceStyle::BrailleThin, _) => self.classic(points, dots, layer, color),
+            (TraceStyle::BrailleThin, false) => self.classic(points, layer, color),
+            (TraceStyle::BrailleThin, true) => self.points(points, layer, color),
             (TraceStyle::BrailleBold, false) => self.trace_run(points, true, layer, color),
             (TraceStyle::BrailleBold, true) => self.points_bold(points, layer, color),
             (TraceStyle::Line, false) => self.text_line(points, layer, color),
@@ -890,8 +891,8 @@ impl Plot {
     /// its low to its high value, so a noisy or steep trace fills its
     /// column. A run is stretched to the row next to where the column
     /// before ended, so the line has no gaps but an edge stays one dot
-    /// column wide. With `dots`, only the low and high points.
-    pub fn classic(&mut self, points: &[(f64, f64)], dots: bool, layer: u8, color: Color) {
+    /// column wide.
+    pub fn classic(&mut self, points: &[(f64, f64)], layer: u8, color: Color) {
         let w = self.dots_w();
         let finite = |p: &&(f64, f64)| p.0.is_finite() && p.1.is_finite();
         let n = points.iter().filter(finite).count();
@@ -913,11 +914,6 @@ impl Plot {
                     continue;
                 };
                 let c = c as i64;
-                if dots {
-                    self.set(c, top, layer, color);
-                    self.set(c, bot, layer, color);
-                    continue;
-                }
                 if let Some((pc, pt, pb)) = prev {
                     // The row of this column next to the run before it.
                     let (from, to) = if top > pb {
@@ -947,7 +943,7 @@ impl Plot {
         let mut prev: Option<(i64, i64)> = None;
         for p in pts.collect::<Vec<_>>() {
             match (p, prev) {
-                (Some(b), Some(a)) if !dots => self.line(a, b, layer, color),
+                (Some(b), Some(a)) => self.line(a, b, layer, color),
                 (Some(b), _) => self.set(b.0, b.1, layer, color),
                 _ => {}
             }
@@ -1882,7 +1878,7 @@ mod tests {
         // high value, so the line is thicker than the thin one.
         let noisy = samples(20_000, |x| 0.3 * (x * 997.0).sin());
         let mut c = Plot::new(6, 3);
-        c.classic(&noisy, false, LAYER_CH1, RED);
+        c.classic(&noisy, LAYER_CH1, RED);
         let mut t = Plot::new(6, 3);
         t.trace(&noisy, LAYER_CH1, RED);
         let dots = |p: &Plot| (0..p.dots_w()).map(|x| column(p, x).len()).sum::<usize>();
@@ -1909,7 +1905,7 @@ mod tests {
             }
         });
         let mut p = Plot::new(cx, ry);
-        p.classic(&sq, false, LAYER_CH1, RED);
+        p.classic(&sq, LAYER_CH1, RED);
         let edge = 4 * ry * 4; // 4 divisions of dot rows
         let tall: Vec<bool> = (0..p.dots_w())
             .map(|x| column(&p, x).len() > edge / 2)
@@ -1929,7 +1925,7 @@ mod tests {
         let df =
             |x: f64| 3.0 * std::f64::consts::TAU / 2.5 * (std::f64::consts::TAU * x / 2.5).cos();
         let mut p = Plot::new(cx, ry);
-        p.classic(&samples(5000, f), false, LAYER_CH1, RED);
+        p.classic(&samples(5000, f), LAYER_CH1, RED);
         let rows_per_col = (4 * ry) as f64 / (2 * cx) as f64;
         let x_of = |c: usize| (c as f64 + 0.5) / (2 * cx) as f64 - 5.0;
         let mut checked = 0;
@@ -1957,25 +1953,35 @@ mod tests {
     }
 
     #[test]
-    fn classic_dots_and_lines() {
+    fn classic_samples_and_lines() {
         // Few points: straight lines between them, or only the points.
         let pts = [(-4.0, 0.0), (0.0, 2.0), (4.0, 0.0)];
         let mut p = Plot::new(4, 2);
-        p.classic(&pts, true, LAYER_CH1, RED);
+        p.styled(&pts, TraceStyle::BrailleThin, true, LAYER_CH1, RED);
         assert_eq!(used_columns(&p).len(), 3);
         let mut p = Plot::new(4, 2);
-        p.classic(&pts, false, LAYER_CH1, RED);
+        p.classic(&pts, LAYER_CH1, RED);
         let cols = used_columns(&p);
         assert_eq!(cols.len(), cols[cols.len() - 1] - cols[0] + 1);
         // A NaN breaks the line.
         let mut q = Plot::new(4, 2);
-        q.classic(
-            &[(-4.0, 0.0), (0.0, f64::NAN), (4.0, 0.0)],
-            false,
-            LAYER_CH1,
-            RED,
-        );
+        q.classic(&[(-4.0, 0.0), (0.0, f64::NAN), (4.0, 0.0)], LAYER_CH1, RED);
         assert_eq!(used_columns(&q).len(), 2);
+    }
+
+    #[test]
+    fn samples_mode_draws_every_sample_in_a_busy_column() {
+        // Many samples in one dot column: low, high and one halfway up an
+        // edge. Samples mode draws all three, not only the low and high.
+        let mut pts = samples(5000, |_| -2.0);
+        let x = pts[2500].0;
+        pts.extend([(x, 2.0), (x, 0.0)]);
+        let mut p = Plot::new(6, 3);
+        p.styled(&pts, TraceStyle::BrailleThin, true, LAYER_CH1, RED);
+        let mid = p.py(0.0).floor() as usize;
+        let col = column(&p, p.px(x).floor() as usize);
+        assert!(col.contains(&mid), "{col:?}");
+        assert_eq!(col.len(), 3, "{col:?}");
     }
 
     #[test]

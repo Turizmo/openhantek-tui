@@ -75,7 +75,6 @@ pub enum Field {
     /// Average / peak / both.
     TraceMode,
     Interpolation,
-    Dots,
     Averaging,
     Persistence,
     Xy,
@@ -237,7 +236,6 @@ pub fn categories() -> Vec<Category> {
             fields: vec![
                 TraceMode,
                 Interpolation,
-                Dots,
                 Averaging,
                 Persistence,
                 Xy,
@@ -414,7 +412,6 @@ impl Field {
             Selected => "Selected trace",
             TraceMode => "Trace mode",
             Interpolation => "Interpolation",
-            Dots => "Dots only",
             Averaging => "Averaging",
             Persistence => "Persistence",
             Xy => "XY mode",
@@ -507,8 +504,7 @@ impl Field {
             MaxAdc => "Highest ADC rate in every mode (scope, roll, logger). The ADC always runs at it; slower rates average its samples. Lower it if the USB link loses data.",
             TraceMode => "average: the mean of the samples behind each point, as a line. peak: the area from the lowest to the highest sample (also over the averaged captures). average + peak: the same line as average, the muted area only around it. Key D.",
             Selected => "The trace the arrow keys, cursors and spectrum use. Key Tab.",
-            Interpolation => "sin(x)/x draws a smooth line through few samples. Key z.",
-            Dots => "Draw only the samples, no lines between them. Key d.",
+            Interpolation => "sin(x)/x: a smooth line through few samples. linear: straight lines. samples only: one dot per sample, no lines. Key z.",
             Averaging => "Average the last N triggers (a sliding window): less noise. Key A.",
             Persistence => "Keep this many old traces on screen, dimmed. Key P.",
             Xy => "Draw CH1 against CH2. Key x.",
@@ -569,7 +565,9 @@ impl Field {
     pub fn kind(self) -> Kind {
         use Field::*;
         match self {
-            ChEnabled(_) | ChInvert(_) | MathEnabled | Dots | Xy | SpecOn | MeasPanel => Kind::Bool,
+            ChEnabled(_) | ChInvert(_) | MathEnabled | Xy | SpecOn | MeasPanel => {
+                Kind::Bool
+            }
             ChOffset(_) | MathOffset | TrigLevel | TrigPosition | CursorPos(_) | CalFreq => {
                 Kind::Number
             }
@@ -619,7 +617,10 @@ impl Field {
                 .iter()
                 .map(|m| m.name().to_string())
                 .collect(),
-            Interpolation => list(&["sin(x)/x", "linear"]),
+            Interpolation => crate::settings::Interpolation::ALL
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect(),
             Averaging => AVERAGING
                 .iter()
                 .map(|n| if *n == 1 { "off".into() } else { n.to_string() })
@@ -744,7 +745,6 @@ impl Field {
             ChEnabled(c) => b(s.channels[c].enabled),
             ChInvert(c) => b(s.channels[c].invert),
             MathEnabled => b(s.math.enabled),
-            Dots => b(s.display.dots),
             Xy => b(s.display.xy),
             SpecOn => b(s.display.spectrum),
             MeasPanel => b(s.display.measurements),
@@ -766,7 +766,10 @@ impl Field {
             Selected => s.selected,
             MaxAdc => s.acquisition.cap_idx(),
             TraceMode => index_of(&crate::settings::TraceMode::ALL, &s.display.trace_mode),
-            Interpolation => b(s.display.interpolation == crate::settings::Interpolation::Linear),
+            Interpolation => index_of(
+                &crate::settings::Interpolation::ALL,
+                &s.display.interpolation,
+            ),
             Averaging => index_of(&AVERAGING, &s.display.averaging),
             Persistence => index_of(&PERSISTENCE, &s.display.persistence),
             Colors => index_of(&ColorMode::ALL, &s.display.colors),
@@ -808,7 +811,6 @@ impl Field {
             ChEnabled(c) => s.channels[c].enabled = on,
             ChInvert(c) => s.channels[c].invert = on,
             MathEnabled => s.math.enabled = on,
-            Dots => s.display.dots = on,
             Xy => s.display.xy = on,
             SpecOn => s.display.spectrum = on,
             MeasPanel => s.display.measurements = on,
@@ -847,11 +849,8 @@ impl Field {
             }
             Selected => s.selected = i.min(2),
             Interpolation => {
-                s.display.interpolation = if on {
-                    crate::settings::Interpolation::Linear
-                } else {
-                    crate::settings::Interpolation::Sinc
-                }
+                let all = crate::settings::Interpolation::ALL;
+                s.display.interpolation = all[i.min(all.len() - 1)]
             }
             Averaging => s.display.averaging = AVERAGING[i.min(AVERAGING.len() - 1)],
             Persistence => s.display.persistence = PERSISTENCE[i.min(PERSISTENCE.len() - 1)],

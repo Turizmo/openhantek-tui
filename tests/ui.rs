@@ -990,13 +990,21 @@ fn every_trace_style_draws_with_dots_persistence_and_interpolation() {
         let mut r = styled_rig(style);
         let base = trace_ink(&r);
         assert!(base > 300, "{style:?}: only {base} dots");
-        // Dots only.
-        r.char('d');
+        // Samples only: z twice (sin(x)/x, linear, samples only).
+        r.char('z');
+        r.char('z');
         r.feed();
-        assert!(r.app.scope.settings.display.dots);
+        assert_eq!(
+            r.app.scope.settings.display.interpolation,
+            Interpolation::Samples
+        );
         let dots = trace_ink(&r);
         assert!(dots > 100, "{style:?} dots: only {dots}");
-        r.char('d');
+        r.char('z');
+        assert_eq!(
+            r.app.scope.settings.display.interpolation,
+            Interpolation::Sinc
+        );
         // Persistence: old traces too.
         r.char('P');
         for _ in 0..4 {
@@ -1087,9 +1095,10 @@ fn box_style_draws_connected_box_lines() {
     let mixed = r.screen(120, 36);
     assert!(braille_dots(&mixed) > 100);
     assert!(mixed.join("").contains('╭'));
-    // Dots mode: a dot per sample.
+    // Samples only (z twice): a dot per sample.
     let mut r = styled_rig(TraceStyle::Box);
-    r.char('d');
+    r.char('z');
+    r.char('z');
     r.feed();
     let dots = r.screen(120, 36).join("\n");
     assert!(dots.matches('•').count() > 100, "{dots}");
@@ -1759,7 +1768,11 @@ fn both_mode_line_looks_like_average_mode() {
         for dots in [false, true] {
             let d = &mut r.app.scope.settings.display;
             d.trace_style = [style; 3];
-            d.dots = dots;
+            d.interpolation = if dots {
+                Interpolation::Samples
+            } else {
+                Interpolation::Sinc
+            };
             d.trace_mode = TraceMode::Average;
             let avg = r.buffer(120, 30);
             r.app.scope.settings.display.trace_mode = TraceMode::Both;

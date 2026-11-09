@@ -441,6 +441,28 @@ pub enum Interpolation {
     /// sin(x)/x, when a screen has few samples.
     #[default]
     Sinc,
+    /// No lines: only the real samples, one dot each. Files from before
+    /// say `samples = true` or `dots = true` (see the config loader).
+    Samples,
+}
+
+impl Interpolation {
+    /// In the order of the `z` key and the settings panel.
+    pub const ALL: [Interpolation; 3] =
+        [Interpolation::Sinc, Interpolation::Linear, Interpolation::Samples];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Interpolation::Sinc => "sin(x)/x",
+            Interpolation::Linear => "linear",
+            Interpolation::Samples => "samples only",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
 }
 
 /// What a trace shows of the raw samples behind each point.
@@ -641,8 +663,6 @@ pub struct DisplaySettings {
     pub averaging: usize,
     /// Number of old traces to keep on screen, dimmed: 0 means off.
     pub persistence: usize,
-    /// Draw dots, not lines.
-    pub dots: bool,
     pub measurements: bool,
     /// Colours: auto, true colour, 256 or 16 colours.
     pub colors: ColorMode,
@@ -676,7 +696,6 @@ impl Default for DisplaySettings {
             interpolation: Interpolation::Sinc,
             averaging: 1,
             persistence: 0,
-            dots: false,
             measurements: true,
             colors: ColorMode::Auto,
             trace_style: [TraceStyle::BrailleThin; 3],
@@ -1173,9 +1192,9 @@ mod tests {
     fn old_files_get_the_classic_styles() {
         // A file from before the style settings: no trace_style, no
         // cursor_style.
-        let text = "[display]\ndots = true\n";
+        let text = "[display]\nxy = true\n";
         let s: Settings = toml::from_str(text).unwrap();
-        assert!(s.display.dots);
+        assert!(s.display.xy);
         assert_eq!(s.display.trace_style, [TraceStyle::BrailleThin; 3]);
         assert_eq!(s.cursors.time_a.style, CursorStyle::Classic);
         // And the grid of the first versions.

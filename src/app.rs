@@ -815,15 +815,9 @@ impl App {
                 s.display.persistence = next_in(&PERSISTENCE, s.display.persistence);
                 self.scope.history.clear();
             }
-            Act::Dots => s.display.dots ^= true,
             Act::TraceMode => s.display.trace_mode = s.display.trace_mode.next(),
             Act::LogTraceMode => s.logger.trace_mode = s.logger.trace_mode.next(),
-            Act::Interpolation => {
-                s.display.interpolation = match s.display.interpolation {
-                    Interpolation::Sinc => Interpolation::Linear,
-                    Interpolation::Linear => Interpolation::Sinc,
-                }
-            }
+            Act::Interpolation => s.display.interpolation = s.display.interpolation.next(),
             Act::MeasurePanel => s.display.measurements ^= true,
             Act::Spectrum => s.display.spectrum ^= true,
             Act::SpectrumZoom => {

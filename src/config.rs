@@ -85,10 +85,9 @@ pub const COMMENTS: &[(&str, &str)] = &[
     ("display.spectrum_zoom", "spectrum span = Nyquist / 2^zoom (0 .. 8)"),
     ("display.window", "FFT window: Rectangular Hann Hamming Blackman FlatTop"),
     ("display.xy", "XY mode: CH1 on x, CH2 on y"),
-    ("display.interpolation", "\"Sinc\" (sin(x)/x) or \"Linear\""),
+    ("display.interpolation", INTERPOLATION_COMMENT),
     ("display.averaging", "captures to average: 1 (off) 2 4 8 16 32 64"),
     ("display.persistence", "old traces kept on screen: 0 (off) 2 4 8 16"),
-    ("display.dots", "draw only the samples"),
     ("display.measurements", "measurement panel on the right"),
     ("display.colors", "Auto TrueColor Ansi256 Ansi16"),
     ("display.trace_style", "CH1, CH2, MATH: BrailleThin BrailleBold Line Box"),
@@ -268,6 +267,7 @@ fn to_table(s: &Settings) -> toml::Table {
 pub fn settings_from_table(user: &toml::Table) -> (Settings, Vec<String>) {
     let mut user = user.clone();
     user.remove("keys");
+    samples_into_interpolation(&mut user);
     axis_from_old_grid(&mut user);
     let mut warnings = Vec::new();
     let defaults = to_table(&Settings::default());
@@ -329,6 +329,84 @@ fn axis_from_old_grid(user: &mut toml::Table) {
         _ => return,
     };
     d.insert("axis_style".into(), toml::Value::String(axis.into()));
+}
+
+/// The comment above `display.interpolation`.
+const INTERPOLATION_COMMENT: &str =
+    "\"Sinc\" (sin(x)/x), \"Linear\" or \"Samples\" (samples only: the real samples, one dot each)";
+
+/// The comment the app wrote above `display.interpolation` before
+/// "Samples" was one of its values.
+const OLD_INTERPOLATION_COMMENT: &str = "\"Sinc\" (sin(x)/x) or \"Linear\"";
+
+/// Old names of the samples-only switch, newest first. It was a setting
+/// in `[display]` and an action in `[keys]` (key `d`). Now it is the
+/// interpolation "Samples", and `z` steps through it.
+const OLD_SAMPLES: [&str; 2] = ["samples", "dots"];
+
+/// Read the old samples-only switch as the interpolation "Samples". A file
+/// with both old names takes the newer one.
+fn samples_into_interpolation(user: &mut toml::Table) {
+    if let Some(toml::Value::Table(d)) = user.get_mut("display") {
+        let old: Vec<toml::Value> = OLD_SAMPLES.iter().filter_map(|k| d.remove(*k)).collect();
+        if old.first().and_then(toml::Value::as_bool) == Some(true) {
+            d.insert(
+                "interpolation".into(),
+                toml::Value::String("Samples".into()),
+            );
+        }
+    }
+    if let Some(toml::Value::Table(k)) = user.get_mut("keys") {
+        for name in OLD_SAMPLES {
+            k.remove(name);
+        }
+    }
+}
+
+/// Move the old samples-only switch in the file into
+/// `display.interpolation`, in place: the old keys and their comments go,
+/// other lines stay. Returns true when the file changed.
+fn samples_into_interpolation_in_doc(doc: &mut DocumentMut) -> bool {
+    let mut changed = false;
+    if let Some(Item::Table(d)) = doc.get_mut("display") {
+        let mut on = None;
+        for name in OLD_SAMPLES {
+            if let Some(item) = d.remove(name) {
+                changed = true;
+                on = on.or(item.as_bool());
+            }
+        }
+        if on == Some(true) {
+            match d.get_mut("interpolation") {
+                Some(Item::Value(v)) => {
+                    let decor = v.decor().clone();
+                    *v = "Samples".into();
+                    *v.decor_mut() = decor;
+                }
+                _ => {
+                    d.insert("interpolation", toml_edit::value("Samples"));
+                }
+            }
+        }
+        if changed {
+            if let Some(mut key) = d.key_mut("interpolation") {
+                let decor = key.leaf_decor_mut();
+                if let Some(pre) = decor.prefix().and_then(|p| p.as_str()) {
+                    let pre = pre.replace(
+                        &format!("# {OLD_INTERPOLATION_COMMENT}\n"),
+                        &format!("# {INTERPOLATION_COMMENT}\n"),
+                    );
+                    decor.set_prefix(pre);
+                }
+            }
+        }
+    }
+    if let Some(Item::Table(k)) = doc.get_mut("keys") {
+        for name in OLD_SAMPLES {
+            changed |= k.remove(name).is_some();
+        }
+    }
+    changed
 }
 
 /// The `[keys]` table as (action, keys) in file order, with warnings for
@@ -512,7 +590,7 @@ pub fn load(path: &Path, old: Option<&Path>) -> Loaded {
     let mut notes = Vec::new();
     match std::fs::read_to_string(path) {
         Ok(text) => {
-            let doc: DocumentMut = match text.parse() {
+            let mut doc: DocumentMut = match text.parse() {
                 Ok(d) => d,
                 Err(e) => {
                     let first = e.to_string();
@@ -530,7 +608,16 @@ pub fn load(path: &Path, old: Option<&Path>) -> Loaded {
                     };
                 }
             };
-            let table: toml::Table = toml::from_str(&text).unwrap_or_default();
+            if samples_into_interpolation_in_doc(&mut doc) {
+                match write_atomic(path, &doc.to_string()) {
+                    Ok(()) => notes.push(format!(
+                        "Moved display.samples into display.interpolation in {}",
+                        path.display()
+                    )),
+                    Err(e) => warnings.push(format!("Cannot write {}: {e:#}", path.display())),
+                }
+            }
+            let table: toml::Table = toml::from_str(&doc.to_string()).unwrap_or_default();
             let (settings, w) = settings_from_table(&table);
             warnings.extend(w);
             let (keys, w) = keys_table(&doc);
@@ -556,6 +643,7 @@ pub fn load(path: &Path, old: Option<&Path>) -> Loaded {
                     .map_err(anyhow::Error::from)
                     .and_then(|t| toml::from_str::<toml::Table>(&t).map_err(Into::into))
                     .and_then(|mut t| {
+                        samples_into_interpolation(&mut t);
                         axis_from_old_grid(&mut t);
                         Settings::deserialize(t).map_err(Into::into)
                     }) {
@@ -980,7 +1068,7 @@ mod tests {
             l.notes
         );
         assert_eq!(l.settings.selected, 1);
-        assert!(l.settings.display.dots);
+        assert_eq!(l.settings.display.interpolation, Interpolation::Samples);
         // The old file is left as it was.
         assert_eq!(std::fs::read_to_string(&old).unwrap(), old_text);
         // The new file has the values, the new cursor format and the keys.
@@ -988,7 +1076,8 @@ mod tests {
         assert!(l2.notes.iter().all(|n| !n.contains("settings.toml")));
         let s = &l2.settings;
         assert_eq!(s.selected, 1);
-        assert!(s.display.dots && s.cursors.time_a.enabled && s.cursors.time_b.enabled);
+        assert_eq!(s.display.interpolation, Interpolation::Samples);
+        assert!(s.cursors.time_a.enabled && s.cursors.time_b.enabled);
         assert_eq!(s.cursors.time_a.style, CursorStyle::Fine);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("[keys]") && text.contains("[cursors.time_a]"));
@@ -1000,6 +1089,54 @@ mod tests {
         assert!(!dir2.join("config.toml").exists());
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    #[test]
+    fn old_samples_switch_becomes_the_interpolation_in_place() {
+        let dir = temp_dir("samples");
+        let path = dir.join("config.toml");
+        let old = format!(
+            "[display]\n# {OLD_INTERPOLATION_COMMENT}\ninterpolation = \"Linear\" # mine\nxy = false\n# samples mode: draw only the real samples, one dot each\nsamples = true\nmeasurements = true\n\n[keys]\nquit = \"q\"\n# samples / lines\nsamples = \"F9\"\nhelp = \"?\"\n"
+        );
+        std::fs::write(&path, old).unwrap();
+        let l = load(&path, None);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert!(
+            l.notes.iter().any(|n| n.contains("display.interpolation")),
+            "{:?}",
+            l.notes
+        );
+        assert_eq!(l.settings.display.interpolation, Interpolation::Samples);
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Same place and own comment; the app's comment is the new one.
+        assert_eq!(
+            text,
+            format!(
+                "[display]\n# {INTERPOLATION_COMMENT}\ninterpolation = \"Samples\" # mine\nxy = false\nmeasurements = true\n\n[keys]\nquit = \"q\"\nhelp = \"?\"\n"
+            )
+        );
+        // Loading again changes nothing.
+        let l = load(&path, None);
+        assert!(
+            l.notes.is_empty() && l.warnings.is_empty(),
+            "{:?} {:?}",
+            l.notes,
+            l.warnings
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        // Off (and the older name `dots`) keeps the interpolation.
+        std::fs::write(&path, "[display]\ninterpolation = \"Linear\"\ndots = false\n").unwrap();
+        let l = load(&path, None);
+        assert_eq!(l.settings.display.interpolation, Interpolation::Linear);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[display]\ninterpolation = \"Linear\"\n"
+        );
+        // Both old names: the newer one counts.
+        std::fs::write(&path, "[display]\nsamples = false\ndots = true\n").unwrap();
+        let l = load(&path, None);
+        assert_eq!(l.settings.display.interpolation, Interpolation::Sinc);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

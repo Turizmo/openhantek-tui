@@ -290,7 +290,8 @@ fn layer_of(s: &Settings, t: usize) -> u8 {
 }
 
 /// Screen points of a trace, in divisions, in time order. Few samples get
-/// sin(x)/x points between them. With `dots`, only the real samples.
+/// sin(x)/x points between them. With `dots` (samples mode), only the
+/// real samples.
 pub fn trace_points(
     frame: &Frame,
     t: usize,
@@ -347,11 +348,10 @@ fn grid(plot: &mut Plot, s: &Settings, pal: &Palette) {
 
 fn draw_line(plot: &mut Plot, frame: &Frame, t: usize, s: &Settings, layer: u8, color: Color) {
     let style = s.display.trace_style[t];
-    // Braille thin shows the same points with and without dots, like the
-    // first version did: sin(x)/x points too.
-    let dots = s.display.dots && style != TraceStyle::BrailleThin;
-    let pts = trace_points(frame, t, s, plot.dots_w(), dots);
-    plot.styled(&pts, style, s.display.dots, layer, color);
+    // Samples mode: only the real samples, one mark each, in every style.
+    let samples = s.display.interpolation == Interpolation::Samples;
+    let pts = trace_points(frame, t, s, plot.dots_w(), samples);
+    plot.styled(&pts, style, samples, layer, color);
 }
 
 /// The peak area of trace `t` per dot column: the high and low value in
@@ -1000,7 +1000,7 @@ fn draw_xy(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     };
     let mut plot = Plot::new(g.cx, g.ry);
     grid(&mut plot, s, pal);
-    if s.display.dots {
+    if s.display.interpolation == Interpolation::Samples {
         plot.points(&points, plot::LAYER_TOP, pal.xy);
     } else {
         plot.polyline(&points, plot::LAYER_TOP, pal.xy);
@@ -1408,11 +1408,10 @@ fn draw_time_line(f: &mut TermFrame, app: &App, area: Rect) {
     if s.display.persistence > 0 {
         parts.push(text(format!("Pers {}", s.display.persistence)));
     }
-    if s.display.interpolation == Interpolation::Linear {
-        parts.push(text("Linear".into()));
-    }
-    if s.display.dots {
-        parts.push(text("Dots".into()));
+    match s.display.interpolation {
+        Interpolation::Sinc => {}
+        Interpolation::Linear => parts.push(text("Linear".into())),
+        Interpolation::Samples => parts.push(text("Samples only".into())),
     }
     parts.push(text(format!("Cal out {}", fmt_si(s.cal_freq as f64, "Hz"))));
     let mut spans = Vec::new();
