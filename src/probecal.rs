@@ -169,7 +169,7 @@ impl ProbeCal {
         ch.invert = false;
         s.math.enabled = false;
         s.display.xy = false;
-        s.display.spectrum = false;
+        s.display.spectrum = crate::settings::SpectrumView::Off;
         s.display.averaging = 8;
         s.display.persistence = 0;
         s.display.trace_mode = TraceMode::Average;

@@ -147,6 +147,12 @@ pub struct Plot {
     /// Layers up to this one render with the DIM modifier (the older old
     /// traces in 16 colours). 0: none.
     dim_upto: u8,
+    /// Layers that render with the DIM modifier on their own (a dim trace
+    /// in 16 colours), one bit per layer.
+    dim_layers: [u64; 4],
+    /// Layers that render with the BOLD modifier (a bright trace in 16
+    /// colours), one bit per layer.
+    bold_layers: [u64; 4],
 }
 
 impl Plot {
@@ -162,12 +168,32 @@ impl Plot {
             rows,
             cells: vec![Cell::default(); cols * rows],
             dim_upto: 0,
+            dim_layers: [0; 4],
+            bold_layers: [0; 4],
         }
     }
 
     /// Show the cells of layers up to `layer` with the DIM modifier.
     pub fn dim_upto(&mut self, layer: u8) {
         self.dim_upto = layer;
+    }
+
+    /// Show the cells of `layer` with the DIM modifier.
+    pub fn dim_layer(&mut self, layer: u8) {
+        self.dim_layers[layer as usize / 64] |= 1 << (layer % 64);
+    }
+
+    fn is_dim_layer(&self, layer: u8) -> bool {
+        self.dim_layers[layer as usize / 64] & (1 << (layer % 64)) != 0
+    }
+
+    /// Show the cells of `layer` with the BOLD modifier.
+    pub fn bold_layer(&mut self, layer: u8) {
+        self.bold_layers[layer as usize / 64] |= 1 << (layer % 64);
+    }
+
+    fn is_bold_layer(&self, layer: u8) -> bool {
+        self.bold_layers[layer as usize / 64] & (1 << (layer % 64)) != 0
     }
 
     /// Dot columns and dot rows.
@@ -1156,12 +1182,15 @@ impl Plot {
                     let pos = (area.x + col as u16, area.y + row as u16);
                     if let Some(cell) = buf.cell_mut(pos) {
                         cell.set_char(c).set_fg(color);
+                        let drawn = src.dots != 0 || src.glyph.is_some();
                         let faint = src.layer != 0
-                            && src.layer <= self.dim_upto
-                            && (src.dots != 0 || src.glyph.is_some());
-                        let grid = src.dots == 0 && src.glyph.is_none();
-                        if faint || (grid && src.text_dim) {
+                            && (src.layer <= self.dim_upto || self.is_dim_layer(src.layer))
+                            && drawn;
+                        if faint || (!drawn && src.text_dim) {
                             cell.modifier.insert(ratatui::style::Modifier::DIM);
+                        }
+                        if src.layer != 0 && drawn && self.is_bold_layer(src.layer) {
+                            cell.modifier.insert(ratatui::style::Modifier::BOLD);
                         }
                     }
                 }
@@ -2405,6 +2434,23 @@ mod tests {
         p.render(&mut buf, area);
         assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
         assert!(!buf[(1, 0)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn dim_and_bold_trace_layers() {
+        use ratatui::style::Modifier;
+        let mut p = Plot::new(4, 2);
+        p.set(0, 0, LAYER_CH1, RED);
+        p.set(2, 0, LAYER_CH2, BLUE);
+        p.set(4, 0, LAYER_MATH, BLUE);
+        p.bold_layer(LAYER_CH1);
+        p.dim_layer(LAYER_CH2);
+        let area = Rect::new(0, 0, p.cols as u16, p.rows as u16);
+        let mut buf = Buffer::empty(area);
+        p.render(&mut buf, area);
+        assert_eq!(buf[(0, 0)].modifier, Modifier::BOLD);
+        assert_eq!(buf[(1, 0)].modifier, Modifier::DIM);
+        assert_eq!(buf[(2, 0)].modifier, Modifier::empty());
     }
 
     #[test]

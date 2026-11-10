@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::dsp::fft::Window;
 use crate::dsp::math::MathMode;
 use crate::dsp::trigger::Slope;
-use crate::theme::ColorMode;
+use crate::theme::{ColorMode, ColorTheme, TraceColor};
 
 /// Screen grid: 10 divisions wide, 8 divisions high, like a real scope.
 pub const H_DIVS: f64 = 10.0;
@@ -21,7 +21,7 @@ pub const TIME_DIVS: [f64; 27] = [
 pub const VOLT_DIVS: [f64; 9] = [0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0];
 
 /// Time per division where roll mode starts. Slower screens scroll.
-pub const ROLL_FROM: f64 = 100e-3;
+pub const ROLL_FROM: f64 = 500e-3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Coupling {
@@ -62,6 +62,10 @@ pub struct ChannelSettings {
     /// the step below and this one; 1 = the step itself. The hardware gain
     /// is the one of the step, so the range covers the screen.
     pub volts_fine: f64,
+    /// Time shift of the trace on screen, in seconds: + moves it right
+    /// (later). It lines up two signals or takes out a probe delay. Only
+    /// the drawing moves: measurements use the real sample times.
+    pub deskew: f64,
 }
 
 impl Default for ChannelSettings {
@@ -74,6 +78,7 @@ impl Default for ChannelSettings {
             probe: 1,
             invert: false,
             volts_fine: 1.0,
+            deskew: 0.0,
         }
     }
 }
@@ -465,6 +470,37 @@ impl Interpolation {
     }
 }
 
+/// Where the spectrum (FFT) is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SpectrumView {
+    /// No spectrum.
+    #[default]
+    Off,
+    /// Below the time view, which keeps the top part of the screen.
+    Split,
+    /// The whole plot area, with no time view.
+    Full,
+}
+
+impl SpectrumView {
+    /// In the order of the `f` key and the settings panel. Files from
+    /// before say `spectrum = true` or `false` (see the config loader).
+    pub const ALL: [SpectrumView; 3] = [SpectrumView::Off, SpectrumView::Split, SpectrumView::Full];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SpectrumView::Off => "off",
+            SpectrumView::Split => "split",
+            SpectrumView::Full => "full",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
+
 /// What a trace shows of the raw samples behind each point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TraceMode {
@@ -651,8 +687,8 @@ pub const AXIS_EXTENT_DEFAULT: GridExtent = GridExtent::Full;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DisplaySettings {
-    /// Show the spectrum below the time view.
-    pub spectrum: bool,
+    /// Spectrum off, below the time view, or on the whole plot area.
+    pub spectrum: SpectrumView,
     /// Spectrum span is the Nyquist frequency divided by 2^zoom.
     pub spectrum_zoom: u32,
     pub window: Window,
@@ -666,6 +702,18 @@ pub struct DisplaySettings {
     pub measurements: bool,
     /// Colours: auto, true colour, 256 or 16 colours.
     pub colors: ColorMode,
+    /// Where the colours come from: the terminal, or our light or dark
+    /// set.
+    pub colortheme: ColorTheme,
+    /// Colour of CH1, CH2 and MATH: an ANSI colour or RGB.
+    pub trace_colors: [TraceColor; 3],
+    /// Brightness of CH1, CH2 and MATH in percent (-100 to 100). Below 0
+    /// the trace fades toward the background, above 0 it stands out more
+    /// (toward the lightness of the text colour).
+    pub trace_brightness: [i16; 3],
+    /// Saturation of CH1, CH2 and MATH in percent (0 to 400): 0 is gray,
+    /// 100 the colour itself.
+    pub trace_saturation: [u16; 3],
     /// How CH1, CH2 and MATH are drawn (also in the spectrum).
     pub trace_style: [TraceStyle; 3],
     /// Mean line, peak area or both (scope and log view).
@@ -689,7 +737,7 @@ pub struct DisplaySettings {
 impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
-            spectrum: false,
+            spectrum: SpectrumView::Off,
             spectrum_zoom: 0,
             window: Window::Hann,
             xy: false,
@@ -698,6 +746,10 @@ impl Default for DisplaySettings {
             persistence: 0,
             measurements: true,
             colors: ColorMode::Auto,
+            colortheme: ColorTheme::Terminal,
+            trace_colors: TraceColor::DEFAULTS,
+            trace_brightness: [0; 3],
+            trace_saturation: [100; 3],
             trace_style: [TraceStyle::BrailleThin; 3],
             trace_mode: TraceMode::Average,
             cursor_style: None,
@@ -710,6 +762,11 @@ impl Default for DisplaySettings {
         }
     }
 }
+
+/// Highest trace brightness, in percent. The lowest is minus this.
+pub const TRACE_BRIGHTNESS_MAX: i16 = 100;
+/// Highest trace saturation, in percent.
+pub const TRACE_SATURATION_MAX: u16 = 400;
 
 /// Averaging steps for the `A` key.
 pub const AVERAGING: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
@@ -1007,6 +1064,16 @@ impl Settings {
         );
         self.math.offset = finite_or(self.math.offset, 0.0).clamp(-half_v, half_v);
         fine(&TIME_DIVS, &mut self.time_idx, &mut self.time_fine);
+        let max_skew = self.max_deskew();
+        for ch in &mut self.channels {
+            ch.deskew = finite_or(ch.deskew, 0.0).clamp(-max_skew, max_skew);
+        }
+        for t in 0..3 {
+            self.display.trace_brightness[t] = self.display.trace_brightness[t]
+                .clamp(-TRACE_BRIGHTNESS_MAX, TRACE_BRIGHTNESS_MAX);
+            self.display.trace_saturation[t] =
+                self.display.trace_saturation[t].min(TRACE_SATURATION_MAX);
+        }
         self.trigger.source = self.trigger.source.min(1);
         self.trigger.level = finite_or(self.trigger.level, 0.0);
         self.trigger.position = finite_or(self.trigger.position, 0.5).clamp(0.0, 1.0);
@@ -1062,6 +1129,11 @@ impl Settings {
         self.calibration.sanitize();
     }
 
+    /// Largest deskew either way, in seconds: one screen width.
+    pub fn max_deskew(&self) -> f64 {
+        self.screen_time()
+    }
+
     /// Time per division, with the fine factor.
     pub fn time_per_div(&self) -> f64 {
         self.coarse_time_per_div() * self.time_fine
@@ -1112,6 +1184,20 @@ fn finite_or(v: f64, default: f64) -> f64 {
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
+
+    #[test]
+    fn spectrum_view_cycles() {
+        let mut v = SpectrumView::default();
+        assert_eq!(v, SpectrumView::Off);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            v = v.next();
+            seen.push(v);
+        }
+        use SpectrumView::*;
+        assert_eq!(seen, [Split, Full, Off, Split]);
+    }
+
     use super::*;
 
     #[test]
@@ -1126,6 +1212,20 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_clamps_deskew_to_one_screen() {
+        let mut s = Settings::default();
+        s.channels[0].deskew = 1.0;
+        s.channels[1].deskew = f64::NAN;
+        s.sanitize();
+        // 1 ms/div: one screen is 10 ms.
+        assert!((s.channels[0].deskew - 10e-3).abs() < 1e-12);
+        assert_eq!(s.channels[1].deskew, 0.0);
+        s.channels[0].deskew = -2e-3;
+        s.sanitize();
+        assert_eq!(s.channels[0].deskew, -2e-3);
+    }
+
+    #[test]
     fn sanitize_fixes_bad_values() {
         let mut s = Settings::default();
         s.time_idx = 999;
@@ -1137,6 +1237,8 @@ mod tests {
         s.cal_freq = 12345;
         s.display.averaging = 0;
         s.display.grid_brightness = 255;
+        s.display.trace_brightness = [101, -50, -255];
+        s.display.trace_saturation = [401, 0, 999];
         s.selected = 9;
         s.sanitize();
         assert_eq!(s.time_idx, TIME_DIVS.len() - 1);
@@ -1148,6 +1250,8 @@ mod tests {
         assert_eq!(s.cal_freq, 1000);
         assert_eq!(s.display.averaging, 1);
         assert_eq!(s.display.grid_brightness, 100);
+        assert_eq!(s.display.trace_brightness, [100, -50, -100]);
+        assert_eq!(s.display.trace_saturation, [400, 0, 400]);
         assert_eq!(s.selected, 2);
     }
 
@@ -1163,7 +1267,7 @@ mod tests {
     #[test]
     fn roll_mode_on_slow_time_base() {
         let mut s = Settings::default();
-        s.time_idx = TIME_DIVS.iter().position(|t| *t == 100e-3).unwrap();
+        s.time_idx = TIME_DIVS.iter().position(|t| *t == 500e-3).unwrap();
         assert!(s.roll());
         s.time_idx -= 1;
         assert!(!s.roll());

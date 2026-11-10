@@ -17,9 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Size of the ring the scope streams into: 64 MiB, 2 s at the top USB
-/// rate (32 MB/s). The longest capture (50 ms/div, 500 ms) is 16 MB.
-pub const STREAM_RING: usize = 1 << 26;
+/// Size of the ring the scope streams into: 128 MiB, 4 s at the top USB
+/// rate (32 MB/s). The longest capture (200 ms/div, 2 s) is 64 MB.
+pub const STREAM_RING: usize = 1 << 27;
 
 /// Most transfer marks kept for the reader.
 const MARKS_MAX: usize = 8192;
@@ -118,7 +118,7 @@ impl Ring {
     pub fn new(size: usize) -> Self {
         assert!(size.is_power_of_two() && size >= 2, "ring size {size}");
         // `vec![0; n]` asks the OS for zeroed pages, which it maps only
-        // when they are used: cheap, also for 64 MiB.
+        // when they are used: cheap, also for 128 MiB.
         let buf: Vec<UnsafeCell<u8>> = {
             let v = vec![0u8; size];
             // SAFETY: UnsafeCell<u8> has the same layout as u8.
@@ -368,6 +368,26 @@ impl Ring {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// The longest triggered screen (the step below roll mode) fits in
+    /// the ring at the top USB rate, with 1 s to spare for the transfers
+    /// in flight and the processing behind.
+    #[test]
+    fn ring_holds_the_longest_triggered_screen() {
+        use crate::device::protocol::{raw_rate_of_id, ADC_CAPS};
+        use crate::settings::{H_DIVS, ROLL_FROM, TIME_DIVS};
+        let slowest = TIME_DIVS
+            .iter()
+            .copied()
+            .filter(|t| *t < ROLL_FROM * 0.999)
+            .fold(0.0, f64::max);
+        let top = ADC_CAPS
+            .iter()
+            .map(|&(two, one)| (raw_rate_of_id(two) * 2.0).max(raw_rate_of_id(one)))
+            .fold(0.0, f64::max);
+        let need = (slowest * H_DIVS + 1.0) * top;
+        assert!(need <= STREAM_RING as f64, "{need} > {STREAM_RING}");
+    }
 
     fn ring(size: usize, ch: u8) -> (Arc<Ring>, Writer) {
         let r = Arc::new(Ring::new(size));

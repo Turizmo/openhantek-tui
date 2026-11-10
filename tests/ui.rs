@@ -123,12 +123,71 @@ fn help_overlay_lists_keys_and_closes() {
     r.char('?');
     assert!(r.app.help);
     let t = r.text(120, 40);
-    assert!(t.contains("Keys · any key closes"));
+    assert!(t.contains("Keys · / filter · any key closes"));
     assert!(t.contains("autoset"));
     assert!(t.contains("trigger mode"));
     r.char('x'); // any key closes, and does nothing else
     assert!(!r.app.help);
     assert!(!r.app.scope.settings.display.xy);
+}
+
+#[test]
+fn help_filter_keys() {
+    let mut r = rig();
+    r.char('?');
+    // All keys go to the filter while it is typed: no shortcut fires.
+    r.char('/');
+    assert!(r.app.help_typing);
+    for c in "XYa".chars() {
+        r.char(c);
+    }
+    assert_eq!(r.app.help_filter, "XYa");
+    assert!(!r.app.scope.settings.display.xy && !r.app.quit);
+    r.char('q');
+    assert!(!r.app.quit && r.app.help);
+    r.key(KeyCode::Backspace);
+    r.key(KeyCode::Backspace);
+    r.key(KeyCode::Backspace);
+    assert_eq!(r.app.help_filter, "X");
+    // Esc while typing clears the filter, the help stays open.
+    r.key(KeyCode::Esc);
+    assert!(r.app.help && !r.app.help_typing && r.app.help_filter.is_empty());
+    // Enter ends typing and keeps the filter; the screen shows it.
+    r.char('/');
+    for c in "auto".chars() {
+        r.char(c);
+    }
+    r.key(KeyCode::Enter);
+    assert!(r.app.help && !r.app.help_typing);
+    assert_eq!(r.app.help_filter, "auto");
+    let t = r.text(120, 40);
+    assert!(t.contains("autoset") && t.contains("/auto"), "{t}");
+    assert!(!t.contains("run / stop"), "{t}");
+    // `/` edits the filter again.
+    r.char('/');
+    r.char('x');
+    assert_eq!(r.app.help_filter, "autox");
+    assert!(r.text(120, 40).contains("no match"));
+    r.key(KeyCode::Enter);
+    // Esc closes the help and drops the filter.
+    r.key(KeyCode::Esc);
+    assert!(!r.app.help && r.app.help_filter.is_empty());
+    r.char('?');
+    assert!(r.text(120, 40).contains("trigger mode"));
+}
+
+#[test]
+fn help_filter_resets_the_scroll() {
+    let mut r = rig();
+    r.char('?');
+    r.screen(80, 24);
+    assert!(r.app.help_max.get() > 0);
+    r.char('j');
+    r.char('j');
+    assert_eq!(r.app.help_scroll, 2);
+    r.char('/');
+    r.char('e');
+    assert_eq!(r.app.help_scroll, 0);
 }
 
 #[test]
@@ -216,6 +275,28 @@ fn spectrum_view_shows_the_peak() {
     assert!(r.text(150, 44).contains("Spectrum · Hamming"));
     r.char('F');
     assert!(r.text(150, 44).contains("0..250 kHz"));
+    // f steps on: off, split, full, off.
+    assert_eq!(r.app.scope.settings.display.spectrum, SpectrumView::Split);
+    r.char('f');
+    assert_eq!(r.app.scope.settings.display.spectrum, SpectrumView::Full);
+    // Full: one box from the top row, with no time view. The scope title
+    // stays on top; the spectrum title moves to the bottom border.
+    let full = r.screen(150, 44);
+    assert!(
+        full[0].contains("TESTSCOPE") && full[0].contains("RUN"),
+        "{}",
+        full[0]
+    );
+    let spec: Vec<usize> = (0..full.len())
+        .filter(|&y| full[y].contains("Spectrum · Hamming"))
+        .collect();
+    assert_eq!(spec.len(), 1);
+    assert!(full[spec[0]].starts_with('└'), "{}", full[spec[0]]);
+    assert!(full[spec[0] + 1].contains("CH1 "), "{}", full[spec[0] + 1]);
+    assert!(!full.iter().any(|l| l.contains("-5ms")));
+    r.char('f');
+    assert_eq!(r.app.scope.settings.display.spectrum, SpectrumView::Off);
+    assert!(!r.text(150, 44).contains("Spectrum ·"));
 }
 
 #[test]
@@ -281,6 +362,24 @@ fn cursor_readout() {
     r.app.scope.settings.cursors.time_b.enabled = false;
     let t = r.text(150, 40);
     assert!(meas_row(&t, "ΔT").is_none() && meas_row(&t, "A t").is_some());
+}
+
+#[test]
+fn deskew_shows_in_the_status_and_moves_the_cursor_value() {
+    let mut r = rig();
+    // Cursor A 0.25 div left of the trigger point: 0.25 ms at 1 ms/div.
+    r.app.scope.settings.cursors.time_a.enabled = true;
+    r.app.scope.settings.cursors.time_a.position = -0.25;
+    let before = ui::value_at_cursor(&r.app, 0, 0).unwrap();
+    // CH1 drawn 0.25 ms later: cursor A at the trigger point reads it.
+    r.app.scope.settings.cursors.time_a.position = 0.0;
+    r.app.scope.settings.channels[0].deskew = 0.25e-3;
+    let after = ui::value_at_cursor(&r.app, 0, 0).unwrap();
+    assert!((before - after).abs() < 1e-9, "{before} {after}");
+    let t = r.text(150, 40);
+    assert!(t.contains("CH1 1 V/div DC x1 skew +250 µs"), "{t}");
+    assert!(t.contains("CH2 1 V/div DC x1 "), "{t}");
+    assert!(!t.contains("CH2 1 V/div DC x1 skew"), "{t}");
 }
 
 #[test]
@@ -398,14 +497,17 @@ fn trigger_level_out_of_range_is_red_and_explained() {
     let mut r = rig();
     r.app.scope.settings.trigger.level = 1.0;
     r.feed();
+    // The screen sends the colours the way the palette does.
+    let pal = openhantek_tui::theme::Palette::of(&r.app.scope.settings.display);
+    let out = pal.named(ui::TRIGGER_OUT_OF_RANGE);
     let normal = trigger_mark_colour(&r);
-    assert_ne!(normal, ui::TRIGGER_OUT_OF_RANGE);
+    assert_ne!(normal, out);
     assert!(!r.text(120, 40).contains("out of range"));
     // 20 mV/div: the input covers only about ±0.5 V.
     r.app.scope.settings.channels[0].volt_idx = 0;
     r.feed();
     r.feed();
-    assert_eq!(trigger_mark_colour(&r), ui::TRIGGER_OUT_OF_RANGE);
+    assert_eq!(trigger_mark_colour(&r), out);
     let text = r.text(120, 40);
     let line = text
         .lines()
@@ -661,24 +763,124 @@ fn persistence_fades_old_frames_by_age() {
 fn trace_colours_follow_the_colour_setting() {
     use openhantek_tui::theme::ColorMode;
     use ratatui::style::Color;
+    use ratatui::style::Modifier;
     let mut r = rig();
-    for (mode, want) in [
-        (ColorMode::TrueColor, Color::Rgb(255, 214, 10)),
-        (ColorMode::Ansi256, Color::Indexed(220)),
-        (ColorMode::Ansi16, Color::LightYellow),
+    use openhantek_tui::theme::{adjust, xterm_index, DARK};
+    // (mode, CH1 brightness, colour, modifier). The test terminal does
+    // not tell its colours, so the dark preset is in use: RGB, or the
+    // nearest 256-colour index. 16 colours send the name; -50 % and down
+    // is the DIM modifier, +50 % and up BOLD.
+    let y = DARK.ansi[11];
+    let dimmed = adjust(y, DARK.bg, DARK.fg, -40, 100);
+    let brighter = adjust(y, DARK.bg, DARK.fg, 40, 100);
+    let none = Modifier::empty();
+    for (mode, bright, want, m) in [
+        (ColorMode::TrueColor, 0, Color::Rgb(y.0, y.1, y.2), none),
+        (ColorMode::Ansi256, 0, Color::Indexed(xterm_index(y)), none),
+        (ColorMode::Ansi16, 0, Color::LightYellow, none),
+        (
+            ColorMode::TrueColor,
+            -40,
+            Color::Rgb(dimmed.0, dimmed.1, dimmed.2),
+            none,
+        ),
+        (
+            ColorMode::TrueColor,
+            40,
+            Color::Rgb(brighter.0, brighter.1, brighter.2),
+            none,
+        ),
+        (ColorMode::Ansi16, -40, Color::LightYellow, none),
+        (ColorMode::Ansi16, 40, Color::LightYellow, none),
+        (ColorMode::Ansi16, -60, Color::LightYellow, Modifier::DIM),
+        (ColorMode::Ansi16, 60, Color::LightYellow, Modifier::BOLD),
     ] {
         r.app.scope.settings.display.colors = mode;
+        r.app.scope.settings.display.trace_brightness[0] = bright;
         let mut term = Terminal::new(TestBackend::new(140, 40)).unwrap();
         term.draw(|f| ui::draw(f, &r.app)).unwrap();
         let buf = term.backend().buffer();
-        let found = buf.content().iter().any(|c| {
-            c.fg == want
-                && c.symbol()
-                    .chars()
-                    .all(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch))
-        });
-        assert!(found, "{mode:?}: no CH1 braille in {want:?}");
+        let braille: Vec<_> = buf
+            .content()
+            .iter()
+            .filter(|c| {
+                c.fg == want
+                    && c.symbol()
+                        .chars()
+                        .all(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch))
+            })
+            .collect();
+        assert!(!braille.is_empty(), "{mode:?} {bright}: no CH1 braille in {want:?}");
+        assert!(
+            braille.iter().all(|c| c.modifier == m),
+            "{mode:?} {bright}"
+        );
     }
+}
+
+#[test]
+fn a_preset_sends_no_colour_names() {
+    use openhantek_tui::theme::{ColorMode, ColorTheme};
+    use ratatui::style::Color;
+    let mut r = rig();
+    r.char('s');
+    for theme in [ColorTheme::Light, ColorTheme::Dark] {
+        for (mode, rgb) in [(ColorMode::TrueColor, true), (ColorMode::Ansi256, false)] {
+            r.app.scope.settings.display.colortheme = theme;
+            r.app.scope.settings.display.colors = mode;
+            let buf = r.buffer(140, 40);
+            for c in buf.content() {
+                for col in [c.fg, c.bg] {
+                    let ok = match col {
+                        Color::Reset => true,
+                        Color::Rgb(..) => rgb,
+                        Color::Indexed(_) => !rgb,
+                        _ => false,
+                    };
+                    assert!(ok, "{theme:?} {mode:?}: {col:?} at {:?}", c.symbol());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_trace_colour_override_is_used_everywhere() {
+    use openhantek_tui::theme::{ColorMode, TraceColor};
+    use ratatui::style::Color;
+    let mut r = rig();
+    r.app.scope.settings.display.colors = ColorMode::TrueColor;
+    r.app.scope.settings.display.trace_colors[0] = TraceColor::Rgb((255, 0, 255));
+    r.char('f');
+    let want = Color::Rgb(255, 0, 255);
+    let buf = r.buffer(140, 40);
+    let w = buf.area.width;
+    let row = |y: u16| -> String { (0..w).map(|x| buf[(x, y)].symbol()).collect() };
+    let fg_of = |text: &str| -> Vec<Color> {
+        let mut out = Vec::new();
+        for y in 0..buf.area.height {
+            if let Some(i) = row(y).find(text) {
+                let x = row(y)[..i].chars().count() as u16;
+                out.push(buf[(x, y)].fg);
+            }
+        }
+        out
+    };
+    // The channel line, the ground marker and the measurement heading.
+    assert!(fg_of("CH1 1 V/div").contains(&want), "{:?}", fg_of("CH1 1 V/div"));
+    let ch1 = fg_of("CH1");
+    assert!(ch1.iter().filter(|c| **c == want).count() >= 2, "{ch1:?}");
+    assert!(fg_of("1▸").contains(&want), "{:?}", fg_of("1▸"));
+    // CH2 keeps its own colour.
+    let ch2 = openhantek_tui::theme::Palette::of(&r.app.scope.settings.display).trace[1];
+    assert!(fg_of("CH2 1 V/div").contains(&ch2));
+    // Braille of the trace in both views.
+    let n = buf
+        .content()
+        .iter()
+        .filter(|c| c.fg == want && c.symbol().chars().all(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch)))
+        .count();
+    assert!(n > 50, "{n}");
 }
 
 #[test]
@@ -1179,8 +1381,9 @@ fn each_cursor_has_its_own_style_and_colour() {
             }
         }
     }
-    assert_eq!(colours.get("B"), Some(&Color::LightGreen), "{colours:?}");
-    assert_eq!(colours.get("A"), Some(&Color::White), "{colours:?}");
+    let pal = openhantek_tui::theme::Palette::of(&r.app.scope.settings.display);
+    assert_eq!(colours.get("B"), Some(&pal.named(Color::LightGreen)), "{colours:?}");
+    assert_eq!(colours.get("A"), Some(&pal.named(Color::White)), "{colours:?}");
 }
 
 #[test]
@@ -1188,9 +1391,13 @@ fn settings_panel_changes_trace_style_live() {
     let mut r = rig();
     let before = r.screen(140, 40);
     r.char('s');
-    // Channel 1 › Style is the last item.
+    // Channel 1 › Style is above the last three (Colour, Brightness,
+    // Saturation).
     r.char('l');
     r.char('G');
+    r.char('k');
+    r.char('k');
+    r.char('k');
     assert!(r.text(140, 40).contains("Settings · Channel 1 › Style"));
     r.char('l');
     r.char('j');
@@ -1536,9 +1743,9 @@ fn measure_cursors_heading_is_right_aligned_in_the_value_colour() {
         let vy = lines.iter().position(|s| s.contains("│ΔT ") || s.contains("ΔT ")).unwrap();
         let head = buf[(right(hy, "Cursors") as u16, hy as u16)].style().fg;
         let value = buf[(right(vy, "ms") as u16, vy as u16)].style().fg;
-        let pal = Palette::for_setting(r.app.scope.settings.display.colors);
+        let pal = Palette::of(&r.app.scope.settings.display);
         assert_eq!(head, value, "{w}x{h}");
-        assert_eq!(head, Some(ui::cursor_section_color(&r.app.scope.settings, &pal)));
+        assert_eq!(head, Some(pal.named(ui::cursor_section_color(&r.app.scope.settings, &pal))));
         l.columns
     };
     let mut r = rig();
@@ -1551,7 +1758,7 @@ fn measure_cursors_heading_is_right_aligned_in_the_value_colour() {
         r.app.scope.settings.cursors.get_mut(i).color = CursorColor::Green;
     }
     check(&r, 150, 60);
-    let pal = Palette::for_setting(r.app.scope.settings.display.colors);
+    let pal = Palette::of(&r.app.scope.settings.display);
     assert_eq!(
         ui::cursor_section_color(&r.app.scope.settings, &pal),
         ratatui::style::Color::LightGreen
@@ -1626,7 +1833,7 @@ fn help_fits_at_80x24_and_120x40_without_alt_rows_or_cut_words() {
     // 120x40 shows it all at once, 80x24 scrolls.
     let mut r = rig();
     r.char('?');
-    assert!(r.text(120, 40).contains("Keys · any key closes"));
+    assert!(r.text(120, 40).contains("Keys · / filter · any key closes"));
     assert!(r.text(80, 24).contains("j k PgUp PgDn scroll"));
     // Scrolling keys do not close the help, other keys do.
     r.char('j');
@@ -1687,7 +1894,7 @@ fn trace_mode_draws_the_peak_area() {
     r.char('D');
     assert_eq!(r.app.scope.settings.display.trace_mode, TraceMode::Both);
     let buf = r.buffer(120, 30);
-    let pal = openhantek_tui::theme::Palette::for_setting(r.app.scope.settings.display.colors);
+    let pal = openhantek_tui::theme::Palette::of(&r.app.scope.settings.display);
     let count = |c: ratatui::style::Color| {
         buf.content()
             .iter()
@@ -1763,7 +1970,7 @@ fn both_mode_line_looks_like_average_mode() {
     r.app.scope.settings.channels[0].offset = 0.0;
     r.feed();
     r.feed();
-    let pal = openhantek_tui::theme::Palette::for_setting(r.app.scope.settings.display.colors);
+    let pal = openhantek_tui::theme::Palette::of(&r.app.scope.settings.display);
     for style in TraceStyle::ALL {
         for dots in [false, true] {
             let d = &mut r.app.scope.settings.display;

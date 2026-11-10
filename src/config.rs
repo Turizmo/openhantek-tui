@@ -54,6 +54,7 @@ pub const COMMENTS: &[(&str, &str)] = &[
     ("channels.probe", "probe factor: 1 or 10"),
     ("channels.invert", "turn the trace upside down"),
     ("channels.volts_fine", "fine volts/div (Alt-↑ ↓): factor on the volt_idx step, 1 = the step"),
+    ("channels.deskew", "time shift of the trace on screen in seconds, + = right (at most one screen width)"),
     ("math.enabled", "math trace on / off"),
     ("math.mode", "Add Sub SubRev Mul Div Avg NegCh1 NegCh2"),
     ("math.volt_idx", "units/div: index like channels.volt_idx"),
@@ -81,7 +82,7 @@ pub const COMMENTS: &[(&str, &str)] = &[
     ("cursors.volt_b.position", "divisions from the screen center (-4 .. 4)"),
     ("cursors.volt_b.style", "\"Classic\", \"Fine\", \"Solid\" or \"Dotted\""),
     ("cursors.volt_b.color", "Grey White Yellow Cyan Magenta Green Red Blue"),
-    ("display.spectrum", "spectrum (FFT) below the time view"),
+    ("display.spectrum", SPECTRUM_COMMENT),
     ("display.spectrum_zoom", "spectrum span = Nyquist / 2^zoom (0 .. 8)"),
     ("display.window", "FFT window: Rectangular Hann Hamming Blackman FlatTop"),
     ("display.xy", "XY mode: CH1 on x, CH2 on y"),
@@ -89,7 +90,11 @@ pub const COMMENTS: &[(&str, &str)] = &[
     ("display.averaging", "captures to average: 1 (off) 2 4 8 16 32 64"),
     ("display.persistence", "old traces kept on screen: 0 (off) 2 4 8 16"),
     ("display.measurements", "measurement panel on the right"),
-    ("display.colors", "Auto TrueColor Ansi256 Ansi16"),
+    ("display.colors", "how many colours to send: Auto (TrueColor when COLORTERM says so, else Ansi256) TrueColor Ansi256 Ansi16"),
+    ("display.colortheme", "where the colours come from: Terminal (the terminal's own colours; a preset when it does not tell them) Light Dark (our own colours, sent as RGB)"),
+    ("display.trace_colors", TRACE_COLORS_COMMENT),
+    ("display.trace_brightness", TRACE_BRIGHTNESS_COMMENT),
+    ("display.trace_saturation", "CH1, CH2, MATH: saturation in percent, 0 (gray) .. 400; 100 = the colour itself; a colour stops changing at the most vivid shade the screen can show (no effect in 16 colours)"),
     ("display.trace_style", "CH1, CH2, MATH: BrailleThin BrailleBold Line Box"),
     ("display.trace_mode", "\"Average\" (mean line), \"Peak\" (min..max area) or \"Both\" (line over muted area)"),
     ("display.grid_style", "Dots Dashed Solid Crosses None"),
@@ -268,7 +273,10 @@ pub fn settings_from_table(user: &toml::Table) -> (Settings, Vec<String>) {
     let mut user = user.clone();
     user.remove("keys");
     samples_into_interpolation(&mut user);
+    spectrum_from_bool(&mut user);
     axis_from_old_grid(&mut user);
+    auto_trace_colors(&mut user);
+    brightness_from_dim(&mut user);
     let mut warnings = Vec::new();
     let defaults = to_table(&Settings::default());
     let known: Vec<String> = leaves(&defaults)
@@ -407,6 +415,213 @@ fn samples_into_interpolation_in_doc(doc: &mut DocumentMut) -> bool {
         }
     }
     changed
+}
+
+/// The comment above `display.trace_colors`.
+const TRACE_COLORS_COMMENT: &str = "CH1, CH2, MATH: \"#rrggbb\" or a terminal colour: black red green yellow blue magenta cyan gray dark-gray bright-red bright-green bright-yellow bright-blue bright-magenta bright-cyan white";
+
+/// The comment the app wrote above `display.trace_colors` when "auto"
+/// was one of its values.
+const OLD_TRACE_COLORS_COMMENT: &str = "CH1, CH2, MATH: \"auto\", \"#rrggbb\" or a terminal colour: black red green yellow blue magenta cyan gray dark-gray bright-red bright-green bright-yellow bright-blue bright-magenta bright-cyan white";
+
+/// True for the old trace colour "auto" (the colour mode's own colour).
+fn is_auto_colour(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "auto" | "default" | ""
+    )
+}
+
+/// Read the old trace colour "auto" as the default colour of its trace.
+fn auto_trace_colors(user: &mut toml::Table) {
+    let Some(toml::Value::Table(d)) = user.get_mut("display") else {
+        return;
+    };
+    let Some(toml::Value::Array(a)) = d.get_mut("trace_colors") else {
+        return;
+    };
+    for (v, default) in a.iter_mut().zip(crate::theme::TraceColor::DEFAULTS) {
+        if v.as_str().is_some_and(is_auto_colour) {
+            *v = toml::Value::String(default.name());
+        }
+    }
+}
+
+/// Change the old trace colour "auto" in the file into the default
+/// colour of its trace, in place: the values and the app's old comment
+/// change, other lines stay. Returns true when the file changed.
+fn auto_trace_colors_in_doc(doc: &mut DocumentMut) -> bool {
+    let Some(Item::Table(d)) = doc.get_mut("display") else {
+        return false;
+    };
+    let Some(Item::Value(toml_edit::Value::Array(a))) = d.get_mut("trace_colors") else {
+        return false;
+    };
+    let mut changed = false;
+    for (v, default) in a.iter_mut().zip(crate::theme::TraceColor::DEFAULTS) {
+        if v.as_str().is_some_and(is_auto_colour) {
+            let decor = v.decor().clone();
+            *v = default.name().into();
+            *v.decor_mut() = decor;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Some(mut key) = d.key_mut("trace_colors") {
+            let decor = key.leaf_decor_mut();
+            if let Some(pre) = decor.prefix().and_then(|p| p.as_str()) {
+                let pre = pre.replace(
+                    &format!("# {OLD_TRACE_COLORS_COMMENT}\n"),
+                    &format!("# {TRACE_COLORS_COMMENT}\n"),
+                );
+                decor.set_prefix(pre);
+            }
+        }
+    }
+    changed
+}
+
+/// The comment above `display.trace_brightness`.
+const TRACE_BRIGHTNESS_COMMENT: &str = "CH1, CH2, MATH: brightness in percent, -100 .. 100: + stands out more from the background (toward the text colour), - fades toward it (16 colours: 50 and up draws the trace bold, -50 and down dim)";
+
+/// The comment the app wrote above `display.trace_dim`, the dimness that
+/// is now a brightness below 0.
+const OLD_TRACE_DIM_COMMENT: &str = "CH1, CH2, MATH: dimness in percent, 0 .. 100: the share of the way to the background (16 colours: 50 and up draws the trace dim)";
+
+/// The brightness of an old dimness: dimness `d` is brightness `-d`.
+/// Anything that is not a number stays, so loading warns about it.
+fn brightness_of_dim(v: &toml::Value) -> toml::Value {
+    match v {
+        toml::Value::Integer(d) => toml::Value::Integer(-(*d).clamp(0, 100)),
+        toml::Value::Array(a) => toml::Value::Array(a.iter().map(brightness_of_dim).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Read the old `display.trace_dim` as `display.trace_brightness`. A file
+/// with both takes the brightness.
+fn brightness_from_dim(user: &mut toml::Table) {
+    if let Some(toml::Value::Table(d)) = user.get_mut("display") {
+        if let Some(dim) = d.remove("trace_dim") {
+            if !d.contains_key("trace_brightness") {
+                d.insert("trace_brightness".into(), brightness_of_dim(&dim));
+            }
+        }
+    }
+}
+
+/// Change the old `display.trace_dim` in the file into
+/// `display.trace_brightness`, in place: the key keeps its place, its
+/// values change sign, and the app's old comment becomes the new one.
+/// Other lines stay. A file with both loses the old key. Returns true
+/// when the file changed.
+fn brightness_from_dim_in_doc(doc: &mut DocumentMut) -> bool {
+    let Some(Item::Table(d)) = doc.get_mut("display") else {
+        return false;
+    };
+    if !d.contains_key("trace_dim") {
+        return false;
+    }
+    if d.contains_key("trace_brightness") {
+        d.remove("trace_dim");
+        return true;
+    }
+    // Take every entry out and put it back in order, the old key renamed.
+    let names: Vec<String> = d.iter().map(|(k, _)| k.to_string()).collect();
+    let entries: Vec<(toml_edit::Key, Item)> =
+        names.iter().filter_map(|k| d.remove_entry(k)).collect();
+    for (key, mut item) in entries {
+        if key.get() != "trace_dim" {
+            d.insert_formatted(&key, item);
+            continue;
+        }
+        if let Item::Value(v) = &mut item {
+            negate_dim(v);
+        }
+        let mut decor = key.leaf_decor().clone();
+        if let Some(pre) = decor.prefix().and_then(|p| p.as_str()) {
+            let pre = pre.replace(
+                &format!("# {OLD_TRACE_DIM_COMMENT}\n"),
+                &format!("# {TRACE_BRIGHTNESS_COMMENT}\n"),
+            );
+            decor.set_prefix(pre);
+        }
+        let new = toml_edit::Key::new("trace_brightness").with_leaf_decor(decor);
+        d.insert_formatted(&new, item);
+    }
+    true
+}
+
+/// Dimness `d` in the file becomes `-d`, with its own formatting kept.
+fn negate_dim(v: &mut toml_edit::Value) {
+    match v {
+        toml_edit::Value::Array(a) => a.iter_mut().for_each(negate_dim),
+        toml_edit::Value::Integer(i) => {
+            let decor = i.decor().clone();
+            let mut n = toml_edit::Formatted::new(-(*i.value()).clamp(0, 100));
+            *n.decor_mut() = decor;
+            *i = n;
+        }
+        _ => {}
+    }
+}
+
+/// The comment above `display.spectrum`.
+const SPECTRUM_COMMENT: &str =
+    "spectrum (FFT): \"Off\", \"Split\" (below the time view) or \"Full\" (the whole plot area)";
+
+/// The comment the app wrote above `display.spectrum` when it was a
+/// switch.
+const OLD_SPECTRUM_COMMENT: &str = "spectrum (FFT) below the time view";
+
+/// The spectrum view of the old switch: on is "Split", off is "Off".
+fn spectrum_view_of(on: bool) -> &'static str {
+    if on {
+        "Split"
+    } else {
+        "Off"
+    }
+}
+
+/// Read the old spectrum switch (`spectrum = true` or `false`) as a view.
+fn spectrum_from_bool(user: &mut toml::Table) {
+    if let Some(toml::Value::Table(d)) = user.get_mut("display") {
+        if let Some(on) = d.get("spectrum").and_then(toml::Value::as_bool) {
+            d.insert(
+                "spectrum".into(),
+                toml::Value::String(spectrum_view_of(on).into()),
+            );
+        }
+    }
+}
+
+/// Change the old spectrum switch in the file into a view, in place: the
+/// value and the app's old comment change, other lines stay. Returns true
+/// when the file changed.
+fn spectrum_from_bool_in_doc(doc: &mut DocumentMut) -> bool {
+    let Some(Item::Table(d)) = doc.get_mut("display") else {
+        return false;
+    };
+    let Some(Item::Value(v)) = d.get_mut("spectrum") else {
+        return false;
+    };
+    let Some(on) = v.as_bool() else {
+        return false;
+    };
+    let decor = v.decor().clone();
+    *v = spectrum_view_of(on).into();
+    *v.decor_mut() = decor;
+    if let Some(mut key) = d.key_mut("spectrum") {
+        let decor = key.leaf_decor_mut();
+        if let Some(pre) = decor.prefix().and_then(|p| p.as_str()) {
+            let pre = pre.replace(
+                &format!("# {OLD_SPECTRUM_COMMENT}\n"),
+                &format!("# {SPECTRUM_COMMENT}\n"),
+            );
+            decor.set_prefix(pre);
+        }
+    }
+    true
 }
 
 /// The `[keys]` table as (action, keys) in file order, with warnings for
@@ -617,6 +832,33 @@ pub fn load(path: &Path, old: Option<&Path>) -> Loaded {
                     Err(e) => warnings.push(format!("Cannot write {}: {e:#}", path.display())),
                 }
             }
+            if spectrum_from_bool_in_doc(&mut doc) {
+                match write_atomic(path, &doc.to_string()) {
+                    Ok(()) => notes.push(format!(
+                        "Changed display.spectrum from on / off to a view in {}",
+                        path.display()
+                    )),
+                    Err(e) => warnings.push(format!("Cannot write {}: {e:#}", path.display())),
+                }
+            }
+            if auto_trace_colors_in_doc(&mut doc) {
+                match write_atomic(path, &doc.to_string()) {
+                    Ok(()) => notes.push(format!(
+                        "Changed \"auto\" in display.trace_colors to the default colours in {}",
+                        path.display()
+                    )),
+                    Err(e) => warnings.push(format!("Cannot write {}: {e:#}", path.display())),
+                }
+            }
+            if brightness_from_dim_in_doc(&mut doc) {
+                match write_atomic(path, &doc.to_string()) {
+                    Ok(()) => notes.push(format!(
+                        "Changed display.trace_dim into display.trace_brightness (dimness 40 is brightness -40) in {}",
+                        path.display()
+                    )),
+                    Err(e) => warnings.push(format!("Cannot write {}: {e:#}", path.display())),
+                }
+            }
             let table: toml::Table = toml::from_str(&doc.to_string()).unwrap_or_default();
             let (settings, w) = settings_from_table(&table);
             warnings.extend(w);
@@ -644,7 +886,10 @@ pub fn load(path: &Path, old: Option<&Path>) -> Loaded {
                     .and_then(|t| toml::from_str::<toml::Table>(&t).map_err(Into::into))
                     .and_then(|mut t| {
                         samples_into_interpolation(&mut t);
+                        spectrum_from_bool(&mut t);
                         axis_from_old_grid(&mut t);
+                        auto_trace_colors(&mut t);
+                        brightness_from_dim(&mut t);
                         Settings::deserialize(t).map_err(Into::into)
                     }) {
                     Ok(s) => {
@@ -1004,6 +1249,227 @@ mod tests {
     }
 
     #[test]
+    fn deskew_is_saved_into_channels_made_before_it() {
+        let dir = temp_dir("deskew");
+        let path = dir.join("config.toml");
+        // A file of an older version: no deskew in [[channels]].
+        let c = comment_for("channels.deskew").unwrap();
+        let text = generate(&Settings::default());
+        let line = format!("# {c}\ndeskew = 0.0\n");
+        assert_eq!(text.matches(&line).count(), 2, "{text}");
+        let old = text.replace(&line, "");
+        std::fs::write(&path, &old).unwrap();
+        let l = load(&path, None);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert_eq!(l.settings, Settings::default());
+        let target = l.save.unwrap();
+        let mut s = l.settings.clone();
+        s.channels[1].deskew = -2.5e-4;
+        assert_eq!(save(&target, &s).unwrap(), Saved::Written);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains(&format!("# {c}\ndeskew = -0.00025")), "{after}");
+        let back = load(&path, None);
+        assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+        assert_eq!(back.settings, s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trace_colours_round_trip_and_go_into_old_files() {
+        use crate::theme::TraceColor;
+        let dir = temp_dir("colours");
+        let path = dir.join("config.toml");
+        // A file of an older version: no trace_colors, trace_brightness
+        // or trace_saturation.
+        let text = generate(&Settings::default());
+        let line = |key: &str, value: &str| {
+            let c = comment_for(&format!("display.{key}")).unwrap();
+            format!("# {c}\n{key} = {value}\n")
+        };
+        let colours = line(
+            "trace_colors",
+            "[\"bright-yellow\", \"bright-blue\", \"bright-magenta\"]",
+        );
+        let dim = line("trace_brightness", "[0, 0, 0]");
+        let sat = line("trace_saturation", "[100, 100, 100]");
+        let mut old = text.clone();
+        for l in [&colours, &dim, &sat] {
+            assert_eq!(text.matches(l.as_str()).count(), 1, "{l}\n{text}");
+            old = old.replace(l.as_str(), "");
+        }
+        std::fs::write(&path, old).unwrap();
+        let l = load(&path, None);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert_eq!(l.settings, Settings::default());
+        let target = l.save.unwrap();
+        let mut s = l.settings.clone();
+        s.display.trace_colors = [
+            TraceColor::Rgb((255, 0, 255)),
+            TraceColor::Ansi(11),
+            TraceColor::Ansi(13),
+        ];
+        s.display.trace_brightness = [-40, 60, 0];
+        s.display.trace_saturation = [100, 380, 100];
+        assert_eq!(save(&target, &s).unwrap(), Saved::Written);
+        let after = std::fs::read_to_string(&path).unwrap();
+        for want in [
+            line(
+                "trace_colors",
+                "[\"#ff00ff\", \"bright-yellow\", \"bright-magenta\"]",
+            ),
+            line("trace_brightness", "[-40, 60, 0]"),
+            line("trace_saturation", "[100, 380, 100]"),
+        ] {
+            assert!(after.contains(&want), "{want}\n{after}");
+        }
+        let back = load(&path, None);
+        assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+        assert_eq!(back.settings, s);
+        // A bad colour: a warning and the defaults.
+        let bad = after.replace("\"#ff00ff\"", "\"#ff00\"");
+        std::fs::write(&path, bad).unwrap();
+        let l = load(&path, None);
+        assert_eq!(l.warnings.len(), 1, "{:?}", l.warnings);
+        assert!(l.warnings[0].contains("trace_colors"), "{:?}", l.warnings);
+        assert_eq!(l.settings.display.trace_colors, TraceColor::DEFAULTS);
+        // Too high values are clamped.
+        let t: toml::Table = toml::from_str(
+            "[display]\ntrace_brightness = [150, -150, 0]\ntrace_saturation = [500, 0, 0]\n",
+        )
+        .unwrap();
+        let (mut s, w) = settings_from_table(&t);
+        assert!(w.is_empty(), "{w:?}");
+        s.sanitize();
+        assert_eq!(s.display.trace_brightness, [100, -100, 0]);
+        assert_eq!(s.display.trace_saturation, [400, 0, 0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trace_dim_becomes_brightness_in_place() {
+        let dir = temp_dir("trace-dim");
+        let path = dir.join("config.toml");
+        // The file as the app wrote it, with dimness on CH1 and MATH and a
+        // note of the user's own.
+        let text = generate(&Settings::default());
+        let new = format!("# {TRACE_BRIGHTNESS_COMMENT}\ntrace_brightness = [0, 0, 0]\n");
+        let old = format!("# {OLD_TRACE_DIM_COMMENT}\ntrace_dim = [40, 0, 150] # mine\n");
+        assert_eq!(text.matches(new.as_str()).count(), 1, "{text}");
+        std::fs::write(&path, text.replace(&new, &old)).unwrap();
+        let l = load(&path, None);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert!(
+            l.notes.iter().any(|n| n.contains("display.trace_brightness")),
+            "{:?}",
+            l.notes
+        );
+        assert_eq!(l.settings.display.trace_brightness, [-40, 0, -100]);
+        // The key keeps its place and the user's note; the comment is the
+        // new one; nothing else changes.
+        let after = std::fs::read_to_string(&path).unwrap();
+        let want = format!("# {TRACE_BRIGHTNESS_COMMENT}\ntrace_brightness = [-40, 0, -100] # mine\n");
+        assert_eq!(after, text.replace(&new, &want));
+        assert!(!after.contains("trace_dim"), "{after}");
+        // Loading again changes nothing.
+        let again = load(&path, None);
+        assert!(again.notes.is_empty(), "{:?}", again.notes);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        // A file with both: the brightness wins, the old key goes.
+        let both = after.replace(&want, &format!("{want}trace_dim = [10, 10, 10]\n"));
+        std::fs::write(&path, both).unwrap();
+        let l = load(&path, None);
+        assert_eq!(l.settings.display.trace_brightness, [-40, 0, -100]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        // The table path and an old settings.toml read it the same way.
+        let t: toml::Table = toml::from_str("[display]\ntrace_dim = [40, 0, 0]\n").unwrap();
+        let (s, w) = settings_from_table(&t);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.display.trace_brightness, [-40, 0, 0]);
+        let old_file = dir.join("settings.toml");
+        std::fs::write(&old_file, "[display]\ntrace_dim = [0, 60, 0]\n").unwrap();
+        let fresh = dir.join("fresh.toml");
+        let l = load(&fresh, Some(&old_file));
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert_eq!(l.settings.display.trace_brightness, [0, -60, 0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn auto_trace_colours_become_the_defaults_in_place() {
+        let dir = temp_dir("auto-colours");
+        let path = dir.join("config.toml");
+        let old = format!(
+            "[display]\n# {OLD_TRACE_COLORS_COMMENT}\ntrace_colors = [\"auto\", \"red\", \"Auto\"] # mine\n"
+        );
+        std::fs::write(&path, old).unwrap();
+        let l = load(&path, None);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert!(
+            l.notes.iter().any(|n| n.contains("display.trace_colors")),
+            "{:?}",
+            l.notes
+        );
+        use crate::theme::TraceColor;
+        assert_eq!(
+            l.settings.display.trace_colors,
+            [TraceColor::Ansi(11), TraceColor::Ansi(1), TraceColor::Ansi(13)]
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "[display]\n# {TRACE_COLORS_COMMENT}\ntrace_colors = [\"bright-yellow\", \"red\", \"bright-magenta\"] # mine\n"
+            )
+        );
+        // Loading again changes nothing.
+        let l = load(&path, None);
+        assert!(l.notes.is_empty() && l.warnings.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        // A table, as from an old settings file, reads "auto" too.
+        let t: toml::Table =
+            toml::from_str("[display]\ntrace_colors = [\"auto\", \"auto\", \"auto\"]\n").unwrap();
+        let (s, w) = settings_from_table(&t);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.display.trace_colors, TraceColor::DEFAULTS);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn colour_theme_round_trips_and_goes_into_old_files() {
+        use crate::theme::ColorTheme;
+        let dir = temp_dir("colortheme");
+        let path = dir.join("config.toml");
+        let text = generate(&Settings::default());
+        let c = comment_for("display.colortheme").unwrap();
+        let line = |v: &str| format!("# {c}\ncolortheme = \"{v}\"\n");
+        assert_eq!(text.matches(&line("Terminal")).count(), 1, "{text}");
+        // A file of an older version has no colortheme.
+        std::fs::write(&path, text.replace(&line("Terminal"), "")).unwrap();
+        let l = load(&path, None);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert_eq!(l.settings.display.colortheme, ColorTheme::Terminal);
+        for theme in [ColorTheme::Light, ColorTheme::Dark, ColorTheme::Terminal] {
+            let l = load(&path, None);
+            let mut s = l.settings.clone();
+            s.display.colortheme = theme;
+            save(&l.save.unwrap(), &s).unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            let name = format!("{theme:?}");
+            assert!(after.contains(&line(&name)), "{after}");
+            let back = load(&path, None);
+            assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+            assert_eq!(back.settings, s);
+        }
+        // A bad value: a warning and the default.
+        let after = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, after.replace("\"Terminal\"", "\"Blue\"")).unwrap();
+        let l = load(&path, None);
+        assert_eq!(l.warnings.len(), 1, "{:?}", l.warnings);
+        assert_eq!(l.settings.display.colortheme, ColorTheme::Terminal);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn every_setting_goes_into_an_old_minimal_file() {
         let old = "# my old file\ncal_freq = 1000\n\n[keys]\nquit = \"q\"\n";
         let mut doc: DocumentMut = old.parse().unwrap();
@@ -1089,6 +1555,62 @@ mod tests {
         assert!(!dir2.join("config.toml").exists());
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    #[test]
+    fn old_spectrum_switch_becomes_a_view_in_place() {
+        let dir = temp_dir("spectrum");
+        let path = dir.join("config.toml");
+        let old = format!(
+            "[display]\n# {OLD_SPECTRUM_COMMENT}\nspectrum = true # mine\nspectrum_zoom = 2\n"
+        );
+        std::fs::write(&path, old).unwrap();
+        let l = load(&path, None);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert!(
+            l.notes.iter().any(|n| n.contains("display.spectrum")),
+            "{:?}",
+            l.notes
+        );
+        assert_eq!(l.settings.display.spectrum, SpectrumView::Split);
+        assert_eq!(l.settings.display.spectrum_zoom, 2);
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Same place and own comment; the app's comment is the new one.
+        assert_eq!(
+            text,
+            format!(
+                "[display]\n# {SPECTRUM_COMMENT}\nspectrum = \"Split\" # mine\nspectrum_zoom = 2\n"
+            )
+        );
+        // Loading again changes nothing.
+        let l = load(&path, None);
+        assert!(
+            l.notes.is_empty() && l.warnings.is_empty(),
+            "{:?} {:?}",
+            l.notes,
+            l.warnings
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        // Off becomes "Off"; a view already in the file stays.
+        std::fs::write(&path, "[display]\nspectrum = false\n").unwrap();
+        assert_eq!(
+            load(&path, None).settings.display.spectrum,
+            SpectrumView::Off
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[display]\nspectrum = \"Off\"\n"
+        );
+        std::fs::write(&path, "[display]\nspectrum = \"Full\"\n").unwrap();
+        let l = load(&path, None);
+        assert!(l.notes.is_empty() && l.warnings.is_empty());
+        assert_eq!(l.settings.display.spectrum, SpectrumView::Full);
+        // A table, as from an old settings file, reads the switch too.
+        let t: toml::Table = toml::from_str("[display]\nspectrum = true\n").unwrap();
+        let (s, w) = settings_from_table(&t);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.display.spectrum, SpectrumView::Split);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

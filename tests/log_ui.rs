@@ -572,7 +572,7 @@ fn raw_log_in_the_log_view_and_csv() {
 #[test]
 fn log_view_both_mode_line_looks_like_average_mode() {
     let (mut app, dir) = app_with_log("both-line");
-    let pal = openhantek_tui::theme::Palette::for_setting(app.scope.settings.display.colors);
+    let pal = openhantek_tui::theme::Palette::of(&app.scope.settings.display);
     let buffer = |app: &App| {
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| ui::draw(f, app)).unwrap();

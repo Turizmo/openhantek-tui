@@ -201,6 +201,7 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         let yd = |x: f32| (x as f64 / scale + offset).clamp(-half_v, half_v);
         let layer = layer_of(s, t);
         let band_layer = plot::LAYER_BAND + if t == s.selected { 3 } else { 2 - t as u8 };
+        super::trace_layer_modifier(&mut plot, pal, t, &[layer, band_layer]);
         // The mean: a point per dot column, or (zoomed in past one step
         // per dot column) a point in the middle of each step, joined.
         let pts: Vec<(f64, f64)> = cols
@@ -462,7 +463,7 @@ pub fn draw_log_status(f: &mut TermFrame, app: &App, areas: [Rect; 3], pal: &Pal
         ),
         None => Line::styled(
             " V scope · r rec · ←→ PgUp PgDn scroll · +- zoom · F whole · Home End · v hlHL cursors · E export · t time · ? help",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(pal.hint),
         ),
     };
     f.render_widget(Paragraph::new(line3), l3);

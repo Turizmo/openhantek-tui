@@ -9,10 +9,11 @@ Features:
 
 - Two channels and a math channel (CH1+CH2, CH1-CH2, CH2-CH1, CH1×CH2,
   CH1÷CH2, average, -CH1, -CH2)
-- 20 mV/div to 10 V/div, probe x1 / x10, invert, DC / AC coupling
+- 20 mV/div to 10 V/div, probe x1 / x10, invert, DC / AC coupling,
+  deskew (a time shift of the trace on screen)
   (AC is done in software; a scope with the AC hardware mod also gets the
   hardware command)
-- 20 ns/div to 10 s/div, roll mode from 100 ms/div
+- 20 ns/div to 10 s/div, roll mode from 500 ms/div
 - The ADC always streams at its top clean rate (16 MS/s with both
   channels, 30 MS/s with CH1 alone) through an async USB stream, in every
   mode; slower time bases average its samples, and a Max ADC rate
@@ -32,7 +33,8 @@ Features:
   line style and colour; ΔT, 1/ΔT, ΔV and the value of each channel at
   the time cursors in the measurement panel
 - Spectrum (FFT) view with Rectangular, Hann, Hamming, Blackman and flat top
-  windows, in dBV, with peak readout and zoom
+  windows, in dBV, with peak readout and zoom; below the time view (split)
+  or on the whole plot area (full)
 - XY mode
 - Averaging, persistence (old traces fade by age), sin(x)/x interpolation
   or samples only (only the real samples, one dot each)
@@ -57,7 +59,8 @@ Features:
 - Settings panel (`s`, `Enter` or `F2`) with yazi-style keys: every setting in one place,
   with search and typed values
 - Clean braille plot: whole cells per division, so the grid lines up, and
-  one-dot-thick traces; true colour, with 256 and 16 colour fallbacks
+  one-dot-thick traces; colours from the terminal theme or from our own
+  light and dark presets, with true colour, 256 and 16 colour modes
 - One config file with every setting and every key binding, with a
   comment on each line; changes are saved on quit, in place, so your own
   comments and formatting stay
@@ -157,7 +160,7 @@ the OpenHantek6022 source to `/etc/udev/rules.d/`, then run
 | `+` `-` | trigger level |
 | `T` | trigger level to the middle of the signal |
 | `,` `.` | trigger position left / right |
-| `f` | spectrum (FFT) view |
+| `f` | spectrum (FFT): off / split / full |
 | `F` | spectrum zoom (span / 2) |
 | `w` | FFT window |
 | `x` | XY mode |
@@ -287,6 +290,10 @@ run_stop = "Space"
   `settings.toml` from an older version is in the same folder, its
   values are taken once into the new config.toml. The old file is left
   in place, untouched; the app does not read it again.
+- **Old spectrum switch.** `display.spectrum` was on / off. It is now
+  `"Off"`, `"Split"` (below the time view) or `"Full"` (the whole plot
+  area). A file with `spectrum = true` or `false` loads as `"Split"` or
+  `"Off"`, and the app changes that line in place.
 
 **Keys.** `action = "key"` or `action = ["key", "key"]`; `[]` unbinds.
 A key is a single character (`a`, `A`, `+`, `?`), or one of `Enter`
@@ -309,7 +316,12 @@ key`. Long texts wrap at word boundaries in their column. When the
 help is taller than the screen (80x24) it is one column that scrolls
 with `j` `k` (or `↓` `↑`), `PgUp` `PgDn`, `Home` `End`; the title shows
 which rows are on screen, and any other key closes it. On a big
-screen (120x40) it shows all keys in two columns.
+screen (120x40) it shows all keys in two columns. In the help, `/`
+filters the rows: type a text, and only rows with it in the keys or
+the description stay (any case). The filter shows on the bottom
+border. While you type, all keys go to the filter; `Backspace` edits,
+`Enter` keeps the filter and ends typing, `Esc` clears it. `/` again
+edits it. Closing the help drops the filter.
 
 **Ctrl and Alt in terminals.** `Alt` works in every terminal (the fine
 cursor keys use it). `Ctrl` with a letter works too, but a terminal
@@ -381,8 +393,115 @@ seconds, voltage cursors and the trigger level take volts, the trigger
 position takes percent. Every setting with a key is in the panel, and so
 are run/stop, single shot, autoset, export and reset. The Device category
 shows the model, serial number, firmware, calibration source and sample
-rate. Display › Colours picks true colour, 256 or 16 colours (`auto`
-uses `COLORTERM`).
+rate. Display › Colours picks how many colours are sent, Display ›
+Color theme where they come from (see Colours below), and Channel 1,
+Channel 2 and Math › Colour, Brightness and Saturation set how
+each trace looks.
+
+**Colours** (Display › Colours, `display.colors`) set how many colours
+are sent. They do not change where the colours come from, so `Auto`
+looks the same as the mode it picks.
+
+| Mode | What it does |
+|---|---|
+| `Auto` (default) | `TrueColor` when `COLORTERM` says `truecolor` or `24bit`, else `Ansi256`. |
+| `TrueColor` | RGB colours. |
+| `Ansi256` | The nearest of the xterm 256 colours. |
+| `Ansi16` | Only the 16 ANSI colours, by name, so the terminal theme picks the shade. Each colour is the nearest of the 16 in the colour theme. Old traces and a brightness of -50 % or less use the dim attribute, a brightness of +50 % or more the bold attribute. |
+
+**Color theme** (Display › Color theme, `display.colortheme`) sets where
+the colours come from. Old traces, the muted area of trace mode both,
+the grid, the center cross, labels and hints are blended from the text
+and background colours of the theme, so they fit a light background as
+well as a dark one.
+
+| Theme | What it does |
+|---|---|
+| `Terminal` (default) | At start the app asks the terminal for its text, background and 16 ANSI colours (OSC 10, 11 and 4, with a 150 ms limit). Trace colours by name are sent by name, so the terminal theme picks them. A terminal that does not answer gets a preset, with a note on the message line: `Light` when `COLORFGBG` names background 7 or 15, else `Dark`. |
+| `Light` | Our own colours for a light background, sent as RGB (or the nearest 256 colour). The terminal theme does not matter. |
+| `Dark` | Our own colours for a dark background, sent the same way. |
+
+The app does not paint the background. With `Light` or `Dark`, pick the
+one that fits the terminal's background.
+
+**Trace colours** (Channel 1, Channel 2 and Math › Colour,
+`display.trace_colors`, one value for CH1, CH2, MATH). The defaults are
+`bright-yellow`, `bright-blue` and `bright-magenta`, in every colour
+mode. On a base16 theme (like base16 Gruvbox) the bright colours are the
+same as the plain ones.
+
+- A terminal colour: `black` `red` `green` `yellow` `blue` `magenta`
+  `cyan` `gray` `dark-gray` `bright-red` `bright-green` `bright-yellow`
+  `bright-blue` `bright-magenta` `bright-cyan` `white`. With the
+  `Terminal` theme the terminal picks the shade. With `Light` or `Dark`
+  it is the preset's colour for that name.
+- `#rrggbb`: an exact colour in true colour, the nearest xterm colour in
+  256 colours, and the nearest of the 16 colours of the theme in
+  16-colour mode.
+
+Old traces and the muted area come from the trace's own colour (for a
+terminal colour, its RGB in the colour theme).
+The channel line, the measurements, the labels and markers all use the
+trace colour. In the panel, `j` `k` in the value column pick a name
+(each with a swatch), and `#` (or `=` / `i`) types a value like
+`#ff8800` or `bright-red`; `Enter` applies it. A bad value shows an
+error and stays for editing.
+
+Older versions had `auto` as a trace colour. A config file with `auto`
+is changed in place to the default colour of that trace, with a note on
+the message line.
+
+Older versions had `display.trace_dim` (dimness, 0 to 100 %) in place of
+the brightness. A config file with it is changed in place: dimness 40
+becomes brightness -40, the key becomes `display.trace_brightness`, and
+the message line says so.
+
+**Brightness and saturation** (Channel 1, Channel 2 and Math › Brightness
+and Saturation, `display.trace_brightness` and `display.trace_saturation`,
+in percent, one value for CH1, CH2, MATH):
+
+- Brightness, -100 to +100 % (default 0). + stands out more from the
+  background, - fades toward it. Below 0 the trace colour is mixed
+  toward the background of the colour theme by that share: -100 % is
+  the background. Above 0 its lightness moves that share of the way to
+  the lightness of the text colour, with the same hue: lighter on a
+  dark theme, darker on a light one. A colour that is already as light
+  as the text (or as dark, on a light theme) goes toward white (or
+  black) instead. Near white and black there is less room for colour,
+  so the chroma drops where the screen cannot show it.
+- Saturation, 0 to 400 % (default 100): the colour's chroma times that
+  share, at the same lightness. 0 % is gray. Above 100 % the colour gets
+  stronger, with the same hue. It stops changing once it is the most
+  vivid shade of that hue the screen can show, so a colour that is
+  vivid already changes little.
+
+Both are mixed in Oklab, like the rest of the colours. At brightness 0 and
+saturation 100 a terminal colour of the `Terminal` theme stays the
+terminal colour, so the theme picks it exactly. Else the trace is
+written as RGB: true colour when there is true colour, else the nearest
+of the 256 colours. It is made from the RGB of the colour in the colour
+theme, or the `#rrggbb`. Old traces, the muted area, the channel line, the
+measurements, labels and markers all use the changed colour. In
+16-colour mode RGB is not possible: saturation does nothing. A
+brightness of -50 % or less draws the trace with the dim attribute, and
++50 % or more with the bold attribute (many terminals draw bold text
+brighter). In between, nothing changes. In the panel, `j` `k` step 5 %, `Alt-j`
+`Alt-k` step 1 %, and a typed number (like -40) sets the value. A swatch next to
+the value shows the colour.
+
+**Deskew** (Channel 1 and Channel 2 › Deskew, `channels.deskew`, in
+seconds). It moves the channel's trace left (-) or right (+) on screen,
+to line up two signals or to take out a probe delay. `j` `k` step 0.1
+division of the time/div, `Alt-j` `Alt-k` 0.01 division; or type a time
+like `5n` or `-1.2u`. It goes at most one screen width either way. The
+status line shows it (`CH2 1 V/div DC x1 skew +2.5 ms`). Only the
+drawing moves. Where the shift moves the trace past the end of the
+captured samples, that part of the screen stays empty. Measurements,
+the spectrum, XY mode, the CSV export and the math trace use the real
+sample times; the math trace is not shifted. The trigger finds its edge
+in the real samples, so a deskewed trigger source draws its edge away
+from the `▾` mark. The value is in seconds, so it stays the same when
+the time/div changes. It has no key.
 
 Each trace has a Style (Channel 1, Channel 2 and Math › Style), used in the
 time view and the spectrum:
@@ -451,14 +570,15 @@ file from before the axis settings keeps its look: with `grid_style =
 "Solid"` the center cross is solid, with `"None"` it is off. The axes
 are drawn over the grid, and traces over both. Ticks at 1/5 division
 show when a division is a multiple of 5 cells and at least 10.
-Brightness scales the perceptual lightness in true colour, takes the
-nearest xterm gray in 256 colours, and has four steps in 16 colours
-(dim dark gray, dark gray, gray, white).
+Brightness moves the colour from the background toward the text colour
+of the colour theme. In 16 colours it is the nearest of the 16 colours,
+and the lowest steps also have the dim attribute.
 
 Persistence (`P`, time view only) keeps 2, 4, 8 or 16 old traces, and
 each fades by age: the newest old trace is at 85 % of the way from the
 background to the trace colour, the oldest at 12 %, in even perceptual
-steps. A newer trace wins a cell over an older one, and the live trace
+steps (toward the background of the colour theme, so old traces get
+paler on a light theme). A newer trace wins a cell over an older one, and the live trace
 wins over all. In 256 colours the fade uses the nearest xterm colour of
 the same hue (about 5 steps); in 16 colours the newer half is the normal
 colour and the older half also has the dim attribute. With box lines, old
@@ -566,7 +686,8 @@ shows them again, each with its own on/off; `h` `l` `H` `L` `j` `k` `J`
 section of the measurement panel: `A t` `B t` (time from the trigger
 point), `ΔT` and `1/ΔT` when both time cursors are on, `A v` `B v`, and
 `ΔV` when both voltage cursors are on; and `V@A` `V@B`, the value of each
-channel at a time cursor. The log view uses the style and colour of time
+channel at a time cursor. That value is read from the trace as drawn,
+with its deskew. The cursor times are screen times. The log view uses the style and colour of time
 cursors A and B. Settings files from older versions still load: the old
 cursor mode `Time` turns time cursors A and B on, `Volt` the voltage
 cursors, and the old global cursor style becomes the style of each
@@ -810,7 +931,7 @@ record at the end is ignored).
   the firmware, with a generator thread that writes the stream into the
   ring (bus times, real time or as fast as the ring has room, a 40 MB/s
   link, lost samples and transfer errors on request).
-- `src/stream/`: `ring.rs` is the 64 MiB sample ring the USB side writes
+- `src/stream/`: `ring.rs` is the 128 MiB sample ring the USB side writes
   and the processing reads; `pipeline.rs` is the processing on it
   (decimation, trigger, captures, average, peak band, roll mode, math).
 - `src/acquire.rs`: the processing thread: commands, connect, stream
@@ -826,7 +947,7 @@ record at the end is ignored).
   `src/keys.rs` maps the logger keys to actions; `src/ui/log.rs` draws
   the log view and the REC status.
 - `src/app.rs` and `src/ui.rs`: keys and drawing. `src/plot.rs` is the
-  braille and text renderer (trace styles and cursor lines), `src/theme.rs` the colours, `src/panel.rs` the
+  braille and text renderer (trace styles and cursor lines), `src/theme.rs` the colours, `src/termcolors.rs` the terminal colour query, `src/panel.rs` the
   settings panel model.
 
 **One stream for every mode.** The scope always streams: the driver
@@ -838,7 +959,7 @@ the max ADC rate allows; a time base that needs fewer samples gets them
 by decimation on the fly: each output sample is the mean of a whole
 number of ADC samples (16 of 16 MS/s at 1 ms/div), with their min and
 max for the peak area. The decimation works in ADC counts per transfer,
-so no raw data is kept for a screen (at 50 ms/div a screen is 16 MB of
+so no raw data is kept for a screen (at 200 ms/div a screen is 64 MB of
 raw samples). Output rates are the 1-2-5 rates that divide the ADC rate,
 and the ADC rate / 1, 2, 4 (16, 8, 4 MS/s; 30, 15, 7.5 MS/s).
 
@@ -853,8 +974,8 @@ and the ADC rate / 1, 2, 4 (16, 8, 4 MS/s; 30, 15, 7.5 MS/s).
   the peak band. The UI takes the newest finished frame when it draws (at
   most 60 per second); a frame it did not take is replaced, so a slow
   screen never makes the stream drop data.
-- The ring holds 2 s at the top rate (the longest capture, 50 ms/div,
-  is 0.5 s). It never overwrites what the processing still needs: when
+- The ring holds 4 s at the top rate (the longest capture, 200 ms/div,
+  is 2 s). It never overwrites what the processing still needs: when
   the processing falls that far behind, new transfers are dropped and
   counted, the stream starts again, and the message line says
   `Processing fell behind ... the stream started again`. A transfer that

@@ -87,6 +87,10 @@ pub struct App {
     pub help_scroll: usize,
     /// Largest `help_scroll` for the screen, set when the help is drawn.
     pub help_max: std::cell::Cell<usize>,
+    /// Filter text of the help (`/`). Empty: all rows.
+    pub help_filter: String,
+    /// True while the help filter is being typed.
+    pub help_typing: bool,
     pub quit: bool,
     pub export_dir: PathBuf,
     /// Settings file, when settings are saved on quit.
@@ -140,6 +144,8 @@ impl App {
             confirm_delete: None,
             help_scroll: 0,
             help_max: std::cell::Cell::new(0),
+            help_filter: String::new(),
+            help_typing: false,
             quit: false,
             export_dir: PathBuf::from("."),
             settings_path: None,
@@ -642,34 +648,7 @@ impl App {
             return;
         }
         if self.help {
-            // A long help scrolls; any other key closes it, and the quit
-            // keys still quit.
-            let max = self.help_max.get();
-            if max > 0 {
-                let page = 10;
-                let s = self.help_scroll.min(max);
-                let to = if self.keys.is(Act::PanelDown, &key) {
-                    Some(s + 1)
-                } else if self.keys.is(Act::PanelUp, &key) {
-                    Some(s.saturating_sub(1))
-                } else {
-                    match key.code {
-                        KeyCode::PageDown => Some(s + page),
-                        KeyCode::PageUp => Some(s.saturating_sub(page)),
-                        KeyCode::Home => Some(0),
-                        KeyCode::End => Some(max),
-                        _ => None,
-                    }
-                };
-                if let Some(to) = to {
-                    self.help_scroll = to.min(max);
-                    return;
-                }
-            }
-            if self.keys.is(Act::Quit, &key) {
-                self.quit = true;
-            }
-            self.help = false;
+            self.help_key(key);
             return;
         }
         if self.panel_open {
@@ -684,6 +663,66 @@ impl App {
         if let Some(a) = self.keys.action(views, &key) {
             self.act(a);
         }
+    }
+
+    /// A key while the help is open. While the filter is typed, all keys
+    /// go to it. Else `/` types the filter, the scroll keys scroll a long
+    /// help, and any other key closes it (the quit keys still quit).
+    fn help_key(&mut self, key: KeyEvent) {
+        if self.help_typing {
+            match key.code {
+                KeyCode::Esc => {
+                    self.help_typing = false;
+                    self.help_filter.clear();
+                }
+                KeyCode::Enter => self.help_typing = false,
+                KeyCode::Backspace => {
+                    self.help_filter.pop();
+                }
+                KeyCode::Char(c) => self.help_filter.push(c),
+                _ => return,
+            }
+            self.help_scroll = 0;
+            return;
+        }
+        if key.code == KeyCode::Char('/') {
+            // Edit the filter that is there, if any.
+            self.help_typing = true;
+            return;
+        }
+        let max = self.help_max.get();
+        if max > 0 {
+            let page = 10;
+            let s = self.help_scroll.min(max);
+            let to = if self.keys.is(Act::PanelDown, &key) {
+                Some(s + 1)
+            } else if self.keys.is(Act::PanelUp, &key) {
+                Some(s.saturating_sub(1))
+            } else {
+                match key.code {
+                    KeyCode::PageDown => Some(s + page),
+                    KeyCode::PageUp => Some(s.saturating_sub(page)),
+                    KeyCode::Home => Some(0),
+                    KeyCode::End => Some(max),
+                    _ => None,
+                }
+            };
+            if let Some(to) = to {
+                self.help_scroll = to.min(max);
+                return;
+            }
+        }
+        if self.keys.is(Act::Quit, &key) {
+            self.quit = true;
+        }
+        self.close_help();
+    }
+
+    /// Close the help, and drop its filter.
+    fn close_help(&mut self) {
+        self.help = false;
+        self.help_typing = false;
+        self.help_filter.clear();
     }
 
     /// Do what a key action of the scope or log view does.
@@ -819,7 +858,7 @@ impl App {
             Act::LogTraceMode => s.logger.trace_mode = s.logger.trace_mode.next(),
             Act::Interpolation => s.display.interpolation = s.display.interpolation.next(),
             Act::MeasurePanel => s.display.measurements ^= true,
-            Act::Spectrum => s.display.spectrum ^= true,
+            Act::Spectrum => s.display.spectrum = s.display.spectrum.next(),
             Act::SpectrumZoom => {
                 s.display.spectrum_zoom = (s.display.spectrum_zoom + 1) % (MAX_SPECTRUM_ZOOM + 1)
             }

@@ -19,7 +19,7 @@ use crate::plot::{self, Geometry, Plot, LABEL_W, MARKER_W};
 use crate::scope::{Frame, TrigState, MATH};
 use crate::settings::*;
 use crate::si::{fmt_opt, fmt_percent, fmt_si};
-use crate::theme::Palette;
+use crate::theme::{Palette, TraceColor};
 
 mod log;
 
@@ -41,8 +41,20 @@ const PLOT_MIN_ROWS: u16 = 2 + V_DIVS as u16 + 1;
 const STATUS_ROWS: u16 = 3;
 
 pub fn draw(f: &mut TermFrame, app: &App) {
+    let pal = Palette::of(&app.scope.settings.display);
+    draw_screen(f, app, &pal);
+    // A preset sends no colour by name: the terminal theme must not
+    // change it. So every name drawn is turned into the preset's RGB.
+    if !pal.sends_names() {
+        for c in f.buffer_mut().content.iter_mut() {
+            c.fg = pal.named(c.fg);
+            c.bg = pal.named(c.bg);
+        }
+    }
+}
+
+fn draw_screen(f: &mut TermFrame, app: &App, pal: &Palette) {
     let area = f.area();
-    let pal = Palette::for_setting(app.scope.settings.display.colors);
     let panel_h = if app.panel_open {
         let s = &app.scope.settings;
         let rows = app.panel.column_rows(s, &app.device_info()) as u16;
@@ -61,15 +73,15 @@ pub fn draw(f: &mut TermFrame, app: &App) {
     let s = &app.scope.settings;
 
     if app.show_log {
-        log::draw_log(f, app, main, &pal);
+        log::draw_log(f, app, main, pal);
         if app.panel_open {
-            draw_panel(f, app, panel, &pal);
+            draw_panel(f, app, panel, pal);
         }
-        log::draw_log_status(f, app, [status1, status2, status3], &pal);
+        log::draw_log_status(f, app, [status1, status2, status3], pal);
         if app.help {
             draw_help(f, area, &log_help_rows(app), app);
         }
-        draw_confirm(f, app, area, &pal);
+        draw_confirm(f, app, area, pal);
         return;
     }
 
@@ -79,33 +91,33 @@ pub fn draw(f: &mut TermFrame, app: &App) {
     let [view, meas] =
         Layout::horizontal([Constraint::Min(20), Constraint::Length(panel_w)]).areas(main);
     if let Some(l) = &layout {
-        draw_measurements(f, app, l, meas, &pal);
+        draw_measurements(f, app, l, meas, pal);
     }
-    if s.display.spectrum && !s.display.xy {
-        let time_h = split_height(view.height);
-        let [time, spec] =
-            Layout::vertical([Constraint::Length(time_h), Constraint::Min(0)]).areas(view);
-        draw_time(f, app, time, &pal);
-        draw_spectrum(f, app, spec, &pal);
-    } else if s.display.xy {
-        draw_xy(f, app, view, &pal);
+    if s.display.xy {
+        draw_xy(f, app, view, pal);
     } else {
-        draw_time(f, app, view, &pal);
+        let (time, spec) = plot_panes(view, s.display.spectrum);
+        if let Some(time) = time {
+            draw_time(f, app, time, pal);
+        }
+        if let Some(spec) = spec {
+            draw_spectrum(f, app, spec, time.is_none(), pal);
+        }
     }
     if app.panel_open {
-        draw_panel(f, app, panel, &pal);
+        draw_panel(f, app, panel, pal);
     }
-    draw_channel_line(f, app, status1, &pal);
+    draw_channel_line(f, app, status1, pal);
     match log::rec_status(app) {
         Some(line) => f.render_widget(Paragraph::new(line), status2),
         None => draw_time_line(f, app, status2),
     }
-    draw_message_line(f, app, status3);
-    draw_probe_cal(f, app, view, &pal);
+    draw_message_line(f, app, status3, pal);
+    draw_probe_cal(f, app, view, pal);
     if app.help {
         draw_help(f, area, &scope_help_rows(app), app);
     }
-    draw_confirm(f, app, area, &pal);
+    draw_confirm(f, app, area, pal);
 }
 
 /// The question before the zero calibration.
@@ -237,6 +249,21 @@ pub fn panel_height(need: u16, h: u16) -> u16 {
         .min(h.saturating_sub(STATUS_ROWS + 6))
 }
 
+/// The time view and the spectrum in the plot area (not in XY mode).
+/// Split puts the spectrum below the time view; full gives it all.
+fn plot_panes(view: Rect, mode: SpectrumView) -> (Option<Rect>, Option<Rect>) {
+    match mode {
+        SpectrumView::Off => (Some(view), None),
+        SpectrumView::Split => {
+            let time_h = split_height(view.height);
+            let [time, spec] =
+                Layout::vertical([Constraint::Length(time_h), Constraint::Min(0)]).areas(view);
+            (Some(time), Some(spec))
+        }
+        SpectrumView::Full => (None, Some(view)),
+    }
+}
+
 /// Height of the time view when the spectrum is below it: about 55 % of
 /// the rows, rounded down to a whole number of rows per division.
 fn split_height(h: u16) -> u16 {
@@ -291,7 +318,8 @@ fn layer_of(s: &Settings, t: usize) -> u8 {
 
 /// Screen points of a trace, in divisions, in time order. Few samples get
 /// sin(x)/x points between them. With `dots` (samples mode), only the
-/// real samples.
+/// real samples. A channel's deskew moves the points; samples it moves
+/// past the record's ends leave that part of the screen empty.
 pub fn trace_points(
     frame: &Frame,
     t: usize,
@@ -311,13 +339,14 @@ pub fn trace_points(
             f64::NAN
         }
     };
-    let r = frame.visible(s, tr.len());
+    let r = frame.trace_visible(t, s, tr.len());
     let n = r.len();
     if n == 0 {
         return Vec::new();
     }
+    let x = |i: f64| frame.trace_x(t, i, s);
     if dots {
-        return r.map(|i| (frame.x(i as f64, s), y(tr[i]))).collect();
+        return r.map(|i| (x(i as f64), y(tr[i]))).collect();
     }
     if s.display.interpolation == Interpolation::Sinc && n * 4 < dots_x {
         let factor = (dots_x / n).clamp(2, 32);
@@ -327,13 +356,13 @@ pub fn trace_points(
         return fine
             .iter()
             .enumerate()
-            .map(|(j, v)| (frame.x(lo as f64 + j as f64 / factor as f64, s), y(*v)))
+            .map(|(j, v)| (x(lo as f64 + j as f64 / factor as f64), y(*v)))
             .collect();
     }
     // One sample more on each side, so the line reaches the screen edges.
     let lo = r.start.saturating_sub(1);
     let hi = (r.end + 1).min(tr.len());
-    (lo..hi).map(|i| (frame.x(i as f64, s), y(tr[i]))).collect()
+    (lo..hi).map(|i| (x(i as f64), y(tr[i]))).collect()
 }
 
 /// The grid in the style of the display settings.
@@ -369,7 +398,7 @@ pub fn peak_columns(
     let half_v = V_DIVS / 2.0;
     let y = |v: f64| (v / scale + offset).clamp(-half_v, half_v);
     let n = lo.len().min(hi.len());
-    let r = frame.visible(s, n);
+    let r = frame.trace_visible(t, s, n);
     if r.is_empty() {
         return None;
     }
@@ -384,7 +413,7 @@ pub fn peak_columns(
     // One sample more on each side, so the area reaches the edges.
     let pts: Vec<(f64, f64, f64)> = (r.start.saturating_sub(1)..(r.end + 1).min(n))
         .filter(|&i| hi[i].is_finite() && lo[i].is_finite())
-        .map(|i| (plot.px(frame.x(i as f64, s)), y(hi[i]), y(lo[i])))
+        .map(|i| (plot.px(frame.trace_x(t, i as f64, s)), y(hi[i]), y(lo[i])))
         .collect();
     for p in &pts {
         add(p.0.floor() as i64, p.1, p.2);
@@ -688,6 +717,7 @@ fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     if let Some(frame) = &sc.frame {
         for &t in &order {
             if trace_enabled(s, t) {
+                trace_layer_modifier(&mut plot, pal, t, &[layer_of(s, t), band_layer_of(s, t)]);
                 draw_trace(
                     &mut plot,
                     frame,
@@ -887,7 +917,9 @@ pub fn spectrum_points(sp: &Spectrum, span: f64, dots_x: usize) -> Vec<(f64, f64
         .collect()
 }
 
-fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
+/// The spectrum in `area`. `alone`: there is no time view, so the box
+/// has the scope title on top and the spectrum title at the bottom.
+fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect, alone: bool, pal: &Palette) {
     let s = &app.scope.settings;
     let rate = app.scope.frame.as_ref().map_or(1.0, |f| f.rate);
     let span = rate / 2.0 / 2f64.powi(s.display.spectrum_zoom as i32);
@@ -929,6 +961,7 @@ fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
             }
         }
         if let Some(p) = plot.as_mut() {
+            trace_layer_modifier(p, pal, t, &[layer_of(s, t)]);
             let pts: Vec<(f64, f64)> = spectrum_points(&sp, span, p.dots_w() - 1)
                 .into_iter()
                 .map(to_div)
@@ -942,7 +975,12 @@ fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
             );
         }
     }
-    f.render_widget(Block::bordered().title(title), area);
+    let block = if alone {
+        Block::bordered().title(self::title(app)).title_bottom(title)
+    } else {
+        Block::bordered().title(title)
+    };
+    f.render_widget(block, area);
     let (Some(g), Some(p)) = (geo, plot) else {
         return;
     };
@@ -1285,13 +1323,21 @@ fn channel_span(app: &App, t: usize, pal: &Palette) -> Span<'static> {
         )
     } else {
         let ch = &s.channels[t];
+        // A deskew shows, so a moved trace is not taken for a real delay.
+        let skew = if ch.deskew != 0.0 {
+            let sign = if ch.deskew > 0.0 { "+" } else { "" };
+            format!(" skew {sign}{}", fmt_si(ch.deskew, "s"))
+        } else {
+            String::new()
+        };
         format!(
-            " {} {}/div {} x{}{} ",
+            " {} {}/div {} x{}{}{} ",
             NAMES[t],
             fmt_si(ch.volts_per_div(), "V"),
             ch.coupling.name(),
             ch.probe,
-            if ch.invert { " INV" } else { "" }
+            if ch.invert { " INV" } else { "" },
+            skew
         )
     };
     let mut style = Style::default().fg(pal.trace[t]);
@@ -1353,7 +1399,8 @@ pub fn cursor_rows(app: &App) -> Vec<(&'static str, String)> {
 }
 
 /// Value of trace `t` at time cursor `i` (0 = A, 1 = B), from the frame
-/// on screen, interpolated between samples.
+/// on screen, interpolated between samples. It reads the trace as drawn:
+/// with the channel's deskew.
 pub fn value_at_cursor(app: &App, t: usize, i: usize) -> Option<f64> {
     let s = &app.scope.settings;
     let f = app.scope.frame.as_ref()?;
@@ -1361,7 +1408,8 @@ pub fn value_at_cursor(app: &App, t: usize, i: usize) -> Option<f64> {
     if tr.is_empty() || f.dt <= 0.0 {
         return None;
     }
-    let k = (f.time_at(s.cursors.get(i).position, s) - f.t0) / f.dt;
+    let t_at = f.time_at(s.cursors.get(i).position, s) - Frame::deskew(t, s);
+    let k = (t_at - f.t0) / f.dt;
     if k < 0.0 || k > (tr.len() - 1) as f64 {
         return None;
     }
@@ -1424,7 +1472,7 @@ fn draw_time_line(f: &mut TermFrame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)).style(gray), area);
 }
 
-fn draw_message_line(f: &mut TermFrame, app: &App, area: Rect) {
+fn draw_message_line(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let line = match (app.current_message(), &app.status) {
         (Some(m), _) => Line::styled(
             format!(" {}", m.text),
@@ -1449,7 +1497,7 @@ fn draw_message_line(f: &mut TermFrame, app: &App, area: Rect) {
                     k.label(&[Act::VoltsSmaller, Act::VoltsBigger]).replace(' ', ""),
                     k.first(Act::NextTrace).to_lowercase(),
                 ),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(pal.hint),
             )
         }
     };
@@ -1589,6 +1637,9 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
     let mut right: Vec<Line> = Vec::new();
     if let Some(field) = current {
         match field.kind() {
+            Kind::Choice if p.input.is_some() && p.focus == Focus::Values => {
+                right = colour_input_column(p, pal);
+            }
             Kind::Choice | Kind::Bool => {
                 let opts = field.options(s, &d);
                 let now = field.index(s);
@@ -1606,7 +1657,18 @@ fn draw_panel(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
                     } else {
                         style
                     };
-                    right.push(Line::styled(format!(" {mark} {o} "), style));
+                    match field {
+                        // A swatch of each colour.
+                        crate::panel::Field::TraceColour(t) => {
+                            let c = TraceColor::parse(o).unwrap_or(TraceColor::DEFAULTS[t]);
+                            right.push(Line::from(vec![
+                                Span::styled(format!(" {mark} "), style),
+                                Span::styled("██", swatch(pal, t).fg(pal.trace_color(t, c))),
+                                Span::styled(format!(" {o} "), style),
+                            ]));
+                        }
+                        _ => right.push(Line::styled(format!(" {mark} {o} "), style)),
+                    }
                 }
             }
             Kind::Number => right = number_column(p, field, s, &d, pal),
@@ -1690,13 +1752,69 @@ fn number_column(
         Line::styled(format!(" ╰{bar}╯"), frame),
         Line::from(format!(" j k  {}", field.step_text(s))),
     ];
+    // Brightness and saturation: a swatch of the trace colour they make.
+    if let crate::panel::Field::TraceBright(t) | crate::panel::Field::TraceSat(t) = field {
+        let sw = swatch(pal, t).fg(pal.trace[t]);
+        lines[1].spans.extend([Span::raw(" "), Span::styled("████", sw)]);
+    }
     let hint = Style::default().fg(pal.label);
     if here && p.input.is_some() {
         lines.push(Line::styled(" ⏎ apply · esc cancel", hint));
     } else {
-        lines.push(Line::styled(" type: 500m 2k 1.5u", hint));
+        let eg = if field.unit() == "%" {
+            " type a number"
+        } else {
+            " type: 500m 2k 1.5u"
+        };
+        lines.push(Line::styled(eg, hint));
     }
     if let (Some(e), true) = (&p.error, here) {
+        lines.push(Line::styled(
+            format!(" {e}"),
+            Style::default().fg(Color::LightRed),
+        ));
+    }
+    lines
+}
+
+/// Style of a trace colour swatch: BOLD or DIM where the palette draws
+/// the trace so (16 colours).
+fn swatch(pal: &Palette, t: usize) -> Style {
+    Style::default().add_modifier(pal.trace_modifier[t.min(2)])
+}
+
+/// Mark the layers of trace `t` (its line and its area) to render with the
+/// palette's modifier for it: BOLD or DIM in 16 colours.
+pub fn trace_layer_modifier(plot: &mut Plot, pal: &Palette, t: usize, layers: &[u8]) {
+    let m = pal.trace_modifier[t.min(2)];
+    for l in layers {
+        if m.contains(Modifier::DIM) {
+            plot.dim_layer(*l);
+        }
+        if m.contains(Modifier::BOLD) {
+            plot.bold_layer(*l);
+        }
+    }
+}
+
+/// The value column of a trace colour while typing it: the typed text in
+/// a box, how to type, and the error of the last try.
+fn colour_input_column(p: &crate::panel::Panel, pal: &Palette) -> Vec<Line<'static>> {
+    let text = format!("{}▏", p.input.clone().unwrap_or_default());
+    let c = Style::default().fg(pal.trace[0]);
+    let bar = "─".repeat(text.chars().count() + 2);
+    let mut lines = vec![
+        Line::styled(format!(" ╭{bar}╮"), c),
+        Line::from(vec![
+            Span::styled(" │ ", c),
+            Span::styled(text, c.add_modifier(Modifier::BOLD)),
+            Span::styled(" │", c),
+        ]),
+        Line::styled(format!(" ╰{bar}╯"), c),
+        Line::styled(" #rrggbb or a name", Style::default().fg(pal.label)),
+        Line::styled(" ⏎ apply · esc cancel", Style::default().fg(pal.label)),
+    ];
+    if let Some(e) = &p.error {
         lines.push(Line::styled(
             format!(" {e}"),
             Style::default().fg(Color::LightRed),
@@ -1714,13 +1832,19 @@ fn panel_foot(
 ) -> Line<'static> {
     let p = &app.panel;
     let k = &app.keys;
-    let hint = Style::default().fg(Color::DarkGray);
+    let hint = Style::default().fg(pal.hint);
     let one = |a: Act| k.first(a);
     let two = |a: Act, b: Act| format!("{}/{}", k.first(a), k.first(b));
     let foot_line = if p.input.is_some() {
         let label = current.map_or("", |f| f.label());
+        // A colour name can have an h: there h is typed.
+        let moves = if matches!(current, Some(crate::panel::Field::TraceColour(_))) {
+            "← ↑ ↓"
+        } else {
+            "← h ↑ ↓"
+        };
         Line::styled(
-            format!(" typing {label} · ⏎ apply · ← h ↑ ↓ apply and move · esc cancel · ⌫ edit"),
+            format!(" typing {label} · ⏎ apply · {moves} apply and move · esc cancel · ⌫ edit"),
             hint,
         )
     } else if p.on_number() && width >= 90 {
@@ -1854,10 +1978,55 @@ fn help_lines(keys: &[(String, String)], width: usize) -> Vec<Vec<Line<'static>>
         .collect()
 }
 
+/// The help rows that match `filter` (case-insensitive, in the keys or
+/// the text). A run of rows without keys is one paragraph: it is kept
+/// whole when one of its lines matches. A blank row is kept only between
+/// two kept groups. An empty filter keeps all rows.
+pub fn filter_help_rows(rows: &[(String, String)], filter: &str) -> Vec<(String, String)> {
+    if filter.is_empty() {
+        return rows.to_vec();
+    }
+    let f = filter.to_lowercase();
+    let hit = |(k, d): &(String, String)| k.to_lowercase().contains(&f) || d.to_lowercase().contains(&f);
+    let blank = |(k, d): &(String, String)| k.is_empty() && d.is_empty();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut gap = false;
+    let mut i = 0;
+    while i < rows.len() {
+        if blank(&rows[i]) {
+            gap = true;
+            i += 1;
+            continue;
+        }
+        // One row with keys, or a paragraph of rows without keys.
+        let mut end = i + 1;
+        if rows[i].0.is_empty() {
+            while end < rows.len() && rows[end].0.is_empty() && !blank(&rows[end]) {
+                end += 1;
+            }
+        }
+        let part = &rows[i..end];
+        if part.iter().any(hit) {
+            if gap && !out.is_empty() {
+                out.push((String::new(), String::new()));
+            }
+            gap = false;
+            out.extend_from_slice(part);
+        }
+        i = end;
+    }
+    out
+}
+
 /// The help popup. Two columns when the screen is wide enough and all
 /// rows fit; else one column that scrolls (j k, arrows, PgUp PgDn) when
 /// it is longer than the screen. Rows are word-wrapped, never cut.
-fn draw_help(f: &mut TermFrame, area: Rect, keys: &[(String, String)], app: &App) {
+fn draw_help(f: &mut TermFrame, area: Rect, all: &[(String, String)], app: &App) {
+    let mut keys = filter_help_rows(all, &app.help_filter);
+    if keys.is_empty() {
+        keys.push((String::new(), "no match".into()));
+    }
+    let keys = keys.as_slice();
     let w = 110.min(area.width);
     let inner_w = w.saturating_sub(2) as usize;
     let max_h = area.height.saturating_sub(2) as usize;
@@ -1898,15 +2067,32 @@ fn draw_help(f: &mut TermFrame, area: Rect, keys: &[(String, String)], app: &App
     f.render_widget(Clear, popup);
     let title = if max_scroll > 0 {
         format!(
-            " Keys · {}–{} of {} · j k PgUp PgDn scroll · other keys close ",
+            " Keys · {}–{} of {} · j k PgUp PgDn scroll · / filter · other keys close ",
             scroll + 1,
             scroll + view_h,
             need
         )
     } else {
-        " Keys · any key closes ".to_string()
+        " Keys · / filter · any key closes ".to_string()
     };
-    let block = Block::bordered().title(title);
+    let mut block = Block::bordered().title(title);
+    // The filter on the bottom border, while it is typed or in use.
+    if app.help_typing || !app.help_filter.is_empty() {
+        let (text, hint) = if app.help_typing {
+            (format!(" /{}▏", app.help_filter), "  ⏎ done · esc clear ")
+        } else {
+            (format!(" /{} ", app.help_filter), " / edit ")
+        };
+        block = block.title_bottom(Line::from(vec![
+            Span::styled(
+                text,
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(hint),
+        ]));
+    }
     let inner = block.inner(popup);
     f.render_widget(block, popup);
     let shown = |lines: Vec<Line<'static>>| -> Vec<Line<'static>> {
@@ -1928,6 +2114,44 @@ fn draw_help(f: &mut TermFrame, area: Rect, keys: &[(String, String)], app: &App
 mod tests {
     use super::*;
 
+    fn rows(r: &[(&str, &str)]) -> Vec<(String, String)> {
+        r.iter().map(|(k, d)| (k.to_string(), d.to_string())).collect()
+    }
+
+    #[test]
+    fn help_filter_matches_keys_and_text_and_keeps_paragraphs() {
+        let all = rows(&[
+            ("q", "quit"),
+            ("a", "autoset"),
+            ("", ""),
+            ("PgUp", "trigger mode"),
+            ("", ""),
+            ("", "Raw log step:"),
+            ("", "one ADC sample per step."),
+        ]);
+        // An empty filter keeps all rows.
+        assert_eq!(filter_help_rows(&all, ""), all);
+        // Text, any case.
+        assert_eq!(filter_help_rows(&all, "AUTO"), rows(&[("a", "autoset")]));
+        // The key column.
+        assert_eq!(filter_help_rows(&all, "pgup"), rows(&[("PgUp", "trigger mode")]));
+        // A blank row only between two kept groups.
+        assert_eq!(
+            filter_help_rows(&all, "o"),
+            rows(&[
+                ("a", "autoset"),
+                ("", ""),
+                ("PgUp", "trigger mode"),
+                ("", ""),
+                ("", "Raw log step:"),
+                ("", "one ADC sample per step."),
+            ])
+        );
+        // A paragraph stays whole.
+        assert_eq!(filter_help_rows(&all, "adc"), all[5..].to_vec());
+        assert!(filter_help_rows(&all, "zzz").is_empty());
+    }
+
     #[test]
     fn panel_height_rules() {
         // As big as needed when there is room.
@@ -1939,6 +2163,22 @@ mod tests {
         assert_eq!(panel_height(15, 20), PANEL_MIN_ROWS);
         // A tiny screen still leaves room for the plot and status lines.
         assert_eq!(panel_height(15, 15), 6);
+    }
+
+    #[test]
+    fn spectrum_panes_by_mode() {
+        let view = Rect::new(3, 2, 100, 40);
+        assert_eq!(plot_panes(view, SpectrumView::Off), (Some(view), None));
+        // Full: the spectrum gets the whole plot area, no time view.
+        assert_eq!(plot_panes(view, SpectrumView::Full), (None, Some(view)));
+        // Split: the time view on top, the spectrum below, no gap.
+        let (Some(t), Some(sp)) = plot_panes(view, SpectrumView::Split) else {
+            panic!("split has two panes");
+        };
+        assert_eq!(t.height, split_height(view.height));
+        assert_eq!((t.x, t.y, t.width), (view.x, view.y, view.width));
+        assert_eq!((sp.x, sp.y, sp.width), (view.x, view.y + t.height, view.width));
+        assert_eq!(t.height + sp.height, view.height);
     }
 
     #[test]

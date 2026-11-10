@@ -60,15 +60,44 @@ impl Frame {
         (x - self.x_ref(s)) * s.time_per_div()
     }
 
+    /// Time shift of trace `t` on screen, in seconds: the channel's
+    /// deskew. The math trace is not moved.
+    pub fn deskew(t: usize, s: &Settings) -> f64 {
+        if t < MATH {
+            s.channels[t].deskew
+        } else {
+            0.0
+        }
+    }
+
+    /// Screen x (in divisions) where trace `t` draws its sample `i`: the
+    /// sample's own x, moved by the trace's deskew.
+    pub fn trace_x(&self, t: usize, i: f64, s: &Settings) -> f64 {
+        self.x(i, s) + Self::deskew(t, s) / s.time_per_div()
+    }
+
     /// Indexes of the samples inside the screen.
     pub fn visible(&self, s: &Settings, len: usize) -> Range<usize> {
+        self.visible_shifted(s, len, 0.0)
+    }
+
+    /// Indexes of the samples that trace `t` draws inside the screen,
+    /// with its deskew. Measurements use [`Frame::visible`]: real time.
+    pub fn trace_visible(&self, t: usize, s: &Settings, len: usize) -> Range<usize> {
+        self.visible_shifted(s, len, Self::deskew(t, s))
+    }
+
+    /// Indexes of the samples inside the screen when they are drawn
+    /// `shift` seconds later.
+    fn visible_shifted(&self, s: &Settings, len: usize, shift: f64) -> Range<usize> {
         if self.dt <= 0.0 || len == 0 {
             return 0..0;
         }
         let half = H_DIVS / 2.0;
         let tdiv = s.time_per_div();
-        // x(i) = x_ref + (t0 + i dt) / tdiv  =>  i = ((x - x_ref) tdiv - t0) / dt
-        let idx = |x: f64| ((x - self.x_ref(s)) * tdiv - self.t0) / self.dt;
+        // x(i) = x_ref + (t0 + shift + i dt) / tdiv
+        //   =>  i = ((x - x_ref) tdiv - t0 - shift) / dt
+        let idx = |x: f64| ((x - self.x_ref(s)) * tdiv - self.t0 - shift) / self.dt;
         let a = idx(-half).ceil().max(0.0) as usize;
         let b = (idx(half).floor() + 1.0).max(0.0) as usize;
         a.min(len)..b.min(len)
@@ -755,6 +784,37 @@ mod tests {
     }
 
     #[test]
+    fn deskew_moves_only_the_drawing_of_its_channel() {
+        let mut s = scope();
+        s.push(sine_block(1, 1e6, 1000.0, 2.0, 1.0));
+        let f = s.frame.clone().unwrap();
+        let len = f.traces[0].as_ref().unwrap().len();
+        let i = -f.t0 / f.dt;
+        let r0 = f.trace_visible(0, &s.settings, len);
+        // 1 ms/div: +2 ms moves CH1 two divisions right.
+        s.settings.channels[0].deskew = 2e-3;
+        let st = &s.settings;
+        assert!((f.trace_x(0, i, st) - 2.0).abs() < 1e-9);
+        assert!(f.trace_x(1, i, st).abs() < 1e-9);
+        assert!(f.trace_x(MATH, i, st).abs() < 1e-9);
+        // The drawn range ends 2000 samples (2 ms at 1 MS/s) earlier. It
+        // starts at the record's first sample: the screen's left part
+        // has no samples and stays empty.
+        let r = f.trace_visible(0, st, len);
+        assert!((r0.end as i64 - r.end as i64 - 2000).abs() <= 1, "{r0:?} {r:?}");
+        assert_eq!(r.start, 0);
+        assert!(f.trace_x(0, 0.0, st) > -H_DIVS / 2.0 + 1.5);
+        // Measurements keep the real time: the same range as before.
+        assert_eq!(f.visible(st, len), r0);
+        assert_eq!(f.trace_visible(1, st, len), r0);
+        // A shift past the record leaves nothing to draw.
+        s.settings.channels[0].deskew = 1.0;
+        assert!(f.trace_visible(0, &s.settings, len).is_empty());
+        s.settings.channels[0].deskew = -1.0;
+        assert!(f.trace_visible(0, &s.settings, len).is_empty());
+    }
+
+    #[test]
     fn falling_slope_and_position() {
         let mut s = scope();
         s.settings.trigger.slope = Slope::Falling;
@@ -973,7 +1033,7 @@ mod tests {
     #[test]
     fn roll_mode_keeps_the_peak_band() {
         let mut s = Scope::new(Settings::default());
-        s.settings.time_idx = time_index(100e-3);
+        s.settings.time_idx = time_index(500e-3);
         let (gen, cfg) = s.sync_hw().unwrap();
         let piece = Block {
             gen,
@@ -1078,7 +1138,7 @@ mod tests {
     #[test]
     fn roll_mode_appends_and_scrolls() {
         let mut s = Scope::new(Settings::default());
-        s.settings.time_idx = time_index(100e-3);
+        s.settings.time_idx = time_index(500e-3);
         let (gen, cfg) = s.sync_hw().unwrap();
         assert!(cfg.roll);
         let rate = cfg.rate.rate;

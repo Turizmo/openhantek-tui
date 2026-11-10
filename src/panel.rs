@@ -13,7 +13,7 @@ use crate::dsp::fft::Window;
 use crate::dsp::trigger::Slope;
 use crate::settings::*;
 use crate::si::fmt_si;
-use crate::theme::ColorMode;
+use crate::theme::{ColorMode, ColorTheme, TraceColor};
 
 /// Things a panel item can do that are not settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,8 +56,16 @@ pub enum Field {
     ChCoupling(usize),
     ChProbe(usize),
     ChInvert(usize),
+    /// Time shift of the channel's trace on screen.
+    ChDeskew(usize),
     /// Trace style of CH1, CH2 or MATH.
     Style(usize),
+    /// Colour of CH1, CH2 or MATH.
+    TraceColour(usize),
+    /// Brightness of CH1, CH2 or MATH, in percent (-100 to 100).
+    TraceBright(usize),
+    /// Saturation of CH1, CH2 or MATH, in percent.
+    TraceSat(usize),
     MathEnabled,
     MathMode,
     MathScale,
@@ -79,13 +87,14 @@ pub enum Field {
     Persistence,
     Xy,
     Colors,
+    Colortheme,
     GridLook,
     GridExtent,
     GridBrightness,
     AxisLook,
     AxisExtent,
     AxisBrightness,
-    SpecOn,
+    SpecView,
     SpecWindow,
     SpecZoom,
     /// Cursor `i` (time A, time B, voltage A, voltage B): its position,
@@ -193,7 +202,11 @@ pub fn categories() -> Vec<Category> {
             ChCoupling(c),
             ChProbe(c),
             ChInvert(c),
+            ChDeskew(c),
             Style(c),
+            TraceColour(c),
+            TraceBright(c),
+            TraceSat(c),
         ]
     };
     vec![
@@ -207,7 +220,16 @@ pub fn categories() -> Vec<Category> {
         },
         Category {
             name: "Math",
-            fields: vec![MathEnabled, MathMode, MathScale, MathOffset, Style(2)],
+            fields: vec![
+                MathEnabled,
+                MathMode,
+                MathScale,
+                MathOffset,
+                Style(2),
+                TraceColour(2),
+                TraceBright(2),
+                TraceSat(2),
+            ],
         },
         Category {
             name: "Trigger",
@@ -240,6 +262,7 @@ pub fn categories() -> Vec<Category> {
                 Persistence,
                 Xy,
                 Colors,
+                Colortheme,
                 GridLook,
                 GridExtent,
                 GridBrightness,
@@ -250,7 +273,7 @@ pub fn categories() -> Vec<Category> {
         },
         Category {
             name: "Spectrum",
-            fields: vec![SpecOn, SpecWindow, SpecZoom],
+            fields: vec![SpecView, SpecWindow, SpecZoom],
         },
         Category {
             name: "Cursors",
@@ -398,7 +421,11 @@ impl Field {
             ChCoupling(_) => "Coupling",
             ChProbe(_) => "Probe",
             ChInvert(_) => "Invert",
+            ChDeskew(_) => "Deskew",
             Style(_) => "Style",
+            TraceColour(_) => "Colour",
+            TraceBright(_) => "Brightness",
+            TraceSat(_) => "Saturation",
             MathMode => "Function",
             MathScale => "Units/div",
             TrigMode => "Mode",
@@ -416,13 +443,14 @@ impl Field {
             Persistence => "Persistence",
             Xy => "XY mode",
             Colors => "Colours",
+            Colortheme => "Color theme",
             GridLook => "Grid style",
             GridExtent => "Grid lines",
             GridBrightness => "Grid brightness",
             AxisLook => "Axis style",
             AxisExtent => "Axis lines",
             AxisBrightness => "Axis brightness",
-            SpecOn => "Show spectrum",
+            SpecView => "View",
             SpecWindow => "Window",
             SpecZoom => "Span",
             CursorPos(0) => "Time A",
@@ -489,6 +517,10 @@ impl Field {
             ChCoupling(_) => "AC takes away the DC part (in software). Key c.",
             ChProbe(_) => "Set this to match the switch on the probe. Key p.",
             ChInvert(_) => "Turn the trace upside down. Key i.",
+            ChDeskew(_) => "Move the trace left (-) or right (+) in time, to line up two signals or take out a probe delay. At most one screen width. Only the drawing moves: measurements and math use the real times. Type a value like 5ns.",
+            TraceColour(_) => "Names: the terminal theme picks the shade. # types RGB like #ff8800.",
+            TraceBright(_) => "+ stands out more from the background, - fades toward it. -100 %: the background. 16 colours: +50 bold, -50 dim.",
+            TraceSat(_) => "0 %: gray. 100 %: the colour. 400 %: stronger, up to the most vivid shade the screen shows. Not in 16 colours.",
             Style(_) => "braille thin: lines through the low and high value of each dot column. braille bold: two dots thick. ascii and box lines: no braille.",
             MathEnabled => "Show the math trace. Key 3.",
             MathMode => "How the math trace is made from CH1 and CH2. Key m.",
@@ -508,7 +540,8 @@ impl Field {
             Averaging => "Average the last N triggers (a sliding window): less noise. Key A.",
             Persistence => "Keep this many old traces on screen, dimmed. Key P.",
             Xy => "Draw CH1 against CH2. Key x.",
-            Colors => "auto uses true colour when COLORTERM says so.",
+            Colors => "How many colours to send. auto: true colour when COLORTERM says so, else 256.",
+            Colortheme => "terminal: the terminal's own colours. light, dark: our own colours, sent as RGB.",
             GridLook => "Look of the division lines. The center cross has its own Axis settings.",
             GridExtent => "points: marks where division lines cross. full: every division line across the whole plot.",
             GridBrightness => "How bright the grid is. Traces are always drawn over it.",
@@ -517,7 +550,7 @@ impl Field {
             AxisBrightness => "How bright the center cross is. It is drawn over the grid, under the traces.",
             CursorLook(_) => "classic: dashes, name inside the plot. fine dashes: short dashes, name in the margin. solid, dotted: name inside.",
             CursorColour(_) => "Colour of the cursor line and its name.",
-            SpecOn => "Show the spectrum (FFT) below the trace. Key f.",
+            SpecView => "off: no spectrum. split: the spectrum (FFT) below the trace. full: the spectrum on the whole plot area, no trace. Key f.",
             SpecWindow => "Window function for the FFT. Key w.",
             SpecZoom => "Highest frequency on the spectrum screen. Key F.",
             CursorPos(i) if i < 2 => "Space: on/off. Time from the screen center, in seconds. Keys h l H L; v hides all.",
@@ -565,12 +598,9 @@ impl Field {
     pub fn kind(self) -> Kind {
         use Field::*;
         match self {
-            ChEnabled(_) | ChInvert(_) | MathEnabled | Xy | SpecOn | MeasPanel => {
-                Kind::Bool
-            }
-            ChOffset(_) | MathOffset | TrigLevel | TrigPosition | CursorPos(_) | CalFreq => {
-                Kind::Number
-            }
+            ChEnabled(_) | ChInvert(_) | MathEnabled | Xy | MeasPanel => Kind::Bool,
+            ChOffset(_) | ChDeskew(_) | MathOffset | TrigLevel | TrigPosition | CursorPos(_)
+            | CalFreq | TraceBright(_) | TraceSat(_) => Kind::Number,
             Roll | DevModel | DevSerial | DevFirmware | DevState | DevCalibration | DevRate
             | ExportDir | SettingsFile | ConfigWarnings | LogDir | LogFree => Kind::Info,
             CalZero | CalGain => Kind::Info,
@@ -639,6 +669,17 @@ impl Field {
                 .iter()
                 .map(|m| m.name().to_string())
                 .collect(),
+            Colortheme => ColorTheme::ALL
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect(),
+            TraceColour(t) => {
+                let mut all: Vec<String> = TraceColor::choices().iter().map(|c| c.name()).collect();
+                if let c @ TraceColor::Rgb(_) = s.display.trace_colors[t] {
+                    all.push(c.name());
+                }
+                all
+            }
             Style(_) => crate::settings::TraceStyle::ALL
                 .iter()
                 .map(|m| m.name().to_string())
@@ -662,6 +703,10 @@ impl Field {
             GridBrightness | AxisBrightness => {
                 GRID_BRIGHTNESS.iter().map(|b| format!("{b} %")).collect()
             }
+            SpecView => SpectrumView::ALL
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect(),
             SpecWindow => Window::ALL.iter().map(|w| w.name().to_string()).collect(),
             SpecZoom => (0..=MAX_SPECTRUM_ZOOM)
                 .map(|z| match d.rate {
@@ -746,7 +791,7 @@ impl Field {
             ChInvert(c) => b(s.channels[c].invert),
             MathEnabled => b(s.math.enabled),
             Xy => b(s.display.xy),
-            SpecOn => b(s.display.spectrum),
+            SpecView => index_of(&SpectrumView::ALL, &s.display.spectrum),
             MeasPanel => b(s.display.measurements),
             ChVolts(c) => s.channels[c].volt_idx,
             ChCoupling(c) => b(s.channels[c].coupling == Coupling::Ac),
@@ -773,7 +818,13 @@ impl Field {
             Averaging => index_of(&AVERAGING, &s.display.averaging),
             Persistence => index_of(&PERSISTENCE, &s.display.persistence),
             Colors => index_of(&ColorMode::ALL, &s.display.colors),
+            Colortheme => index_of(&ColorTheme::ALL, &s.display.colortheme),
             Style(t) => index_of(&crate::settings::TraceStyle::ALL, &s.display.trace_style[t]),
+            TraceColour(t) => match s.display.trace_colors[t] {
+                TraceColor::Ansi(n) => n as usize,
+                // The RGB colour is the last option.
+                TraceColor::Rgb(_) => 16,
+            },
             CursorLook(i) => index_of(&crate::settings::CursorStyle::ALL, &s.cursors.get(i).style),
             CursorColour(i) => index_of(&CursorColor::ALL, &s.cursors.get(i).color),
             GridLook => index_of(&GridStyle::ALL, &s.display.grid_style),
@@ -812,7 +863,7 @@ impl Field {
             ChInvert(c) => s.channels[c].invert = on,
             MathEnabled => s.math.enabled = on,
             Xy => s.display.xy = on,
-            SpecOn => s.display.spectrum = on,
+            SpecView => s.display.spectrum = SpectrumView::ALL[i.min(SpectrumView::ALL.len() - 1)],
             MeasPanel => s.display.measurements = on,
             ChVolts(c) => {
                 s.channels[c].volt_idx = i.min(VOLT_DIVS.len() - 1);
@@ -855,6 +906,15 @@ impl Field {
             Averaging => s.display.averaging = AVERAGING[i.min(AVERAGING.len() - 1)],
             Persistence => s.display.persistence = PERSISTENCE[i.min(PERSISTENCE.len() - 1)],
             Colors => s.display.colors = ColorMode::ALL[i.min(ColorMode::ALL.len() - 1)],
+            Colortheme => {
+                s.display.colortheme = ColorTheme::ALL[i.min(ColorTheme::ALL.len() - 1)]
+            }
+            // The last option (an RGB colour) is the current one.
+            TraceColour(t) => {
+                if let Some(c) = TraceColor::choices().get(i) {
+                    s.display.trace_colors[t] = *c;
+                }
+            }
             Style(t) => {
                 let all = crate::settings::TraceStyle::ALL;
                 s.display.trace_style[t] = all[i.min(all.len() - 1)]
@@ -928,8 +988,8 @@ impl Field {
             ChOffset(_) | MathOffset => "div",
             TrigLevel => "V",
             CursorPos(i) if i >= 2 => "V",
-            TrigPosition => "%",
-            CursorPos(_) => "s",
+            TrigPosition | TraceBright(_) | TraceSat(_) => "%",
+            CursorPos(_) | ChDeskew(_) => "s",
             CalFreq => "Hz",
             _ => "",
         }
@@ -950,6 +1010,7 @@ impl Field {
         use Field::*;
         match self {
             ChOffset(c) => s.channels[c].offset,
+            ChDeskew(c) => s.channels[c].deskew,
             MathOffset => s.math.offset,
             TrigLevel => s.trigger.level,
             TrigPosition => s.trigger.position * 100.0,
@@ -959,6 +1020,8 @@ impl Field {
                 (s.cursors.get(i).position - offset) * scale
             }
             CalFreq => s.cal_freq as f64,
+            TraceBright(t) => s.display.trace_brightness[t] as f64,
+            TraceSat(t) => s.display.trace_saturation[t] as f64,
             _ => 0.0,
         }
     }
@@ -981,9 +1044,23 @@ impl Field {
             }
             _ if !unit_ok => return Err(format!("use {own} for {}", self.label())),
             ChOffset(c) => s.channels[c].offset = v.clamp(-half_v, half_v),
+            ChDeskew(c) => {
+                let max = s.max_deskew();
+                // Steps can end a hair off 0: snap to it.
+                let v = if v.abs() < 1e-6 * s.time_per_div() { 0.0 } else { v };
+                s.channels[c].deskew = v.clamp(-max, max);
+            }
             MathOffset => s.math.offset = v.clamp(-half_v, half_v),
             TrigLevel => s.trigger.level = v,
             TrigPosition => s.trigger.position = (v / 100.0).clamp(0.0, 1.0),
+            TraceBright(t) => {
+                let max = crate::settings::TRACE_BRIGHTNESS_MAX as f64;
+                s.display.trace_brightness[t] = v.round().clamp(-max, max) as i16;
+            }
+            TraceSat(t) => {
+                let max = crate::settings::TRACE_SATURATION_MAX as f64;
+                s.display.trace_saturation[t] = v.round().clamp(0.0, max) as u16;
+            }
             CursorPos(i) if i < 2 => {
                 s.cursors.get_mut(i).position = (v / s.time_per_div()).clamp(-half_h, half_h)
             }
@@ -1018,8 +1095,9 @@ impl Field {
         self.step_number_by(s, dir, 1.0);
     }
 
-    /// Like [`Field::step_number`], with the step times `scale` (0.1 for
-    /// Alt-j/k: a fine step). The calibration frequency has fixed steps.
+    /// Like [`Field::step_number`], with the step times `scale` (see
+    /// [`Field::fine_scale`] for Alt-j/k). The calibration frequency has
+    /// fixed steps.
     pub fn step_number_by(self, s: &mut Settings, dir: i64, scale: f64) {
         if self == Field::CalFreq {
             let i = index_of(&CAL_FREQS, &s.cal_freq) as i64 + dir;
@@ -1030,11 +1108,21 @@ impl Field {
         }
     }
 
+    /// The share of the step Alt-j/k takes: a tenth, or 1 % for the
+    /// trace brightness and saturation (steps of 5 %).
+    pub fn fine_scale(self) -> f64 {
+        match self {
+            Field::TraceBright(_) | Field::TraceSat(_) => 0.2,
+            _ => 0.1,
+        }
+    }
+
     /// The step of [`Field::step_number`] as text.
     pub fn step_text(self, s: &Settings) -> String {
         match self {
             Field::ChOffset(_) | Field::MathOffset => format!("± {:.1} div", self.step(s)),
             Field::TrigPosition => format!("± {:.0} %", self.step(s)),
+            Field::TraceBright(_) | Field::TraceSat(_) => "± 5 % · alt ± 1 %".into(),
             Field::CalFreq => "next / previous step".into(),
             Field::CursorPos(_) => {
                 format!("± {} · space on/off", fmt_si(self.step(s), self.unit()))
@@ -1049,8 +1137,9 @@ impl Field {
         match self {
             ChOffset(_) | MathOffset => 0.1,
             TrigLevel => 0.1 * s.channels[s.trigger_source()].volts_per_div(),
-            TrigPosition => 5.0,
+            TrigPosition | TraceBright(_) | TraceSat(_) => 5.0,
             CursorPos(i) if i < 2 => 0.1 * s.time_per_div(),
+            ChDeskew(_) => 0.1 * s.time_per_div(),
             CursorPos(_) => 0.1 * Self::cursor_scale(s).0,
             _ => 0.0,
         }
@@ -1086,7 +1175,8 @@ impl Field {
                     format!("off · {}", fmt_si(self.number(s), self.unit()))
                 }
                 ChOffset(_) | MathOffset => format!("{:.1} div", self.number(s)),
-                TrigPosition => format!("{:.0} %", self.number(s)),
+                TraceBright(_) if self.number(s) > 0.0 => format!("+{:.0} %", self.number(s)),
+                TrigPosition | TraceBright(_) | TraceSat(_) => format!("{:.0} %", self.number(s)),
                 _ => fmt_si(self.number(s), self.unit()),
             },
             Kind::Info => {
@@ -1331,6 +1421,8 @@ impl Panel {
             .cats
             .iter()
             .flat_map(|c| &c.fields)
+            // The colour lists scroll: they would make the panel tall.
+            .filter(|f| !matches!(f, Field::TraceColour(_)))
             .map(|f| match f.kind() {
                 Kind::Choice | Kind::Bool => f.options(s, d).len(),
                 // The value box, the step, the key hint and an error.
@@ -1369,6 +1461,11 @@ impl Panel {
         self.item = self.item.min(n.saturating_sub(1));
     }
 
+    /// True while a trace colour is typed.
+    fn typing_colour(&self) -> bool {
+        self.input.is_some() && matches!(self.current(), Some(Field::TraceColour(_)))
+    }
+
     /// True when the value column shows a number (not a list).
     pub fn on_number(&self) -> bool {
         self.focus == Focus::Values && self.current().is_some_and(|f| f.kind() == Kind::Number)
@@ -1389,6 +1486,18 @@ impl Panel {
         }
         if self.searching {
             return self.search_key(key, s, d);
+        }
+        let colour = matches!(self.current(), Some(Field::TraceColour(_)));
+        if colour
+            && self.focus == Focus::Values
+            && key.code == KeyCode::Char('#')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.input = Some("#".into());
+            self.error = None;
+            return Outcome::None;
         }
         let act = keys.action(&[View::Panel], &key);
         if self.on_number() {
@@ -1448,8 +1557,9 @@ impl Panel {
             Act::PanelNext if items => self.toggle(s, d, 1, false),
             Act::PanelPrevious if items => self.toggle(s, d, -1, false),
             // Types a value on number fields; the next value on others.
-            Act::PanelType if items => match self.current().map(Field::kind) {
+            Act::PanelType if items || colour => match self.current().map(Field::kind) {
                 Some(Kind::Number) => self.open_input(s),
+                _ if colour => self.open_input(s),
                 _ => self.toggle(s, d, 1, false),
             },
             _ => Outcome::None,
@@ -1629,12 +1739,20 @@ impl Panel {
     /// (so Backspace edits it). Also moves to the value column: `=` and
     /// `i` on a number setting.
     fn open_input(&mut self, s: &Settings) -> Outcome {
+        if let Some(Field::TraceColour(t)) = self.current() {
+            self.input = Some(s.display.trace_colors[t].name());
+            self.error = None;
+            self.focus = Focus::Values;
+            return Outcome::None;
+        }
         if let Some(f) = self.current() {
             if f.kind() == Kind::Number {
                 let v = f.number(s);
                 let text = match f {
                     Field::ChOffset(_) | Field::MathOffset => format!("{v:.1}"),
-                    Field::TrigPosition => format!("{v:.0}"),
+                    Field::TrigPosition | Field::TraceBright(_) | Field::TraceSat(_) => {
+                        format!("{v:.0}")
+                    }
                     _ => fmt_si(v, f.unit()).replace(' ', ""),
                 };
                 self.input = Some(text);
@@ -1679,7 +1797,7 @@ impl Panel {
             };
             if dir != 0 {
                 let before = s.clone();
-                f.step_number_by(s, dir, 0.1);
+                f.step_number_by(s, dir, f.fine_scale());
                 return Some(if *s == before {
                     Outcome::None
                 } else {
@@ -1729,10 +1847,19 @@ impl Panel {
             return Ok(Outcome::None);
         };
         let before = s.clone();
-        match parse_value(&text).and_then(|(v, unit)| f.set_number(s, v, &unit)) {
+        let set = match f {
+            Field::TraceColour(t) => {
+                TraceColor::parse(&text).map(|c| s.display.trace_colors[t] = c)
+            }
+            _ => parse_value(&text).and_then(|(v, unit)| f.set_number(s, v, &unit)),
+        };
+        match set {
             Ok(()) => {
                 self.input = None;
                 self.error = None;
+                if let Field::TraceColour(_) = f {
+                    self.value = f.index(s);
+                }
                 Ok(if *s == before {
                     Outcome::None
                 } else {
@@ -1765,6 +1892,13 @@ impl Panel {
                 Outcome::None
             }
             KeyCode::Enter => self.apply_input(s).unwrap_or(Outcome::None),
+            // A colour name has an h: it is typed there.
+            KeyCode::Char('h') if self.typing_colour() => {
+                if let Some(t) = self.input.as_mut() {
+                    t.push('h');
+                }
+                Outcome::None
+            }
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Tab => match self.apply_input(s) {
                 Ok(out) => {
                     self.focus = Focus::Items;
@@ -1776,7 +1910,7 @@ impl Panel {
                 Ok(out) => {
                     let dir = if key.code == KeyCode::Up { 1 } else { -1 };
                     let before = s.clone();
-                    if let Some(f) = self.current() {
+                    if let Some(f) = self.current().filter(|f| f.kind() == Kind::Number) {
                         f.step_number(s, dir);
                     }
                     if out == Outcome::Changed || *s != before {
@@ -2015,7 +2149,7 @@ mod tests {
         key(&mut p, &mut s, KeyCode::Char('l'));
         assert_eq!(p.focus, Focus::Items);
         key(&mut p, &mut s, KeyCode::Char('G'));
-        assert_eq!(p.current(), Some(Field::Style(0)));
+        assert_eq!(p.current(), Some(Field::TraceSat(0)));
         keys(&mut p, &mut s, "gg");
         assert_eq!(p.current(), Some(Field::ChEnabled(0)));
         key(&mut p, &mut s, KeyCode::Char('h'));
@@ -2206,6 +2340,157 @@ mod tests {
         Field::ChOffset(0).set_number(&mut s, 99.0, "").unwrap();
         assert_eq!(s.channels[0].offset, 4.0);
         assert!(Field::TrigLevel.set_number(&mut s, 1.0, "s").is_err());
+    }
+
+    #[test]
+    fn deskew_takes_seconds_in_steps_of_a_tenth_division() {
+        let mut s = Settings::default();
+        let mut p = Panel::new();
+        goto(&mut p, &mut s, "Channel 2", "Deskew");
+        key(&mut p, &mut s, KeyCode::Char('l'));
+        keys(&mut p, &mut s, "-250u");
+        assert_eq!(key(&mut p, &mut s, KeyCode::F(2)), Outcome::Close);
+        assert!((s.channels[1].deskew + 250e-6).abs() < 1e-12);
+        assert_eq!(s.channels[0].deskew, 0.0);
+        // 1 ms/div: a step is 0.1 ms. Steps that reach 0 end on 0 exactly.
+        let f = Field::ChDeskew(1);
+        assert!((f.step(&s) - 1e-4).abs() < 1e-15);
+        f.step_number(&mut s, 1);
+        assert!((s.channels[1].deskew + 150e-6).abs() < 1e-12);
+        f.step_number_by(&mut s, 1, 0.5);
+        f.step_number(&mut s, 1);
+        assert_eq!(s.channels[1].deskew, 0.0);
+        assert_eq!(f.value(&s, &DeviceInfo::default()), fmt_si(0.0, "s"));
+        // At most one screen width (10 ms) either way.
+        f.set_number(&mut s, 1.0, "").unwrap();
+        assert_eq!(s.channels[1].deskew, 10e-3);
+        f.set_number(&mut s, -1.0, "s").unwrap();
+        assert_eq!(s.channels[1].deskew, -10e-3);
+        assert!(f.set_number(&mut s, 1.0, "V").is_err());
+    }
+
+    #[test]
+    fn trace_colour_picks_a_name_or_takes_rgb() {
+        let mut s = Settings::default();
+        let mut p = Panel::new();
+        goto(&mut p, &mut s, "Math", "Colour");
+        assert_eq!(p.current(), Some(Field::TraceColour(2)));
+        let f = Field::TraceColour(2);
+        assert_eq!(f.value(&s, &DeviceInfo::default()), "bright-magenta");
+        let opts = f.options(&s, &DeviceInfo::default());
+        assert_eq!(opts.len(), 16);
+        assert!(!opts.contains(&"auto".to_string()));
+        // k in the value column: the name before, applied at once.
+        key(&mut p, &mut s, KeyCode::Char('l'));
+        assert_eq!(p.focus, Focus::Values);
+        assert_eq!(keys(&mut p, &mut s, "kkkkkkkkkk"), vec![Outcome::Changed; 10]);
+        assert_eq!(s.display.trace_colors[2], TraceColor::Ansi(3));
+        assert_eq!(f.value(&s, &DeviceInfo::default()), "yellow");
+        // # types an RGB colour.
+        key(&mut p, &mut s, KeyCode::Char('#'));
+        assert_eq!(p.input.as_deref(), Some("#"));
+        keys(&mut p, &mut s, "ff00f");
+        assert_eq!(key(&mut p, &mut s, KeyCode::Enter), Outcome::None);
+        assert!(p.error.as_deref().is_some_and(|e| e.contains("not a colour")));
+        assert_eq!(s.display.trace_colors[2], TraceColor::Ansi(3));
+        keys(&mut p, &mut s, "f");
+        assert_eq!(key(&mut p, &mut s, KeyCode::Enter), Outcome::Changed);
+        assert_eq!(p.input, None);
+        assert_eq!(s.display.trace_colors[2], TraceColor::Rgb((255, 0, 255)));
+        // The RGB colour is the last option, and the cursor is on it.
+        let opts = f.options(&s, &DeviceInfo::default());
+        assert_eq!(opts.len(), 17);
+        assert_eq!(opts[16], "#ff00ff");
+        assert_eq!(p.value, 16);
+        // k goes back to the names.
+        key(&mut p, &mut s, KeyCode::Char('k'));
+        assert_eq!(s.display.trace_colors[2], TraceColor::Ansi(15));
+        // = types from the current value; a name works too.
+        key(&mut p, &mut s, KeyCode::Char('h'));
+        key(&mut p, &mut s, KeyCode::Char('='));
+        assert_eq!(p.input.as_deref(), Some("white"));
+        for _ in 0..5 {
+            key(&mut p, &mut s, KeyCode::Backspace);
+        }
+        keys(&mut p, &mut s, "bright-cyan");
+        key(&mut p, &mut s, KeyCode::Enter);
+        assert_eq!(s.display.trace_colors[2], TraceColor::Ansi(14));
+        // The other traces keep theirs.
+        assert_eq!(s.display.trace_colors[0], TraceColor::Ansi(11));
+        // Colour, brightness and saturation end each trace's settings.
+        for (c, t) in [(0, 0), (1, 1), (2, 2)] {
+            let f = &categories()[c].fields;
+            assert_eq!(
+                f[f.len() - 3..],
+                [Field::TraceColour(t), Field::TraceBright(t), Field::TraceSat(t)]
+            );
+        }
+    }
+
+    #[test]
+    fn trace_brightness_and_saturation_step_and_type() {
+        let mut s = Settings::default();
+        let mut p = Panel::new();
+        let d = DeviceInfo::default();
+        let alt = |p: &mut Panel, s: &mut Settings, c: char| {
+            p.handle_key(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT),
+                s,
+                &d,
+                &KeyMap::default(),
+            )
+        };
+        goto(&mut p, &mut s, "Channel 1", "Brightness");
+        assert_eq!(p.current(), Some(Field::TraceBright(0)));
+        assert_eq!(Field::TraceBright(0).value(&s, &d), "0 %");
+        key(&mut p, &mut s, KeyCode::Char('l'));
+        assert!(p.on_number());
+        // k: 5 % up, Alt-k: 1 %, Alt-j: 1 % down; j goes below 0.
+        assert_eq!(keys(&mut p, &mut s, "kk"), vec![Outcome::Changed; 2]);
+        assert_eq!(s.display.trace_brightness[0], 10);
+        assert_eq!(Field::TraceBright(0).value(&s, &d), "+10 %");
+        assert_eq!(alt(&mut p, &mut s, 'k'), Outcome::Changed);
+        assert_eq!(s.display.trace_brightness[0], 11);
+        alt(&mut p, &mut s, 'j');
+        alt(&mut p, &mut s, 'j');
+        assert_eq!(s.display.trace_brightness[0], 9);
+        assert_eq!(keys(&mut p, &mut s, "jjj"), vec![Outcome::Changed; 3]);
+        assert_eq!(s.display.trace_brightness[0], -6);
+        assert_eq!(Field::TraceBright(0).value(&s, &d), "-6 %");
+        // Typed numbers, signed, clamped to -100 .. 100.
+        keys(&mut p, &mut s, "250");
+        assert_eq!(key(&mut p, &mut s, KeyCode::Enter), Outcome::Changed);
+        assert_eq!(s.display.trace_brightness[0], 100);
+        keys(&mut p, &mut s, "-40");
+        key(&mut p, &mut s, KeyCode::Enter);
+        assert_eq!(s.display.trace_brightness[0], -40);
+        assert_eq!(Field::TraceBright(0).value(&s, &d), "-40 %");
+        keys(&mut p, &mut s, "-300");
+        key(&mut p, &mut s, KeyCode::Enter);
+        assert_eq!(s.display.trace_brightness[0], -100);
+        assert_eq!(keys(&mut p, &mut s, "j"), vec![Outcome::None]);
+        keys(&mut p, &mut s, "-40");
+        key(&mut p, &mut s, KeyCode::Enter);
+        // Saturation: the next row, 100 % by default, up to 400 %.
+        key(&mut p, &mut s, KeyCode::Char('h'));
+        key(&mut p, &mut s, KeyCode::Char('j'));
+        assert_eq!(p.current(), Some(Field::TraceSat(0)));
+        assert_eq!(Field::TraceSat(0).value(&s, &d), "100 %");
+        key(&mut p, &mut s, KeyCode::Char('l'));
+        key(&mut p, &mut s, KeyCode::Char('k'));
+        assert_eq!(s.display.trace_saturation[0], 105);
+        alt(&mut p, &mut s, 'j');
+        assert_eq!(s.display.trace_saturation[0], 104);
+        keys(&mut p, &mut s, "399");
+        key(&mut p, &mut s, KeyCode::Enter);
+        assert_eq!(keys(&mut p, &mut s, "kk"), vec![Outcome::Changed, Outcome::None]);
+        assert_eq!(s.display.trace_saturation[0], 400);
+        keys(&mut p, &mut s, "900");
+        key(&mut p, &mut s, KeyCode::Enter);
+        assert_eq!(s.display.trace_saturation[0], 400);
+        // The other traces keep theirs.
+        assert_eq!(s.display.trace_brightness, [-40, 0, 0]);
+        assert_eq!(s.display.trace_saturation[1..], [100, 100]);
     }
 
     #[test]

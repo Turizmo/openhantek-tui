@@ -1010,6 +1010,32 @@ mod tests {
         panic!("no frame");
     }
 
+    /// 200 ms/div, the slowest triggered time base: a 2 s capture comes
+    /// out whole, and the stream is not started again. (The fake waits
+    /// for room in the ring; `ring_holds_the_longest_triggered_screen`
+    /// checks the size for a real scope, which drops data instead.)
+    #[test]
+    fn slowest_triggered_time_base_fits_the_ring() {
+        let slow = Wave::Sine {
+            freq: 2.0,
+            amp: 2.0,
+            dc: 0.0,
+        };
+        let fake = FakeScope::new([slow, Wave::Dc(0.0)]);
+        let acq = Acquisition::spawn(fake_opener(fake));
+        let mut s = settings(0.2);
+        s.trigger.level = 0.0;
+        assert!(!s.roll());
+        go(&acq, 1, &s);
+        let p = next_frame(&acq, 1);
+        assert_eq!(p.state, TrigState::Triggered);
+        let f = p.frame.as_ref().unwrap();
+        assert!(!f.roll);
+        let (d, _, _) = ProcSettings::of(&s, 1).window(f.rate);
+        assert_eq!(f.traces[0].as_ref().unwrap().len(), capture_len(d));
+        assert!(!wait_event(&acq, 3, |e| matches!(e, Event::Restart(_))));
+    }
+
     /// Wait for an event that `want` takes.
     fn wait_event(acq: &Acquisition, secs: u64, want: impl Fn(&Event) -> bool) -> bool {
         let t0 = Instant::now();
@@ -1035,7 +1061,7 @@ mod tests {
         let f = p.frame.as_ref().unwrap();
         let (d, _, _) = ProcSettings::of(&s, 1).window(f.rate);
         assert_eq!(f.traces[0].as_ref().unwrap().len(), capture_len(d));
-        let roll = settings(0.2);
+        let roll = settings(0.5);
         go(&acq, 2, &roll);
         let p = next_frame(&acq, 2);
         assert_eq!(p.state, TrigState::Roll);

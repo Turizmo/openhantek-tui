@@ -89,7 +89,7 @@ fn ch1_only_uses_one_channel_and_a_faster_rate() {
 #[test]
 fn roll_mode_scrolls_with_new_data() {
     let mut s = Settings::default();
-    s.time_idx = time_index(200e-3);
+    s.time_idx = time_index(500e-3);
     let slow = Wave::Sine {
         freq: 2.0,
         amp: 1.0,

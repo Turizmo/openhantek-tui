@@ -122,6 +122,16 @@ fn main() -> Result<()> {
         };
     }
 
+    // The terminal's colours, for the Terminal colour theme. Asked
+    // before the screen is set up, so no answer can show on it.
+    openhantek_tui::termcolors::set_detected(openhantek_tui::termcolors::query());
+    if let Some(note) = openhantek_tui::theme::fallback_note(
+        app.scope.settings.display.colortheme,
+        openhantek_tui::termcolors::detected().as_ref(),
+        openhantek_tui::theme::colorfgbg(),
+    ) {
+        app.notify(note, false);
+    }
     let mut terminal = ratatui::init();
     let enhanced = push_keyboard_enhancement();
     let result = run(&mut terminal, &mut app);
