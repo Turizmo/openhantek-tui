@@ -863,8 +863,6 @@ pub struct LoggerSettings {
     pub log_dir: Option<std::path::PathBuf>,
     pub time_axis: TimeAxis,
     pub csv_time: CsvTime,
-    /// Mean line, min..max area or both, in the log view.
-    pub trace_mode: TraceMode,
 }
 
 impl Default for LoggerSettings {
@@ -875,7 +873,6 @@ impl Default for LoggerSettings {
             log_dir: None,
             time_axis: TimeAxis::Clock,
             csv_time: CsvTime::Iso,
-            trace_mode: TraceMode::Both,
         }
     }
 }

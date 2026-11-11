@@ -97,6 +97,7 @@ fn plot_rows(lines: &[String]) -> String {
 fn log_view_draws_each_trace_style() {
     let (mut app, dir) = app_with_log("styles");
     assert!(app.show_log);
+    app.scope.settings.display.trace_mode = TraceMode::Both;
     for style in TraceStyle::ALL {
         app.scope.settings.display.trace_style = [style; 3];
         let lines = screen(&app, 120, 40);
@@ -474,23 +475,25 @@ fn log_view_zooms_in_past_one_step_per_dot_column() {
 fn log_view_trace_modes() {
     let (mut app, dir) = app_with_log("modes");
     app.scope.settings.display.trace_style = [TraceStyle::Box; 3];
-    // Both is the log view default: the area and the line.
-    assert_eq!(app.scope.settings.logger.trace_mode, TraceMode::Both);
-    let both = plot_rows(&screen(&app, 120, 40));
-    assert!(both.matches('░').count() > 100 && both.contains('─'));
-    // D in the log view: average, only the line.
-    key(&mut app, KeyCode::Char('D'));
-    assert_eq!(app.scope.settings.logger.trace_mode, TraceMode::Average);
+    // The log view uses the trace mode of the scope view: average.
+    assert_eq!(app.scope.settings.display.trace_mode, TraceMode::Average);
     let avg = plot_rows(&screen(&app, 120, 40));
     assert_eq!(avg.matches('░').count(), 0);
     assert!(avg.contains('─'));
-    // Peak: the area only, in the trace colour.
+    // D in the log view: peak, the area only, in the trace colour.
     key(&mut app, KeyCode::Char('D'));
-    assert_eq!(app.scope.settings.logger.trace_mode, TraceMode::Peak);
+    assert_eq!(app.scope.settings.display.trace_mode, TraceMode::Peak);
     let peak = plot_rows(&screen(&app, 120, 40));
     assert!(peak.matches('░').count() > 100);
-    // The scope view's mode did not change.
-    assert_eq!(app.scope.settings.display.trace_mode, TraceMode::Average);
+    // Both: the area and the line.
+    key(&mut app, KeyCode::Char('D'));
+    assert_eq!(app.scope.settings.display.trace_mode, TraceMode::Both);
+    let both = plot_rows(&screen(&app, 120, 40));
+    assert!(both.matches('░').count() > 100 && both.contains('─'));
+    // z in the log view steps the interpolation of the scope view.
+    let before = app.scope.settings.display.interpolation;
+    key(&mut app, KeyCode::Char('z'));
+    assert_eq!(app.scope.settings.display.interpolation, before.next());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -542,7 +545,7 @@ fn raw_log_in_the_log_view_and_csv() {
         key(&mut app, KeyCode::Char('+'));
     }
     for mode in TraceMode::ALL {
-        app.scope.settings.logger.trace_mode = mode;
+        app.scope.settings.display.trace_mode = mode;
         for style in TraceStyle::ALL {
             app.scope.settings.display.trace_style = [style; 3];
             let plot = plot_rows(&screen(&app, 120, 40));
@@ -588,9 +591,9 @@ fn log_view_both_mode_line_looks_like_average_mode() {
     };
     for style in TraceStyle::ALL {
         app.scope.settings.display.trace_style = [style; 3];
-        app.scope.settings.logger.trace_mode = TraceMode::Average;
+        app.scope.settings.display.trace_mode = TraceMode::Average;
         let avg = buffer(&app);
-        app.scope.settings.logger.trace_mode = TraceMode::Both;
+        app.scope.settings.display.trace_mode = TraceMode::Both;
         let both = buffer(&app);
         for t in 0..2 {
             let (a, b) = (cells(&avg, pal.trace[t]), cells(&both, pal.trace[t]));
@@ -599,5 +602,127 @@ fn log_view_both_mode_line_looks_like_average_mode() {
         }
         assert!(!cells(&both, pal.muted(0)).is_empty(), "{style:?}");
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A CH1 log of `n` steps of 1 ms: the mean of step `i` is `f(i)`, its
+/// min and max `spread` below and above it.
+fn ch1_log(name: &str, n: u64, spread: f32, f: impl Fn(u64) -> f32) -> (App, PathBuf) {
+    let dir = temp_dir(name);
+    let path = dir.join("log-ch1.ohlog");
+    let mut h = header(1_000_000, 20);
+    h.channels[1].enabled = false;
+    let sh = writer::shared(path.clone(), 0);
+    let w = Writer::spawn(sh.clone());
+    w.send(Msg::Begin(h));
+    let data = (0..n)
+        .flat_map(|i| {
+            let v = f(i);
+            [v - spread, v + spread, v]
+        })
+        .collect();
+    w.send(Msg::Records { first: 0, data });
+    w.finish();
+    let mut app = App::new(Settings::default(), None);
+    app.export_dir = dir.clone();
+    app.log_dir_override = Some(dir.clone());
+    assert!(app.open_log(&path));
+    for _ in 0..10 {
+        app.tick();
+    }
+    (app, dir)
+}
+
+/// Zoom the log view in to `k` dot columns per step, from step `start`.
+fn stretch(app: &mut App, k: u64, start: u64) {
+    screen(app, 120, 40);
+    let v = app.log_view.as_mut().unwrap();
+    v.zoom = Some(1);
+    v.stretch = k;
+    v.follow = false;
+    v.start = start;
+}
+
+fn buffer(app: &App) -> ratatui::buffer::Buffer {
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| ui::draw(f, app)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// Cells with braille dots in colour `c`.
+fn braille_cells(buf: &ratatui::buffer::Buffer, c: ratatui::style::Color) -> Vec<usize> {
+    buf.content()
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| {
+            let braille = |ch: char| ('\u{2801}'..='\u{28FF}').contains(&ch);
+            x.fg == c && x.symbol().chars().all(braille)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Zoomed in past one step per dot column, the area of each step goes
+/// through the same point as its mean (the middle of the step) and runs
+/// straight to the next, as in the scope view. It used to be a flat
+/// block over the whole step, half a step off the line: the line left
+/// the area at every edge.
+#[test]
+fn log_view_zoomed_in_area_holds_the_mean_line() {
+    // A step from 0 to 2 V; min and max 0.25 V from the mean.
+    let (mut app, dir) = ch1_log("area-line", 1_000, 0.25, |i| if i < 500 { 0.0 } else { 2.0 });
+    stretch(&mut app, 20, 495);
+    let pal = openhantek_tui::theme::Palette::of(&app.scope.settings.display);
+    let s = &mut app.scope.settings;
+    s.display.trace_style = [TraceStyle::BrailleThin; 3];
+    s.display.interpolation = Interpolation::Linear;
+    s.display.trace_mode = TraceMode::Average;
+    let avg = braille_cells(&buffer(&app), pal.line[0]);
+    // The line ramps over a step and more: many cells.
+    assert!(avg.len() > 100, "{}", avg.len());
+    app.scope.settings.display.trace_mode = TraceMode::Peak;
+    let peak = braille_cells(&buffer(&app), pal.line[0]);
+    let out: Vec<usize> = avg.iter().filter(|c| !peak.contains(c)).copied().collect();
+    assert!(out.is_empty(), "line cells outside the area: {out:?}");
+    // Both: the line as in average, the muted area around it.
+    app.scope.settings.display.trace_mode = TraceMode::Both;
+    let both = buffer(&app);
+    assert_eq!(braille_cells(&both, pal.line[0]), avg);
+    assert!(!braille_cells(&both, pal.muted(0)).is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The log view draws the mean with the interpolation of the scope
+/// view: linear lines, sin(x)/x, or one dot per step (samples only).
+#[test]
+fn log_view_follows_the_interpolation() {
+    let (mut app, dir) = ch1_log("interp", 3_000, 0.2, |i| {
+        (i as f32 / 6.0 * std::f32::consts::TAU).sin() * 1.5
+    });
+    stretch(&mut app, 20, 1_000);
+    let pal = openhantek_tui::theme::Palette::of(&app.scope.settings.display);
+    app.scope.settings.display.trace_style = [TraceStyle::BrailleThin; 3];
+    app.scope.settings.display.trace_mode = TraceMode::Average;
+    let mut ink = Vec::new();
+    for interp in Interpolation::ALL {
+        app.scope.settings.display.interpolation = interp;
+        let buf = buffer(&app);
+        ink.push((interp, braille_cells(&buf, pal.line[0]), buf));
+    }
+    let [(_, sinc, sinc_buf), (_, linear, linear_buf), (_, samples, _)] = &ink[..] else {
+        unreachable!()
+    };
+    assert!(linear.len() > 100, "{}", linear.len());
+    // sin(x)/x: a curve through the same points, not the straight lines.
+    assert!(sinc.len() > 100, "{}", sinc.len());
+    assert_ne!(sinc_buf, linear_buf);
+    // Samples only: one dot per step on the screen (about 11), no lines.
+    let v = app.log_view.as_ref().unwrap();
+    let span = v.span(v.width.get());
+    let n = samples.len() as u64;
+    assert!(n > 0 && n <= span + 1, "{n} {span}");
+    // z steps it in the log view too.
+    key(&mut app, KeyCode::Char('z'));
+    assert_eq!(app.scope.settings.display.interpolation, Interpolation::Sinc);
     std::fs::remove_dir_all(&dir).unwrap();
 }

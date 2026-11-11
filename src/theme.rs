@@ -631,15 +631,22 @@ pub const THEMED_CURSOR: f64 = 0.9;
 /// All colours the screen uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
-    /// CH1, CH2, MATH.
+    /// CH1, CH2, MATH: the chosen colour with no brightness or
+    /// saturation. For text and markers: the channel line, the
+    /// measurements, the labels and the arrows.
     pub trace: [Color; 3],
+    /// The drawn waveform of each trace: the chosen colour with its
+    /// brightness and saturation.
+    pub line: [Color; 3],
     /// How colours are written: true colour, 256 or 16 colours. Auto is
     /// true colour or 256 colours here, from `COLORTERM`.
     pub mode: ColorMode,
     /// The colours everything is made from: the terminal's or a preset.
     pub scheme: Scheme,
-    /// The trace colours as RGB, the source of the fading old traces.
+    /// The text colours of the traces as RGB.
     pub trace_rgb: [Rgb; 3],
+    /// The waveform colours as RGB, the source of the fading old traces.
+    pub line_rgb: [Rgb; 3],
     /// The ANSI colour (0 to 15) nearest to each trace, for the faded
     /// traces in 16 colours.
     pub trace16: [u8; 3],
@@ -695,9 +702,11 @@ impl Palette {
         let (fg, bg) = (scheme.fg, scheme.bg);
         let mut p = Self {
             trace: [Color::Reset; 3],
+            line: [Color::Reset; 3],
             mode: depth,
             scheme: *scheme,
             trace_rgb: [bg; 3],
+            line_rgb: [bg; 3],
             trace16: [11, 12, 13],
             trace_modifier: [Modifier::empty(); 3],
             looks: *traces,
@@ -723,10 +732,14 @@ impl Palette {
         p.trigger = p.slot(9);
         for (t, look) in traces.iter().enumerate() {
             let (c, rgb, n, m) = p.trace_of(*look);
-            p.trace[t] = c;
-            p.trace_rgb[t] = rgb;
+            p.line[t] = c;
+            p.line_rgb[t] = rgb;
             p.trace16[t] = n;
             p.trace_modifier[t] = m;
+            // The text keeps the plain colour.
+            let (c, rgb, _, _) = p.trace_of(TraceLook::plain(look.color));
+            p.trace[t] = c;
+            p.trace_rgb[t] = rgb;
         }
         p
     }
@@ -837,7 +850,7 @@ impl Palette {
             let dim = self.trace_modifier[t].contains(Modifier::DIM);
             return (plain, dim || (depth > 1 && age * 2 >= depth));
         }
-        let rgb = blend(self.trace_rgb[t], self.background, fade_level(age, depth));
+        let rgb = blend(self.line_rgb[t], self.background, fade_level(age, depth));
         match self.mode {
             ColorMode::TrueColor => (Color::Rgb(rgb.0, rgb.1, rgb.2), false),
             _ => (Color::Indexed(xterm_tint(rgb)), false),
@@ -1116,6 +1129,7 @@ mod tests {
         ];
         for t in 0..3 {
             v.push((format!("trace {t}"), p.trace[t]));
+            v.push((format!("line {t}"), p.line[t]));
             v.push((format!("muted {t}"), p.muted(t)));
             for age in 0..4 {
                 v.push((format!("persist {t} {age}"), p.persist(t, age, 4).0));
@@ -1346,11 +1360,11 @@ mod tests {
         let (bg, fg) = (term.bg.unwrap(), term.fg.unwrap());
         let want0 = adjust(term.ansi[11].unwrap(), bg, fg, -40, 100);
         let want1 = adjust(term.ansi[12].unwrap(), bg, fg, 0, 180);
-        assert_eq!(p.trace[0], Color::Rgb(want0.0, want0.1, want0.2));
-        assert_eq!(p.trace[1], Color::Rgb(want1.0, want1.1, want1.2));
+        assert_eq!(p.line[0], Color::Rgb(want0.0, want0.1, want0.2));
+        assert_eq!(p.line[1], Color::Rgb(want1.0, want1.1, want1.2));
         // MATH has neither: it stays the name.
-        assert_eq!(p.trace[2], Color::LightMagenta);
-        assert_eq!(p.trace_rgb[0], want0);
+        assert_eq!(p.line[2], Color::LightMagenta);
+        assert_eq!(p.line_rgb[0], want0);
         assert_eq!(p.trace_modifier, [Modifier::empty(); 3]);
         // The fades and the muted area come from the dimmed colour.
         let plain = Palette::build(ColorMode::TrueColor, None, &s, &AUTO3);
@@ -1368,16 +1382,16 @@ mod tests {
         up[0].brightness = 60;
         let u = Palette::build(ColorMode::TrueColor, None, &s, &up);
         let want = adjust(term.ansi[11].unwrap(), bg, fg, 60, 100);
-        assert_eq!(u.trace[0], Color::Rgb(want.0, want.1, want.2));
+        assert_eq!(u.line[0], Color::Rgb(want.0, want.1, want.2));
         assert!(light(want) > light(term.ansi[11].unwrap()));
-        assert_eq!(u.trace_rgb[0], want);
+        assert_eq!(u.line_rgb[0], want);
         // 256 colours: the nearest index.
         let q = Palette::build(ColorMode::Ansi256, None, &s, &looks);
-        assert_eq!(q.trace[0], Color::Indexed(xterm_index(want0)));
+        assert_eq!(q.line[0], Color::Indexed(xterm_index(want0)));
         // A preset: toward its own background.
         let t = Palette::build(ColorMode::TrueColor, None, &LIGHT, &looks);
         let w = adjust(LIGHT.ansi[11], LIGHT.bg, LIGHT.fg, -40, 100);
-        assert_eq!(t.trace[0], Color::Rgb(w.0, w.1, w.2));
+        assert_eq!(t.line[0], Color::Rgb(w.0, w.1, w.2));
         // An RGB colour is dimmed too.
         let mut rgb = looks;
         rgb[2] = TraceLook {
@@ -1386,7 +1400,37 @@ mod tests {
             saturation: 100,
         };
         let r = Palette::build(ColorMode::TrueColor, None, &DARK, &rgb);
-        assert_eq!(r.trace[2], Color::Rgb(DARK.bg.0, DARK.bg.1, DARK.bg.2));
+        assert_eq!(r.line[2], Color::Rgb(DARK.bg.0, DARK.bg.1, DARK.bg.2));
+    }
+
+    #[test]
+    fn brightness_and_saturation_change_only_the_line() {
+        let term = gruvbox(false);
+        let s = Scheme::of(ColorTheme::Terminal, Some(&term), None).0;
+        let mut looks = AUTO3;
+        looks[0].brightness = -60;
+        looks[1].saturation = 40;
+        for scheme in [s, DARK, LIGHT] {
+            for mode in [ColorMode::TrueColor, ColorMode::Ansi256] {
+                let plain = Palette::build(mode, None, &scheme, &AUTO3);
+                // At the defaults the text and the line are the same.
+                assert_eq!(plain.trace, plain.line);
+                assert_eq!(plain.trace_rgb, plain.line_rgb);
+                let p = Palette::build(mode, None, &scheme, &looks);
+                // The text keeps the plain colour.
+                assert_eq!(p.trace, plain.trace);
+                assert_eq!(p.trace_rgb, plain.trace_rgb);
+                // The line has the brightness and the saturation.
+                assert_ne!(p.line[0], p.trace[0]);
+                assert_ne!(p.line[1], p.trace[1]);
+                assert_eq!(p.line[2], p.trace[2]);
+                assert_ne!(p.line_rgb[0], p.trace_rgb[0]);
+            }
+        }
+        // The terminal theme: the text stays the name.
+        let p = Palette::build(ColorMode::TrueColor, None, &s, &looks);
+        assert_eq!(p.trace, [Color::LightYellow, Color::LightBlue, Color::LightMagenta]);
+        assert!(matches!(p.line[0], Color::Rgb(..)));
     }
 
     #[test]

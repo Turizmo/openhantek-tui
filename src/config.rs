@@ -109,7 +109,6 @@ pub const COMMENTS: &[(&str, &str)] = &[
     ("logger.log_dir", "log folder (default ~/.local/share/openhantek-tui/logs)"),
     ("logger.time_axis", "log view time labels: \"Clock\" (UTC) or \"Seconds\""),
     ("logger.csv_time", "log CSV time column: \"Iso\" (UTC) or \"Seconds\""),
-    ("logger.trace_mode", "log view: \"Average\" (mean line), \"Peak\" (min..max area) or \"Both\""),
     ("calibration.zero_ch1", "CH1 ADC count of 0 V per gain (20m 50m 100m 200m 500m 1 2 5 V/div), ADC below 30 MS/s; 0 = EEPROM value"),
     ("calibration.zero_ch2", "CH2 ADC count of 0 V per gain, like zero_ch1; 0 = EEPROM value"),
     ("calibration.zero_ch1_30m", "CH1 alone at 30 MS/s: ADC count of 0 V per gain; 0 = EEPROM value"),
@@ -277,6 +276,7 @@ pub fn settings_from_table(user: &toml::Table) -> (Settings, Vec<String>) {
     axis_from_old_grid(&mut user);
     auto_trace_colors(&mut user);
     brightness_from_dim(&mut user);
+    drop_log_trace_mode(&mut user);
     let mut warnings = Vec::new();
     let defaults = to_table(&Settings::default());
     let known: Vec<String> = leaves(&defaults)
@@ -319,6 +319,31 @@ pub fn settings_from_table(user: &toml::Table) -> (Settings, Vec<String>) {
     }
     let s = Settings::deserialize(good).unwrap_or_default();
     (s, warnings)
+}
+
+/// Files from when the log view had its own trace mode: it now uses
+/// `display.trace_mode`, as the scope view does. Drop the old setting
+/// and its key.
+fn drop_log_trace_mode(user: &mut toml::Table) {
+    if let Some(toml::Value::Table(l)) = user.get_mut("logger") {
+        l.remove("trace_mode");
+    }
+    if let Some(toml::Value::Table(k)) = user.get_mut("keys") {
+        k.remove("log_trace_mode");
+    }
+}
+
+/// Take the log view's own trace mode and its key out of the file, in
+/// place: other lines stay. Returns true when the file changed.
+fn drop_log_trace_mode_in_doc(doc: &mut DocumentMut) -> bool {
+    let mut changed = false;
+    if let Some(Item::Table(l)) = doc.get_mut("logger") {
+        changed |= l.remove("trace_mode").is_some();
+    }
+    if let Some(Item::Table(k)) = doc.get_mut("keys") {
+        changed |= k.remove("log_trace_mode").is_some();
+    }
+    changed
 }
 
 /// Files from before the axis settings drew the center cross with the
@@ -859,6 +884,15 @@ pub fn load(path: &Path, old: Option<&Path>) -> Loaded {
                     Err(e) => warnings.push(format!("Cannot write {}: {e:#}", path.display())),
                 }
             }
+            if drop_log_trace_mode_in_doc(&mut doc) {
+                match write_atomic(path, &doc.to_string()) {
+                    Ok(()) => notes.push(format!(
+                        "Removed logger.trace_mode from {}: the log view uses display.trace_mode now",
+                        path.display()
+                    )),
+                    Err(e) => warnings.push(format!("Cannot write {}: {e:#}", path.display())),
+                }
+            }
             let table: toml::Table = toml::from_str(&doc.to_string()).unwrap_or_default();
             let (settings, w) = settings_from_table(&table);
             warnings.extend(w);
@@ -1342,6 +1376,38 @@ mod tests {
         s.sanitize();
         assert_eq!(s.display.trace_brightness, [100, -100, 0]);
         assert_eq!(s.display.trace_saturation, [400, 0, 0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_log_trace_mode_goes_quietly() {
+        let dir = temp_dir("log-trace-mode");
+        let path = dir.join("config.toml");
+        // The file as the app wrote it, with the old log view trace mode
+        // and its key.
+        let text = generate(&Settings::default());
+        let old = text
+            .replace(
+                "[logger]\n",
+                "[logger]\n# log view: Average, Peak or Both\ntrace_mode = \"Peak\"\n",
+            )
+            .replace("[keys]\n", "[keys]\nlog_trace_mode = \"D\"\n");
+        assert_ne!(old, text);
+        assert!(old.contains("log_trace_mode"), "{old}");
+        std::fs::write(&path, &old).unwrap();
+        let l = load(&path, None);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert!(
+            l.notes.iter().any(|n| n.contains("logger.trace_mode")),
+            "{:?}",
+            l.notes
+        );
+        // Both lines and the comment go; nothing else changes.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        // The table path (an old settings.toml) drops it too.
+        let t: toml::Table = toml::from_str("[logger]\ntrace_mode = \"Peak\"\n").unwrap();
+        let (_, w) = settings_from_table(&t);
+        assert!(w.is_empty(), "{w:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

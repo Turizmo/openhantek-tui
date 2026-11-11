@@ -13,6 +13,7 @@ use super::{
     left_labels, put, trace_scale, NAMES,
 };
 use crate::app::App;
+use crate::dsp::sinc_interpolate;
 use crate::logger::{self as lg, writer::LogState};
 use crate::plot::{self, Geometry, Plot, MARKER_W};
 use crate::settings::*;
@@ -189,64 +190,86 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
         }
     }
 
-    // Envelopes in the trace mode: the mean as a line, the min..max
-    // area, or the line over the muted area.
-    let mode = s.logger.trace_mode;
+    // Envelopes in the trace mode and interpolation of the scope view:
+    // the mean as a line, the min..max area, or the line over the muted
+    // area.
+    let mode = s.display.trace_mode;
+    let dots = s.display.interpolation == Interpolation::Samples;
+    // Dot column of entry `j` (fractional between entries): its column,
+    // or (zoomed in past one step per dot column) the middle of its
+    // step, where its mean point is. The area goes through the same
+    // points, so the line stays inside it.
+    let dc_of = |j: f64| {
+        if k > 1 {
+            v.col_of(w, first as f64 + j + 0.5)
+        } else {
+            j
+        }
+    };
+    // sin(x)/x only when the screen has few steps, as in the scope view.
+    let factor = if k > 1 {
+        super::sinc_factor(s, v.span(w) as usize, w)
+    } else {
+        None
+    };
     for t in draw_order(s) {
         if t > 1 || !h.channels[t].enabled || !s.channels[t].enabled {
             continue;
         }
         let style = s.display.trace_style[t];
         let (scale, offset) = trace_scale(s, t);
-        let yd = |x: f32| (x as f64 / scale + offset).clamp(-half_v, half_v);
+        let yd = |x: f64| (x / scale + offset).clamp(-half_v, half_v);
         let layer = layer_of(s, t);
         let band_layer = plot::LAYER_BAND + if t == s.selected { 3 } else { 2 - t as u8 };
         super::trace_layer_modifier(&mut plot, pal, t, &[layer, band_layer]);
-        // The mean: a point per dot column, or (zoomed in past one step
-        // per dot column) a point in the middle of each step, joined.
-        let pts: Vec<(f64, f64)> = cols
-            .iter()
-            .enumerate()
-            .map(|(j, a)| {
-                let a = a[t];
-                let dc = if k > 1 {
-                    v.col_of(w, (first + j as u64) as f64 + 0.5)
-                } else {
-                    j as f64
-                };
-                (x_of(dc), if a.is_empty() { f64::NAN } else { yd(a.mean) })
-            })
-            .collect();
+        let runs = data_runs(&cols, t);
         // Single samples (raw logs, zoomed in) have no area: the peak is
         // the line through the samples.
         let band = mode.peak() && !(k > 1 && h.single());
         if mode.line() || !band {
-            plot.styled(&pts, style, false, layer, pal.trace[t]);
+            // The mean: a point per entry, joined, or the sin(x)/x curve
+            // through them. A gap breaks the line.
+            let mut pts: Vec<(f64, f64)> = Vec::new();
+            for r in &runs {
+                if !pts.is_empty() {
+                    pts.push((f64::NAN, f64::NAN));
+                }
+                let means: Vec<f64> = r.clone().map(|j| cols[j][t].mean as f64).collect();
+                match factor.filter(|_| !dots) {
+                    Some(f) => {
+                        let fine = sinc_interpolate(&means, f);
+                        pts.extend(fine.iter().enumerate().map(|(i, m)| {
+                            let j = r.start as f64 + i as f64 / f as f64;
+                            (x_of(dc_of(j)), yd(*m))
+                        }));
+                    }
+                    None => pts.extend(
+                        r.clone()
+                            .zip(&means)
+                            .map(|(j, m)| (x_of(dc_of(j as f64)), yd(*m))),
+                    ),
+                }
+            }
+            plot.styled(&pts, style, dots, layer, pal.line[t]);
         }
         if !band {
             continue;
         }
-        // The area per dot column: one entry, or a whole step as a flat
-        // band when zoomed in past one step per dot column.
+        // The area per dot column, through the same points as the mean,
+        // straight between them (as in the scope view).
         let mut ranges: Vec<Option<(f64, f64)>> = vec![None; w];
-        for (j, a) in cols.iter().enumerate() {
-            let a = a[t];
-            if a.is_empty() {
-                continue;
-            }
-            let dcs = if k > 1 {
-                let c0 = v.col_of(w, (first + j as u64) as f64).max(0.0) as usize;
-                let c1 = (v.col_of(w, (first + j as u64 + 1) as f64).max(0.0) as usize).min(w);
-                c0..c1
-            } else {
-                j..(j + 1).min(w)
-            };
-            for dc in dcs {
-                ranges[dc] = Some((yd(a.max), yd(a.min)));
-            }
+        for r in &runs {
+            let pts: Vec<(f64, f64, f64)> = r
+                .clone()
+                .map(|j| {
+                    let a = cols[j][t];
+                    (dc_of(j as f64), yd(a.max as f64), yd(a.min as f64))
+                })
+                .collect();
+            super::band_columns(&mut ranges, &pts);
         }
         match mode {
-            TraceMode::Peak => plot.band(&ranges, style, layer, pal.trace[t]),
+            TraceMode::Peak => plot.band(&ranges, style, layer, pal.line[t]),
             // Under the lines: the line owns its cells and looks the same
             // as the line alone; the muted area fills around it.
             _ => plot.band(&ranges, style, band_layer, pal.muted(t)),
@@ -299,6 +322,27 @@ pub fn draw_log(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
             put(buf, cx, g.plot.y - 1, name, style, right_x);
         }
     }
+}
+
+/// Runs of entries of channel `t` with data, in order. A gap (an entry
+/// with no data) ends a run.
+fn data_runs(cols: &[lg::pyramid::Aggs], t: usize) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (j, a) in cols.iter().enumerate() {
+        match (a[t].is_empty(), start) {
+            (false, None) => start = Some(j),
+            (true, Some(s)) => {
+                runs.push(s..j);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        runs.push(s..cols.len());
+    }
+    runs
 }
 
 /// The REC status: `● REC  412 MB / 1 GB   0:41:10, about 0:58:40 left

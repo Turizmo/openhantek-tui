@@ -480,8 +480,10 @@ saturation 100 a terminal colour of the `Terminal` theme stays the
 terminal colour, so the theme picks it exactly. Else the trace is
 written as RGB: true colour when there is true colour, else the nearest
 of the 256 colours. It is made from the RGB of the colour in the colour
-theme, or the `#rrggbb`. Old traces, the muted area, the channel line, the
-measurements, labels and markers all use the changed colour. In
+theme, or the `#rrggbb`. Brightness and saturation change only the drawn
+trace: the line, the old traces, the peak area and the muted area. The
+channel line, the measurements, the labels, the numbers and the markers
+keep the plain colour. In
 16-colour mode RGB is not possible: saturation does nothing. A
 brightness of -50 % or less draws the trace with the dim attribute, and
 +50 % or more with the bold attribute (many terminals draw bold text
@@ -819,12 +821,13 @@ under the cursor: a box asks `Delete log-20261107-185153.ohlog (2.3 MB)?
 y / n`, and only `y` deletes the `.ohlog` and its `.idx` summary file
 (`n`, `Esc` or any other key keeps it). The log being recorded is never
 deleted (stop it first); a log open in the log view is closed first.
-Logger › Trace mode (`logger.trace_mode`, `D` in the log view) picks
-what each channel shows: `average + peak` (the default) fills the band
-from min to max (a muted colour of the channel) under the mean as a line
-in the channel's trace style: braille thin or bold (dots), ascii lines
-(`:` fill) or box lines (`░` fill); `peak` the band alone in the channel
-colour, `average` the mean line alone. The grid settings apply. Volts/div, positions and
+The log view uses the trace mode and the interpolation of the scope
+view (Display › Trace mode, `D`; Display › Interpolation, `z`; both keys
+work in the log view too). `average` shows the mean as a line in the
+channel's trace style: braille thin or bold (dots), ascii lines (`:`
+fill) or box lines (`░` fill). `peak` fills the band from min to max in
+the channel colour. `average + peak` puts the mean line over the band in
+a muted colour. The grid settings apply. Volts/div, positions and
 channels on/off work as in the scope view (`↑` `↓` `[` `]` `{` `}`
 `Tab` `1` `2`).
 
@@ -839,13 +842,18 @@ channels on/off work as in the scope view (`↑` `↓` `[` `]` `{` `}`
 | `h` `l`, `H` `L` | move cursor A, cursor B (`Alt`: a tenth, at least one step) |
 | `t` | time labels: clock (UTC, with the date when the screen spans two days) or seconds since the start |
 | `E` | export CSV: between A and B when the cursors are on, else the whole log |
-| `D` | trace mode: average + peak / average / peak |
+| `D` | trace mode: average / peak / average + peak (the scope view's) |
+| `z` | interpolation: sin(x)/x / linear / samples only (the scope view's) |
 
 Past one step per dot column `+` goes on: each step is drawn over 2,
 5, 10, 20 ... dot columns, until about 10 steps fill the screen. Each
-step is then a flat band from its min to its max, and the mean is a
-line through the middles of the steps; logs of single samples (raw logs,
-and older logs at 2.5 µs) have no band, the line joins the samples (in
+step has its point in the middle of the step: the mean, and the band
+from its min to its max. As in the scope view, the line joins the points
+(linear), runs a smooth sin(x)/x curve through them, or shows only the
+points (samples only); the band runs straight from point to point, so
+a linear line stays inside it. sin(x)/x needs more than 4 dot columns per
+step, else the line is straight. Logs of single samples (raw logs, and
+older logs at 2.5 µs) have no band: the line joins the samples (in
 `peak` mode too). Time labels
 and the `/div` in the status line follow (like `1.1 ms/div`, with an
 extra decimal so the labels keep even steps), cursors sit in the middle

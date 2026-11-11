@@ -123,7 +123,6 @@ pub enum Act {
     LogTimeLabels,
     LogExport,
     /// Log view trace mode: average / peak / both.
-    LogTraceMode,
     // Settings panel.
     PanelDown,
     PanelUp,
@@ -275,7 +274,6 @@ pub const ACTIONS: &[ActionDef] = &[
     def(LogCursorFine(1, true), "log_cursor_b_right_fine", L, &["Alt-L"], "log view: move cursor B right, fine"),
     def(LogTimeLabels, "log_time_labels", L, &["t"], "log view: clock / seconds time labels"),
     def(LogExport, "log_export", L, &["E", "e"], "log view: export CSV (A to B with cursors)"),
-    def(LogTraceMode, "log_trace_mode", L, &["D"], "log view: average / peak (min..max area) / both"),
     def(PanelDown, "panel_down", P, &["j", "Down"], "panel: move down (in numbers: step down)"),
     def(PanelUp, "panel_up", P, &["k", "Up"], "panel: move up (in numbers: step up)"),
     def(PanelBack, "panel_back", P, &["h", "Left"], "panel: back one column"),
@@ -665,7 +663,6 @@ pub const LOG_HELP: &[(&[Act], &str)] = &[
     (&[LogCursorFine(1, false), LogCursorFine(1, true)], "move cursor B, fine"),
     (&[LogTimeLabels], "time labels: clock / seconds"),
     (&[LogExport], "export CSV (A–B when the cursors are on)"),
-    (&[LogTraceMode], "average / peak (min..max area) / both"),
 ];
 
 /// Scope keys that also work in the log view, for its help.
@@ -680,6 +677,8 @@ pub const LOG_SCOPE_HELP: &[(&[Act], &str)] = &[
     (&[TraceDown, TraceUp], "move the selected trace down / up"),
     (&[TraceDownFine, TraceUpFine], "move the selected trace a little"),
     (&[TraceCenter], "selected trace to the center"),
+    (&[TraceMode], "trace mode: average / peak (min..max area) / both"),
+    (&[Interpolation], "interpolation: sin(x)/x / linear / samples only"),
 ];
 
 /// Help rows with the user's keys. Alt keys are not listed one by one

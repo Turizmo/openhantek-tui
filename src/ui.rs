@@ -348,8 +348,7 @@ pub fn trace_points(
     if dots {
         return r.map(|i| (x(i as f64), y(tr[i]))).collect();
     }
-    if s.display.interpolation == Interpolation::Sinc && n * 4 < dots_x {
-        let factor = (dots_x / n).clamp(2, 32);
+    if let Some(factor) = sinc_factor(s, n, dots_x) {
         let lo = r.start.saturating_sub(6);
         let hi = (r.end + 6).min(tr.len());
         let fine = sinc_interpolate(&tr[lo..hi], factor);
@@ -363,6 +362,14 @@ pub fn trace_points(
     let lo = r.start.saturating_sub(1);
     let hi = (r.end + 1).min(tr.len());
     (lo..hi).map(|i| (x(i as f64), y(tr[i]))).collect()
+}
+
+/// Points per sample for sin(x)/x: `None` when the interpolation is
+/// another one, or when `n` samples on a screen `dots_x` dot columns wide
+/// are enough for straight lines.
+pub(crate) fn sinc_factor(s: &Settings, n: usize, dots_x: usize) -> Option<usize> {
+    (s.display.interpolation == Interpolation::Sinc && n > 0 && n * 4 < dots_x)
+        .then(|| (dots_x / n).clamp(2, 32))
 }
 
 /// The grid in the style of the display settings.
@@ -402,32 +409,41 @@ pub fn peak_columns(
     if r.is_empty() {
         return None;
     }
-    let w = plot.dots_w();
-    let mut cols: Vec<Option<(f64, f64)>> = vec![None; w];
-    let mut add = |c: i64, top: f64, bot: f64| {
-        if (0..w as i64).contains(&c) {
-            let e = &mut cols[c as usize];
-            *e = Some(e.map_or((top, bot), |(a, b)| (a.max(top), b.min(bot))));
-        }
-    };
+    let mut cols: Vec<Option<(f64, f64)>> = vec![None; plot.dots_w()];
     // One sample more on each side, so the area reaches the edges.
     let pts: Vec<(f64, f64, f64)> = (r.start.saturating_sub(1)..(r.end + 1).min(n))
         .filter(|&i| hi[i].is_finite() && lo[i].is_finite())
         .map(|i| (plot.px(frame.trace_x(t, i as f64, s)), y(hi[i]), y(lo[i])))
         .collect();
-    for p in &pts {
+    band_columns(&mut cols, &pts);
+    Some(cols)
+}
+
+/// Add an area through `pts` (dot column, high, low; in time order) to
+/// `cols`, one entry per dot column. Each dot column takes the band of
+/// its points; a column between two points takes the band between
+/// them, in a straight line. A column the area already has grows to
+/// cover both.
+pub(crate) fn band_columns(cols: &mut [Option<(f64, f64)>], pts: &[(f64, f64, f64)]) {
+    let w = cols.len() as i64;
+    let mut add = |c: i64, top: f64, bot: f64| {
+        if (0..w).contains(&c) {
+            let e = &mut cols[c as usize];
+            *e = Some(e.map_or((top, bot), |(a, b)| (a.max(top), b.min(bot))));
+        }
+    };
+    for p in pts {
         add(p.0.floor() as i64, p.1, p.2);
     }
     for pair in pts.windows(2) {
         let (p, q) = (pair[0], pair[1]);
         let first = (p.0.floor() as i64 + 1).max(0);
-        let last = (q.0.floor() as i64 - 1).min(w as i64 - 1);
+        let last = (q.0.floor() as i64 - 1).min(w - 1);
         for c in first..=last {
             let f = ((c as f64 + 0.5 - p.0) / (q.0 - p.0)).clamp(0.0, 1.0);
             add(c, p.1 + (q.1 - p.1) * f, p.2 + (q.2 - p.2) * f);
         }
     }
-    Some(cols)
 }
 
 /// Draw trace `t` in the trace mode: the mean line, the peak area in the
@@ -725,7 +741,7 @@ fn draw_time(f: &mut TermFrame, app: &App, area: Rect, pal: &Palette) {
                     s,
                     layer_of(s, t),
                     band_layer_of(s, t),
-                    pal.trace[t],
+                    pal.line[t],
                     pal.muted(t),
                 );
             }
@@ -971,7 +987,7 @@ fn draw_spectrum(f: &mut TermFrame, app: &App, area: Rect, alone: bool, pal: &Pa
                 s.display.trace_style[t],
                 false,
                 layer_of(s, t),
-                pal.trace[t],
+                pal.line[t],
             );
         }
     }
@@ -1754,7 +1770,7 @@ fn number_column(
     ];
     // Brightness and saturation: a swatch of the trace colour they make.
     if let crate::panel::Field::TraceBright(t) | crate::panel::Field::TraceSat(t) = field {
-        let sw = swatch(pal, t).fg(pal.trace[t]);
+        let sw = swatch(pal, t).fg(pal.line[t]);
         lines[1].spans.extend([Span::raw(" "), Span::styled("████", sw)]);
     }
     let hint = Style::default().fg(pal.label);

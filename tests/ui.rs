@@ -884,6 +884,54 @@ fn a_trace_colour_override_is_used_everywhere() {
 }
 
 #[test]
+fn brightness_changes_only_the_drawn_trace() {
+    use openhantek_tui::theme::{ColorMode, Palette};
+    use ratatui::style::Color;
+    let mut r = rig();
+    r.app.scope.settings.display.colors = ColorMode::TrueColor;
+    let base = Palette::of(&r.app.scope.settings.display).trace[0];
+    r.app.scope.settings.display.trace_brightness[0] = -60;
+    let pal = Palette::of(&r.app.scope.settings.display);
+    let line = pal.line[0];
+    assert_eq!(pal.trace[0], base);
+    assert_ne!(line, base);
+    let buf = r.buffer(140, 40);
+    let w = buf.area.width;
+    let row = |y: u16| -> String { (0..w).map(|x| buf[(x, y)].symbol()).collect() };
+    let fg_of = |text: &str| -> Vec<Color> {
+        let mut out = Vec::new();
+        for y in 0..buf.area.height {
+            if let Some(i) = row(y).find(text) {
+                let x = row(y)[..i].chars().count() as u16;
+                out.push(buf[(x, y)].fg);
+            }
+        }
+        out
+    };
+    // The channel line and the measurement heading keep the plain colour.
+    assert!(fg_of("CH1 1 V/div").contains(&base), "{:?}", fg_of("CH1 1 V/div"));
+    let ch1 = fg_of("CH1");
+    assert!(ch1.iter().filter(|c| **c == base).count() >= 2, "{ch1:?}");
+    assert!(!ch1.contains(&line), "{ch1:?}");
+    assert!(fg_of("1▸").contains(&base), "{:?}", fg_of("1▸"));
+    // The braille of the trace has the dimmed colour, and none is plain.
+    let braille = |c: Color| {
+        buf.content()
+            .iter()
+            .filter(|cell| {
+                cell.fg == c
+                    && cell
+                        .symbol()
+                        .chars()
+                        .all(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch))
+            })
+            .count()
+    };
+    assert!(braille(line) > 50, "{}", braille(line));
+    assert_eq!(braille(base), 0);
+}
+
+#[test]
 fn settings_panel_opens_and_closes() {
     let mut r = rig();
     r.char('s');

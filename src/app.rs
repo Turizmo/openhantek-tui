@@ -855,7 +855,6 @@ impl App {
                 self.scope.history.clear();
             }
             Act::TraceMode => s.display.trace_mode = s.display.trace_mode.next(),
-            Act::LogTraceMode => s.logger.trace_mode = s.logger.trace_mode.next(),
             Act::Interpolation => s.display.interpolation = s.display.interpolation.next(),
             Act::MeasurePanel => s.display.measurements ^= true,
             Act::Spectrum => s.display.spectrum = s.display.spectrum.next(),

@@ -22,6 +22,11 @@ pub fn stretch_steps() -> impl Iterator<Item = u64> {
 /// Steps the screen shows at the most zoom (about).
 pub const MIN_STEPS_ON_SCREEN: u64 = 10;
 
+/// Steps read past each screen edge when zoomed in past one step per dot
+/// column: the line and the area run to the edges, and sin(x)/x has the
+/// steps it needs near the edges (as the scope view reads 6 samples more).
+pub const EDGE_STEPS: u64 = 6;
+
 /// Steps summed up per tick while the summary is built.
 pub const SUMMARY_BUDGET: u64 = 4 << 20;
 /// Save the summary next to the log when it took at least this many
@@ -194,12 +199,12 @@ impl LogView {
     }
 
     /// Step of the first entry of [`LogView::columns`]: the left edge,
-    /// or when zoomed in past one step per dot column the step before it
-    /// (so the mean line runs to the edges).
+    /// or when zoomed in past one step per dot column [`EDGE_STEPS`]
+    /// steps before it.
     pub fn first_entry(&self, w: usize) -> u64 {
         let left = self.left(w);
         if self.k() > 1 {
-            left.saturating_sub(1)
+            left.saturating_sub(EDGE_STEPS)
         } else {
             left
         }
@@ -207,13 +212,13 @@ impl LogView {
 
     /// The columns to draw: `w` dot columns from [`LogView::left`]; when
     /// zoomed in past one step per dot column ([`LogView::k`] > 1), one
-    /// entry per step instead, from [`LogView::first_entry`] to one step
-    /// past the right edge.
+    /// entry per step instead, from [`LogView::first_entry`] to
+    /// [`EDGE_STEPS`] steps past the right edge.
     pub fn columns(&self, w: usize) -> Result<Vec<Aggs>> {
         let z = self.z(w);
         let start = self.first_entry(w);
         let n = if self.k() > 1 {
-            (self.left(w) - start + self.span(w) + 1) as usize
+            (self.left(w) - start + self.span(w) + EDGE_STEPS) as usize
         } else {
             w
         };
@@ -437,13 +442,13 @@ mod tests {
         // The middle of the screen stays.
         let l = v.left(w);
         assert!(l <= mid && mid <= l + v.span(w), "{l} {mid}");
-        // One entry per step, from the step before the left edge to one
+        // One entry per step, from 6 steps before the left edge to 6
         // past the right edge.
         let cols = v.columns(w).unwrap();
-        assert_eq!(v.first_entry(w), l - 1);
-        assert_eq!(cols.len(), 12);
+        assert_eq!(v.first_entry(w), l - EDGE_STEPS);
+        assert_eq!(cols.len(), 10 + 2 * EDGE_STEPS as usize);
         for (j, c) in cols.iter().enumerate() {
-            let i = (l - 1 + j as u64) as f32;
+            let i = (l - EDGE_STEPS + j as u64) as f32;
             assert_eq!((c[0].min, c[0].max, c[0].n), (i, i + 1.0, 1), "{j}");
         }
         // Steps and dot columns map both ways, with fractions.

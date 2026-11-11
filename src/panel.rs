@@ -125,8 +125,6 @@ pub enum Field {
     LogFree,
     LogAxis,
     LogCsvTime,
-    /// Trace mode of the log view.
-    LogTraceMode,
     /// Pick one of the recent logs to open.
     LogOpen,
     Act(Action),
@@ -330,7 +328,6 @@ pub fn categories() -> Vec<Category> {
                 LogDir,
                 LogAxis,
                 LogCsvTime,
-                LogTraceMode,
                 Act(Action::LogView),
                 LogOpen,
                 Act(Action::ExportLog),
@@ -484,7 +481,6 @@ impl Field {
             LogFree => "Free space",
             LogAxis => "Time labels",
             LogCsvTime => "CSV time",
-            LogTraceMode => "Trace mode",
             LogOpen => "Open log",
             Act(a) => match a {
                 Action::RunStop => "Run / stop",
@@ -519,8 +515,8 @@ impl Field {
             ChInvert(_) => "Turn the trace upside down. Key i.",
             ChDeskew(_) => "Move the trace left (-) or right (+) in time, to line up two signals or take out a probe delay. At most one screen width. Only the drawing moves: measurements and math use the real times. Type a value like 5ns.",
             TraceColour(_) => "Names: the terminal theme picks the shade. # types RGB like #ff8800.",
-            TraceBright(_) => "+ stands out more from the background, - fades toward it. -100 %: the background. 16 colours: +50 bold, -50 dim.",
-            TraceSat(_) => "0 %: gray. 100 %: the colour. 400 %: stronger, up to the most vivid shade the screen shows. Not in 16 colours.",
+            TraceBright(_) => "Only the drawn trace. + stands out more from the background, - fades toward it. -100 %: the background. 16 colours: +50 bold, -50 dim.",
+            TraceSat(_) => "Only the drawn trace. 0 %: gray. 100 %: the colour. 400 %: stronger, up to the most vivid shade the screen shows. Not in 16 colours.",
             Style(_) => "braille thin: lines through the low and high value of each dot column. braille bold: two dots thick. ascii and box lines: no braille.",
             MathEnabled => "Show the math trace. Key 3.",
             MathMode => "How the math trace is made from CH1 and CH2. Key m.",
@@ -534,9 +530,9 @@ impl Field {
             TimeDiv => "Time per division. Keys ← →.",
             Roll => "Slow time bases scroll from right to left, with no trigger.",
             MaxAdc => "Highest ADC rate in every mode (scope, roll, logger). The ADC always runs at it; slower rates average its samples. Lower it if the USB link loses data.",
-            TraceMode => "average: the mean of the samples behind each point, as a line. peak: the area from the lowest to the highest sample (also over the averaged captures). average + peak: the same line as average, the muted area only around it. Key D.",
+            TraceMode => "average: the mean of the samples behind each point, as a line. peak: the area from the lowest to the highest sample (also over the averaged captures). average + peak: the same line as average, the muted area only around it. Also in the log view (the mean, min and max of each step). Key D.",
             Selected => "The trace the arrow keys, cursors and spectrum use. Key Tab.",
-            Interpolation => "sin(x)/x: a smooth line through few samples. linear: straight lines. samples only: one dot per sample, no lines. Key z.",
+            Interpolation => "sin(x)/x: a smooth line through few samples. linear: straight lines. samples only: one dot per sample, no lines. Also in the log view (one dot per step or column). Key z.",
             Averaging => "Average the last N triggers (a sliding window): less noise. Key A.",
             Persistence => "Keep this many old traces on screen, dimmed. Key P.",
             Xy => "Draw CH1 against CH2. Key x.",
@@ -571,7 +567,6 @@ impl Field {
             LogFree => "Free space on the disk of the log folder.",
             LogAxis => "Time labels of the log view: wall clock (UTC) or seconds since the start. Key t.",
             LogCsvTime => "Time column of the log CSV export.",
-            LogTraceMode => "Log view: average: the mean line. peak: the min..max area of each step (raw logs: the samples). average + peak: the line over the area, muted. Key D in the log view.",
             LogOpen => "Open a recent log in the log view (Enter), d deletes it (asks first). Also: --open-log FILE.",
             Act(a) => match a {
                 Action::RunStop => "Start or stop the capture. Key space.",
@@ -727,10 +722,6 @@ impl Field {
                 .collect(),
             LogAxis => TimeAxis::ALL.iter().map(|m| m.name().to_string()).collect(),
             LogCsvTime => CsvTime::ALL.iter().map(|m| m.name().to_string()).collect(),
-            LogTraceMode => crate::settings::TraceMode::ALL
-                .iter()
-                .map(|m| m.name().to_string())
-                .collect(),
             LogOpen => d.recent_logs.clone(),
             _ => Vec::new(),
         }
@@ -849,7 +840,6 @@ impl Field {
             LogLimit => s.logger.limit_idx(),
             LogAxis => index_of(&TimeAxis::ALL, &s.logger.time_axis),
             LogCsvTime => index_of(&CsvTime::ALL, &s.logger.csv_time),
-            LogTraceMode => index_of(&crate::settings::TraceMode::ALL, &s.logger.trace_mode),
             _ => 0,
         }
     }
@@ -963,10 +953,6 @@ impl Field {
             }
             LogAxis => s.logger.time_axis = TimeAxis::ALL[i.min(1)],
             LogCsvTime => s.logger.csv_time = CsvTime::ALL[i.min(1)],
-            LogTraceMode => {
-                let all = crate::settings::TraceMode::ALL;
-                s.logger.trace_mode = all[i.min(all.len() - 1)]
-            }
             _ => {}
         }
     }
