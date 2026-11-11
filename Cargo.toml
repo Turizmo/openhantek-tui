@@ -2,6 +2,9 @@
 name = "openhantek-tui"
 version = "0.1.0"
 edition = "2021"
+description = "Terminal oscilloscope for the Hantek DSO-6022BE USB scope"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Turizmo/openhantek-tui"
 
 [dependencies]
 anyhow = "1.0.104"

@@ -5,6 +5,26 @@ the scope directly over USB (libusb), with the open firmware from
 [OpenHantek6022](https://github.com/OpenHantek/OpenHantek6022), and draws
 the traces in your terminal with [ratatui](https://ratatui.rs).
 
+![openhantek-tui in demo mode: a sine on CH1, a square wave on CH2, and the measurement panel](docs/screenshot.png)
+
+Use it when you want a scope in a terminal: over SSH, in a tiling window
+manager, or next to your editor. It can also run headless (`--measure`)
+for scripts, and log min/max/mean for hours or days without gaps.
+
+**How it relates to OpenHantek6022.** This is not a fork. It is a new
+program, written from scratch in Rust, with its own git history. It
+uses OpenHantek6022's open firmware for the scope (loaded at run time,
+not included here), follows its USB commands, and reads its calibration
+file if you have one. Thanks to the OpenHantek6022 team: without their
+firmware and protocol work this program would not exist. Use OpenHantek6022 if you want a
+graphical window; use this if you want a terminal.
+
+Try it without a scope (needs [Nix](https://nixos.org) with flakes):
+
+```
+nix run github:Turizmo/openhantek-tui -- --demo
+```
+
 Features:
 
 - Two channels and a math channel (CH1+CH2, CH1-CH2, CH2-CH1, CH1×CH2,
@@ -94,6 +114,29 @@ The firmware is loaded each time the scope gets power. That takes about
 becomes `04b5:6022`).
 
 Close OpenHantek6022 first: only one program can use the scope.
+
+### Install on NixOS
+
+Add the flake as an input and install its package:
+
+```nix
+# flake.nix
+inputs.openhantek-tui = {
+  url = "github:Turizmo/openhantek-tui";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+
+# a NixOS or home-manager module
+environment.systemPackages = [
+  inputs.openhantek-tui.packages.${pkgs.stdenv.hostPlatform.system}.default
+];
+services.udev.packages = [ pkgs.openhantek6022 ];  # USB permissions, see below
+```
+
+`nix flake update openhantek-tui` then a rebuild gets the newest version.
+
+Elsewhere: `cargo install --path .` from a clone (see above for the
+firmware file).
 
 ### Options
 
@@ -1044,7 +1087,12 @@ The fake scope makes its samples from a table per wave period, fast
 enough to stream 32 MB/s in real time; the tests build with
 `opt-level = 1` (`[profile.test]`) so the binning keeps up too.
 
-## Licence of the firmware
+## Licence
+
+openhantek-tui is free software under the GNU General Public License,
+version 3 or later (GPL-3.0-or-later). See [LICENSE](LICENSE).
+
+### Licence of the firmware
 
 The scope firmware comes from OpenHantek6022 (GPL-3.0). This repository
 does not contain it: the program reads the firmware file at run time. The

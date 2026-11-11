@@ -34,7 +34,11 @@
         inherit cargoArtifacts;
         # Runs `cargo test`; the hardware tests are #[ignore]
         doCheck = true;
-        meta.mainProgram = "openhantek-tui";
+        meta = {
+          mainProgram = "openhantek-tui";
+          description = "Terminal oscilloscope for the Hantek DSO-6022BE";
+          license = pkgs.lib.licenses.gpl3Plus;
+        };
       });
     in
     {
