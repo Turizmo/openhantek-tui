@@ -34,6 +34,11 @@
         inherit cargoArtifacts;
         # Runs `cargo test`; the hardware tests are #[ignore]
         doCheck = true;
+        # App launcher entry (it runs in a terminal) and its icon
+        postInstall = ''
+          install -Dm644 ${./packaging/openhantek-tui.desktop} $out/share/applications/openhantek-tui.desktop
+          install -Dm644 ${./packaging/openhantek-tui.svg} $out/share/icons/hicolor/scalable/apps/openhantek-tui.svg
+        '';
         meta = {
           mainProgram = "openhantek-tui";
           description = "Terminal oscilloscope for the Hantek DSO-6022BE";

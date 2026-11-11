@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=openhantek-tui
+GenericName=Oscilloscope
+Comment=Terminal oscilloscope for the Hantek DSO-6022BE
+Exec=openhantek-tui
+Icon=openhantek-tui
+Terminal=true
+Categories=Science;Electronics;Engineering;
+Keywords=scope;oscilloscope;hantek;6022;dso;
+Actions=demo;
+
+[Desktop Action demo]
+Name=Demo (fake scope)
+Exec=openhantek-tui --demo

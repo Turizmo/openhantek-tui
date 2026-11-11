@@ -135,6 +135,9 @@ services.udev.packages = [ pkgs.openhantek6022 ];  # USB permissions, see below
 
 `nix flake update openhantek-tui` then a rebuild gets the newest version.
 
+The package also installs a launcher entry (`openhantek-tui.desktop`, it
+opens in your terminal) and an icon, so app launchers like rofi list it.
+
 Elsewhere: `cargo install --path .` from a clone (see above for the
 firmware file).
 
